@@ -4,17 +4,11 @@
 
 use crate::config::DownloadConfig;
 
-/// 单位常量：KB (bytes)
-const KB: f64 = 1024.0;
-
-/// 单位常量：MB (bytes)
-const MB: f64 = 1024.0 * 1024.0;
-
 /// 分块策略 trait
 ///
 /// 定义了动态调整下载分块大小的接口
 pub(crate) trait ChunkStrategy {
-    /// 根据实时下载速度计算合适的分块大小
+    /// 根据实时下载速度计算合适的分块大小（带平滑）
     ///
     /// # Arguments
     ///
@@ -23,7 +17,7 @@ pub(crate) trait ChunkStrategy {
     /// # Returns
     ///
     /// 计算得到的分块大小 (bytes)
-    fn calculate_chunk_size(&self, instant_speed: f64) -> u64;
+    fn calculate_chunk_size(&mut self, instant_speed: f64) -> u64;
 
     /// 获取当前分块大小
     ///
@@ -31,26 +25,14 @@ pub(crate) trait ChunkStrategy {
     ///
     /// 当前使用的分块大小 (bytes)
     fn current_chunk_size(&self) -> u64;
-
-    /// 更新当前分块大小
-    ///
-    /// # Arguments
-    ///
-    /// * `new_size` - 新的分块大小 (bytes)
-    fn update_chunk_size(&mut self, new_size: u64);
 }
 
 /// 基于速度的自适应分块策略
 ///
-/// 根据实时下载速度动态调整分块大小：
-/// - 速度越快，分块越大（减少请求开销）
-/// - 速度越慢，分块越小（提高并发，更灵活的任务分配）
-///
-/// 分级策略：
-/// - < 500 KB/s: 使用最小分块
-/// - 500 KB/s ~ 2 MB/s: 2 倍最小分块
-/// - 2 MB/s ~ 10 MB/s: 5 倍最小分块
-/// - > 10 MB/s: 使用最大分块
+/// 根据实时下载速度动态调整分块大小，使用平滑算法：
+/// 1. 理想分块大小 = 单个协程下载速度 * 预期时间
+/// 2. 实际分配分块大小 = 上次分块大小 + (理想分块大小 - 上次分块大小) * 平滑系数
+/// 3. 实际分配分块大小限制在 min_chunk_size ~ max_chunk_size 区间内
 #[derive(Debug, Clone)]
 pub(crate) struct SpeedBasedChunkStrategy {
     /// 当前分块大小 (bytes)
@@ -59,6 +41,10 @@ pub(crate) struct SpeedBasedChunkStrategy {
     min_chunk_size: u64,
     /// 最大分块大小 (bytes)
     max_chunk_size: u64,
+    /// 预期分块下载时长 (秒)
+    expected_duration: f64,
+    /// 平滑系数 (0.0 ~ 1.0)
+    smoothing_factor: f64,
 }
 
 impl SpeedBasedChunkStrategy {
@@ -69,15 +55,21 @@ impl SpeedBasedChunkStrategy {
     /// * `initial_chunk_size` - 初始分块大小 (bytes)
     /// * `min_chunk_size` - 最小分块大小 (bytes)
     /// * `max_chunk_size` - 最大分块大小 (bytes)
+    /// * `expected_duration_secs` - 预期分块下载时长 (秒)
+    /// * `smoothing_factor` - 平滑系数 (0.0 ~ 1.0)
     pub(crate) fn new(
         initial_chunk_size: u64,
         min_chunk_size: u64,
         max_chunk_size: u64,
+        expected_duration_secs: f64,
+        smoothing_factor: f64,
     ) -> Self {
         Self {
             current_chunk_size: initial_chunk_size,
             min_chunk_size,
             max_chunk_size,
+            expected_duration: expected_duration_secs,
+            smoothing_factor,
         }
     }
 
@@ -91,36 +83,32 @@ impl SpeedBasedChunkStrategy {
             config.initial_chunk_size(),
             config.min_chunk_size(),
             config.max_chunk_size(),
+            config.expected_chunk_duration().as_secs_f64(),
+            config.smoothing_factor(),
         )
     }
 }
 
 impl ChunkStrategy for SpeedBasedChunkStrategy {
-    fn calculate_chunk_size(&self, instant_speed: f64) -> u64 {
-        let chunk_size = if instant_speed < 500.0 * KB {
-            // < 500 KB/s: 使用最小分块
-            self.min_chunk_size
-        } else if instant_speed < 2.0 * MB {
-            // 500 KB/s ~ 2 MB/s: 2 倍最小分块
-            (self.min_chunk_size * 2).min(self.max_chunk_size)
-        } else if instant_speed < 10.0 * MB {
-            // 2 MB/s ~ 10 MB/s: 5 倍最小分块
-            (self.min_chunk_size * 5).min(self.max_chunk_size)
-        } else {
-            // > 10 MB/s: 使用最大分块
-            self.max_chunk_size
-        };
-
-        // 确保在合理范围内
-        chunk_size.clamp(self.min_chunk_size, self.max_chunk_size)
+    fn calculate_chunk_size(&mut self, instant_speed: f64) -> u64 {
+        // 1. 计算理想分块大小 = 速度 * 预期时间
+        let ideal_chunk_size = (instant_speed * self.expected_duration) as u64;
+        
+        // 2. 应用平滑算法：新大小 = 旧大小 + (理想大小 - 旧大小) * 平滑系数
+        let smoothed_size = self.current_chunk_size as f64 
+            + (ideal_chunk_size as f64 - self.current_chunk_size as f64) * self.smoothing_factor;
+        
+        // 3. 限制在配置范围内
+        let new_size = (smoothed_size as u64).clamp(self.min_chunk_size, self.max_chunk_size);
+        
+        // 4. 更新当前分块大小
+        self.current_chunk_size = new_size;
+        
+        new_size
     }
 
     fn current_chunk_size(&self) -> u64 {
         self.current_chunk_size
-    }
-
-    fn update_chunk_size(&mut self, new_size: u64) {
-        self.current_chunk_size = new_size;
     }
 }
 
@@ -134,6 +122,8 @@ mod tests {
             5 * 1024 * 1024,  // 5 MB initial
             2 * 1024 * 1024,  // 2 MB min
             50 * 1024 * 1024, // 50 MB max
+            2.0,              // 2 seconds expected duration
+            0.3,              // 0.3 smoothing factor
         );
 
         assert_eq!(strategy.current_chunk_size(), 5 * 1024 * 1024);
@@ -141,10 +131,14 @@ mod tests {
 
     #[test]
     fn test_speed_based_chunk_strategy_from_config() {
+        use std::time::Duration;
+        
         let config = DownloadConfig::builder()
             .initial_chunk_size(10 * 1024 * 1024)
             .min_chunk_size(5 * 1024 * 1024)
             .max_chunk_size(100 * 1024 * 1024)
+            .expected_chunk_duration(Duration::from_secs(3))
+            .smoothing_factor(0.5)
             .build();
 
         let strategy = SpeedBasedChunkStrategy::from_config(&config);
@@ -152,124 +146,109 @@ mod tests {
         assert_eq!(strategy.current_chunk_size(), 10 * 1024 * 1024);
         assert_eq!(strategy.min_chunk_size, 5 * 1024 * 1024);
         assert_eq!(strategy.max_chunk_size, 100 * 1024 * 1024);
+        assert_eq!(strategy.expected_duration, 3.0);
+        assert_eq!(strategy.smoothing_factor, 0.5);
     }
 
     #[test]
-    fn test_calculate_chunk_size_very_slow() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            50 * 1024 * 1024,
+    fn test_calculate_chunk_size_smoothing() {
+        let mut strategy = SpeedBasedChunkStrategy::new(
+            5 * 1024 * 1024,  // 5 MB initial
+            2 * 1024 * 1024,  // 2 MB min
+            50 * 1024 * 1024, // 50 MB max
+            2.0,              // 2 seconds expected duration
+            0.5,              // 0.5 smoothing factor
         );
 
-        // < 500 KB/s: 应该返回最小分块
-        let chunk_size = strategy.calculate_chunk_size(100.0 * 1024.0); // 100 KB/s
+        // 速度: 10 MB/s, 理想分块: 10 * 2 = 20 MB
+        // 当前: 5 MB, 新大小: 5 + (20 - 5) * 0.5 = 12.5 MB
+        let chunk_size = strategy.calculate_chunk_size(10.0 * 1024.0 * 1024.0);
+        assert_eq!(chunk_size, 12 * 1024 * 1024 + 512 * 1024); // 12.5 MB
+
+        // 再次计算，应该继续平滑调整
+        // 当前: 12.5 MB, 新大小: 12.5 + (20 - 12.5) * 0.5 = 16.25 MB
+        let chunk_size = strategy.calculate_chunk_size(10.0 * 1024.0 * 1024.0);
+        assert_eq!(chunk_size, 16 * 1024 * 1024 + 256 * 1024); // 16.25 MB
+    }
+
+    #[test]
+    fn test_calculate_chunk_size_respects_min() {
+        let mut strategy = SpeedBasedChunkStrategy::new(
+            5 * 1024 * 1024,  // 5 MB initial
+            2 * 1024 * 1024,  // 2 MB min
+            50 * 1024 * 1024, // 50 MB max
+            2.0,              // 2 seconds
+            1.0,              // 1.0 smoothing (立即响应)
+        );
+
+        // 非常慢的速度: 100 KB/s, 理想分块: 100 * 1024 * 2 = 200 KB
+        // 应该立即调整到理想值并被限制在最小值 2 MB
+        let chunk_size = strategy.calculate_chunk_size(100.0 * 1024.0);
         assert_eq!(chunk_size, 2 * 1024 * 1024);
     }
 
     #[test]
-    fn test_calculate_chunk_size_slow() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            50 * 1024 * 1024,
+    fn test_calculate_chunk_size_respects_max() {
+        let mut strategy = SpeedBasedChunkStrategy::new(
+            5 * 1024 * 1024,  // 5 MB initial
+            2 * 1024 * 1024,  // 2 MB min
+            50 * 1024 * 1024, // 50 MB max
+            2.0,              // 2 seconds
+            1.0,              // 1.0 smoothing (立即响应)
         );
 
-        // 500 KB/s ~ 2 MB/s: 应该返回 2 倍最小分块
-        let chunk_size = strategy.calculate_chunk_size(1.0 * 1024.0 * 1024.0); // 1 MB/s
-        assert_eq!(chunk_size, 4 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_calculate_chunk_size_medium() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            50 * 1024 * 1024,
-        );
-
-        // 2 MB/s ~ 10 MB/s: 应该返回 5 倍最小分块
-        let chunk_size = strategy.calculate_chunk_size(5.0 * 1024.0 * 1024.0); // 5 MB/s
-        assert_eq!(chunk_size, 10 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_calculate_chunk_size_fast() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            50 * 1024 * 1024,
-        );
-
-        // > 10 MB/s: 应该返回最大分块
-        let chunk_size = strategy.calculate_chunk_size(20.0 * 1024.0 * 1024.0); // 20 MB/s
+        // 非常快的速度: 100 MB/s, 理想分块: 100 * 2 = 200 MB
+        // 应该被限制在最大值 50 MB
+        let chunk_size = strategy.calculate_chunk_size(100.0 * 1024.0 * 1024.0);
         assert_eq!(chunk_size, 50 * 1024 * 1024);
     }
 
     #[test]
-    fn test_calculate_chunk_size_respects_max() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            8 * 1024 * 1024,  // 较小的最大值
+    fn test_smoothing_factor_zero() {
+        let mut strategy = SpeedBasedChunkStrategy::new(
+            5 * 1024 * 1024,  // 5 MB initial
+            2 * 1024 * 1024,  // 2 MB min
+            50 * 1024 * 1024, // 50 MB max
+            2.0,              // 2 seconds
+            0.0,              // 0.0 smoothing (完全不响应)
         );
 
-        // 即使是中等速度，也不应该超过最大值
-        let chunk_size = strategy.calculate_chunk_size(5.0 * 1024.0 * 1024.0); // 5 MB/s
-        assert_eq!(chunk_size, 8 * 1024 * 1024); // 不超过 max
+        // 即使速度很快，分块大小也不应该变化
+        let chunk_size = strategy.calculate_chunk_size(100.0 * 1024.0 * 1024.0);
+        assert_eq!(chunk_size, 5 * 1024 * 1024); // 保持初始值
     }
 
     #[test]
-    fn test_update_chunk_size() {
+    fn test_smoothing_factor_one() {
+        let mut strategy = SpeedBasedChunkStrategy::new(
+            5 * 1024 * 1024,  // 5 MB initial
+            2 * 1024 * 1024,  // 2 MB min
+            50 * 1024 * 1024, // 50 MB max
+            2.0,              // 2 seconds
+            1.0,              // 1.0 smoothing (立即响应)
+        );
+
+        // 速度: 10 MB/s, 理想分块: 10 * 2 = 20 MB
+        // 应该立即调整到理想值
+        let chunk_size = strategy.calculate_chunk_size(10.0 * 1024.0 * 1024.0);
+        assert_eq!(chunk_size, 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_chunk_size_updates_state() {
         let mut strategy = SpeedBasedChunkStrategy::new(
             5 * 1024 * 1024,
             2 * 1024 * 1024,
             50 * 1024 * 1024,
+            2.0,
+            0.5,
         );
 
         assert_eq!(strategy.current_chunk_size(), 5 * 1024 * 1024);
 
-        strategy.update_chunk_size(10 * 1024 * 1024);
-        assert_eq!(strategy.current_chunk_size(), 10 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_chunk_size_boundary_500kb() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            50 * 1024 * 1024,
-        );
-
-        // 边界值：刚好 500 KB/s
-        let chunk_size = strategy.calculate_chunk_size(500.0 * 1024.0);
-        assert_eq!(chunk_size, 4 * 1024 * 1024); // 应该是 2 倍最小分块
-    }
-
-    #[test]
-    fn test_chunk_size_boundary_2mb() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            50 * 1024 * 1024,
-        );
-
-        // 边界值：刚好 2 MB/s
-        let chunk_size = strategy.calculate_chunk_size(2.0 * 1024.0 * 1024.0);
-        assert_eq!(chunk_size, 10 * 1024 * 1024); // 应该是 5 倍最小分块
-    }
-
-    #[test]
-    fn test_chunk_size_boundary_10mb() {
-        let strategy = SpeedBasedChunkStrategy::new(
-            5 * 1024 * 1024,
-            2 * 1024 * 1024,
-            50 * 1024 * 1024,
-        );
-
-        // 边界值：刚好 10 MB/s
-        let chunk_size = strategy.calculate_chunk_size(10.0 * 1024.0 * 1024.0);
-        assert_eq!(chunk_size, 50 * 1024 * 1024); // 应该是最大分块
+        // 计算后应该更新内部状态
+        strategy.calculate_chunk_size(10.0 * 1024.0 * 1024.0);
+        assert_eq!(strategy.current_chunk_size(), 12 * 1024 * 1024 + 512 * 1024);
     }
 }
 

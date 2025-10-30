@@ -6,6 +6,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::tools::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::tools::fetch::fetch_range;
 use crate::tools::io_traits::{AsyncFile, HttpClient};
 use crate::tools::range_writer::RangeWriter;
@@ -120,6 +121,8 @@ pub(crate) struct WorkerChannel {
     pub(crate) shutdown_sender: Option<oneshot::Sender<()>>,
     /// 该 worker 的独立下载统计
     pub(crate) stats: Arc<DownloadStats>,
+    /// 该 worker 的独立分块策略
+    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send + Sync>,
 }
 
 /// 下载协程池
@@ -145,21 +148,21 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
     /// * `client` - HTTP客户端（将被克隆给每个worker）
     /// * `worker_count` - worker 协程数量
     /// * `writer` - 共享的 RangeWriter，所有 worker 将直接写入此文件
-    /// * `instant_speed_window` - 实时速度窗口，用于计算瞬时速度
+    /// * `config` - 下载配置，用于创建分块策略和设置速度窗口
     /// 
-    /// 每个 worker 都有独立的 DownloadStats，用于监控单个 worker 的性能
+    /// 每个 worker 都有独立的 DownloadStats 和 ChunkStrategy
     /// 所有 worker 的统计会自动聚合到 global_stats，实现 O(1) 获取
     pub(crate) fn new<C>(
         client: C, 
         worker_count: usize, 
         writer: Arc<RangeWriter<F>>,
-        instant_speed_window: std::time::Duration,
+        config: &crate::config::DownloadConfig,
     ) -> Self
     where
         C: HttpClient + Clone + Send + 'static,
     {
         // 创建全局统计管理器（使用配置的时间窗口）
-        let global_stats = DownloadStatsParent::with_window(instant_speed_window);
+        let global_stats = DownloadStatsParent::with_window(config.instant_speed_window());
         
         // 创建统一的 result channel（所有 worker 共享同一个 sender）
         let (result_sender, result_receiver) = mpsc::channel::<RangeResult>(100);
@@ -186,10 +189,14 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
                 run_worker(id, client_clone, task_receiver, result_sender_clone, shutdown_receiver, writer_clone, stats_clone).await;
             });
 
+            // 为每个 worker 创建独立的分块策略
+            let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(config));
+            
             worker_channels.push(WorkerChannel {
                 task_sender,
                 shutdown_sender: Some(shutdown_sender),
                 stats: worker_stats,
+                chunk_strategy,
             });
             worker_handles.push(handle);
         }
@@ -240,6 +247,39 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
     /// `(实时速度 bytes/s, 是否有效)`
     pub(crate) fn get_total_instant_speed(&self) -> (f64, bool) {
         self.global_stats.get_instant_speed()
+    }
+
+    /// 获取指定 worker 的当前分块大小
+    /// 
+    /// # Arguments
+    /// 
+    /// * `worker_id` - Worker ID
+    /// 
+    /// # Returns
+    /// 
+    /// 当前分块大小 (bytes)
+    pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
+        self.worker_channels[worker_id].chunk_strategy.current_chunk_size()
+    }
+    
+    /// 根据 worker 的实时速度计算新的分块大小
+    /// 
+    /// 使用该 worker 的独立分块策略和实时速度来计算
+    /// 
+    /// # Arguments
+    /// 
+    /// * `worker_id` - Worker ID
+    /// 
+    /// # Returns
+    /// 
+    /// 计算得到的分块大小 (bytes)
+    pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> u64 {
+        let (instant_speed, valid) = self.worker_channels[worker_id].stats.get_instant_speed();
+        if valid && instant_speed > 0.0 {
+            self.worker_channels[worker_id].chunk_strategy.calculate_chunk_size(instant_speed)
+        } else {
+            self.worker_channels[worker_id].chunk_strategy.current_chunk_size()
+        }
     }
 
     /// 优雅关闭所有 workers
@@ -409,11 +449,12 @@ mod tests {
         let writer = Arc::new(writer);
 
         let worker_count = 4;
+        let config = crate::config::DownloadConfig::default();
         let pool = WorkerPool::<MockFile>::new(
             client, 
             worker_count, 
             writer,
-            std::time::Duration::from_secs(1),
+            &config,
         );
 
         assert_eq!(pool.worker_channels.len(), worker_count);
@@ -429,11 +470,12 @@ mod tests {
         let (writer, mut allocator) = RangeWriter::new(&fs, save_path, 100).await.unwrap();
         let writer = Arc::new(writer);
 
+        let config = crate::config::DownloadConfig::default();
         let pool = WorkerPool::<MockFile>::new(
             client, 
             2, 
             writer,
-            std::time::Duration::from_secs(1),
+            &config,
         );
 
         // 分配一个 range
@@ -459,11 +501,12 @@ mod tests {
         let writer = Arc::new(writer);
 
         let worker_count = 3;
+        let config = crate::config::DownloadConfig::default();
         let pool = WorkerPool::<MockFile>::new(
             client, 
             worker_count, 
             writer,
-            std::time::Duration::from_secs(1),
+            &config,
         );
 
         // 初始统计应该都是 0
@@ -485,11 +528,12 @@ mod tests {
         let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
         let writer = Arc::new(writer);
 
+        let config = crate::config::DownloadConfig::default();
         let mut pool = WorkerPool::<MockFile>::new(
             client.clone(), 
             2, 
             writer,
-            std::time::Duration::from_secs(1),
+            &config,
         );
 
         // 关闭 workers

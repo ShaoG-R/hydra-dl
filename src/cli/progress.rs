@@ -87,7 +87,6 @@ impl ProgressManager {
                 percentage: _,
                 avg_speed,
                 instant_speed,
-                current_chunk_size,
                 worker_stats,
             } => {
                 // 更新主进度条
@@ -108,10 +107,23 @@ impl ProgressManager {
                     String::new()
                 };
 
+                // 计算分块大小范围（显示最小和最大值）
+                let chunk_info = if !worker_stats.is_empty() {
+                    let min_chunk = worker_stats.iter().map(|s| s.current_chunk_size).min().unwrap_or(0);
+                    let max_chunk = worker_stats.iter().map(|s| s.current_chunk_size).max().unwrap_or(0);
+                    if min_chunk == max_chunk {
+                        format!(", 分块: {}", format_bytes(min_chunk))
+                    } else {
+                        format!(", 分块: {}~{}", format_bytes(min_chunk), format_bytes(max_chunk))
+                    }
+                } else {
+                    String::new()
+                };
+
                 self.main_bar.set_message(format!(
-                    "{}, 分块: {}{}", 
+                    "{}{}{}", 
                     speed_str,
-                    format_bytes(current_chunk_size),
+                    chunk_info,
                     eta
                 ));
 
@@ -126,9 +138,10 @@ impl ProgressManager {
                             };
                             
                             worker_bar.set_message(format!(
-                                "{}, {} ranges{}",
+                                "{}, {} ranges, 分块: {}{}",
                                 format_bytes(stats.bytes),
                                 stats.ranges,
+                                format_bytes(stats.current_chunk_size),
                                 instant_str
                             ));
                         }

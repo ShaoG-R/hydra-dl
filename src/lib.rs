@@ -54,11 +54,11 @@
 //!                     total_size as f64 / 1024.0 / 1024.0,
 //!                     initial_chunk_size as f64 / 1024.0 / 1024.0);
 //!             }
-//!             DownloadProgress::Progress { percentage, avg_speed, current_chunk_size, worker_stats, .. } => {
-//!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, 当前分块: {:.2} MB, {} 个 workers",
+//!             DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
+//!                 // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+//!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, {} 个 workers",
 //!                     percentage,
 //!                     avg_speed / 1024.0 / 1024.0,
-//!                     current_chunk_size as f64 / 1024.0 / 1024.0,
 //!                     worker_stats.len());
 //!             }
 //!             DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {

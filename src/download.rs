@@ -5,7 +5,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
-use crate::tools::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::tools::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
 use crate::task::{RangeResult, WorkerTask};
@@ -24,6 +23,8 @@ pub struct WorkerStatSnapshot {
     pub avg_speed: f64,
     /// 该 worker 实时速度 (bytes/s)，如果无效则为 None
     pub instant_speed: Option<f64>,
+    /// 该 worker 当前的分块大小 (bytes)
+    pub current_chunk_size: u64,
 }
 
 /// 下载进度更新信息
@@ -50,9 +51,7 @@ pub enum DownloadProgress {
         avg_speed: f64,
         /// 实时速度 (bytes/s)，如果无效则为 None
         instant_speed: Option<f64>,
-        /// 当前分块大小（bytes）
-        current_chunk_size: u64,
-        /// 所有 worker 的统计信息
+        /// 所有 worker 的统计信息（包含各自的分块大小）
         worker_stats: Vec<WorkerStatSnapshot>,
     },
     /// 下载已完成（包含最终的 worker 统计）
@@ -112,17 +111,18 @@ impl DownloadHandle {
     /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config).await.unwrap();
     /// 
     /// while let Some(progress) = handle.progress_receiver().recv().await {
-    ///     match progress {
-    ///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
-    ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers", 
-    ///                 percentage, avg_speed / 1024.0 / 1024.0, worker_stats.len());
-    ///         }
-    ///         DownloadProgress::Completed { .. } => {
-    ///             println!("下载完成！");
-    ///         }
-    ///         _ => {}
-    ///     }
-    /// }
+///     match progress {
+///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
+///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers", 
+///                 percentage, avg_speed / 1024.0 / 1024.0, worker_stats.len());
+///         }
+///         DownloadProgress::Completed { .. } => {
+///             println!("下载完成！");
+///         }
+///         _ => {}
+///     }
+/// }
     /// 
     /// handle.wait().await.unwrap();
     /// # }
@@ -174,7 +174,7 @@ type FailedRange = (AllocatedRange, String);
 
 /// 任务分配器
 /// 
-/// 负责管理任务分配、分块策略和 worker 轮询选择
+/// 负责管理任务分配和 worker 轮询选择
 struct TaskAllocator {
     /// Range 分配器
     allocator: RangeAllocator,
@@ -182,8 +182,6 @@ struct TaskAllocator {
     url: String,
     /// 下一个要分配任务的 worker ID（轮询）
     next_worker_id: usize,
-    /// 动态分块策略
-    chunk_strategy: Box<dyn ChunkStrategy + Send + Sync>,
     /// Worker 总数
     worker_count: usize,
 }
@@ -194,28 +192,32 @@ impl TaskAllocator {
         allocator: RangeAllocator,
         url: String,
         worker_count: usize,
-        config: &crate::config::DownloadConfig,
     ) -> Self {
         Self {
             allocator,
             url,
             next_worker_id: 0,
-            chunk_strategy: Box::new(SpeedBasedChunkStrategy::from_config(config)),
             worker_count,
         }
     }
     
     /// 尝试分配下一个任务
     /// 
+    /// # Arguments
+    /// 
+    /// * `chunk_size` - 要分配的分块大小
+    /// 
+    /// # Returns
+    /// 
     /// 返回 (任务, worker_id)，如果没有剩余空间则返回 None
-    fn try_allocate_next_task(&mut self) -> Option<(WorkerTask, usize)> {
+    fn try_allocate_next_task(&mut self, chunk_size: u64) -> Option<(WorkerTask, usize)> {
         let remaining = self.allocator.remaining();
         if remaining == 0 {
             return None;
         }
         
         // 计算实际分配大小（不超过剩余空间）
-        let alloc_size = self.chunk_strategy.current_chunk_size().min(remaining);
+        let alloc_size = chunk_size.min(remaining);
         
         // 分配 range
         let range = self.allocator.allocate(alloc_size)?;
@@ -231,28 +233,6 @@ impl TaskAllocator {
         self.next_worker_id = (self.next_worker_id + 1) % self.worker_count;
         
         Some((task, worker_id))
-    }
-    
-    /// 获取当前分块大小
-    fn current_chunk_size(&self) -> u64 {
-        self.chunk_strategy.current_chunk_size()
-    }
-    
-    /// 根据实时速度调整分块大小
-    /// 
-    /// # Returns
-    /// 
-    /// 如果分块大小发生变化，返回 `Some((旧大小, 新大小))`
-    fn adjust_chunk_size(&mut self, instant_speed: f64) -> Option<(u64, u64)> {
-        let new_chunk_size = self.chunk_strategy.calculate_chunk_size(instant_speed);
-        let current_chunk_size = self.chunk_strategy.current_chunk_size();
-        
-        if new_chunk_size != current_chunk_size {
-            self.chunk_strategy.update_chunk_size(new_chunk_size);
-            Some((current_chunk_size, new_chunk_size))
-        } else {
-            None
-        }
     }
     
     /// 获取剩余待分配的字节数
@@ -301,7 +281,6 @@ impl ProgressReporter {
     async fn send_progress_update<F: AsyncFile>(
         &self,
         pool: &WorkerPool<F>,
-        current_chunk_size: u64,
     ) {
         if let Some(ref sender) = self.progress_sender {
             let total_avg_speed = pool.get_total_speed();
@@ -315,18 +294,20 @@ impl ProgressReporter {
                 0.0
             };
             
-            // 收集所有 worker 的统计信息
+            // 收集所有 worker 的统计信息（包含各自的分块大小）
             let worker_stats: Vec<WorkerStatSnapshot> = pool.worker_channels.iter()
                 .enumerate()
                 .map(|(id, channel)| {
                     let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
                         channel.stats.get_full_summary();
+                    let current_chunk_size = channel.chunk_strategy.current_chunk_size();
                     WorkerStatSnapshot {
                         worker_id: id,
                         bytes: worker_bytes,
                         ranges: worker_ranges,
                         avg_speed,
                         instant_speed: if instant_valid { Some(instant_speed) } else { None },
+                        current_chunk_size,
                     }
                 })
                 .collect();
@@ -338,7 +319,6 @@ impl ProgressReporter {
                 percentage,
                 avg_speed: total_avg_speed,
                 instant_speed: if instant_valid { Some(total_instant_speed) } else { None },
-                current_chunk_size,
                 worker_stats,
             }).await;
         }
@@ -350,18 +330,20 @@ impl ProgressReporter {
             let (total_bytes, total_secs, _) = pool.get_total_stats();
             let avg_speed = pool.get_total_speed();
             
-            // 收集所有 worker 的最终统计信息
+            // 收集所有 worker 的最终统计信息（包含分块大小）
             let worker_stats: Vec<WorkerStatSnapshot> = pool.worker_channels.iter()
                 .enumerate()
                 .map(|(id, channel)| {
                     let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
                         channel.stats.get_full_summary();
+                    let current_chunk_size = channel.chunk_strategy.current_chunk_size();
                     WorkerStatSnapshot {
                         worker_id: id,
                         bytes: worker_bytes,
                         ranges: worker_ranges,
                         avg_speed,
                         instant_speed: if instant_valid { Some(instant_speed) } else { None },
+                        current_chunk_size,
                     }
                 })
                 .collect();
@@ -424,7 +406,7 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         config: Arc<crate::config::DownloadConfig>,
     ) -> Self {
         let worker_count = pool.worker_channels.len();
-        let task_allocator = TaskAllocator::new(allocator, url, worker_count, &config);
+        let task_allocator = TaskAllocator::new(allocator, url, worker_count);
         let progress_reporter = ProgressReporter::new(progress_sender, total_size);
         
         Self {
@@ -447,10 +429,12 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         let mut progress_timer = tokio::time::interval(self.config.instant_speed_window());
         progress_timer.tick().await; // 跳过首次立即触发
         
-        // 初始任务分配：为每个 worker 分配一个任务
-        info!("开始初始任务分配，每个 worker 分配一个 {} bytes 的分块", self.task_allocator.current_chunk_size());
+        // 初始任务分配：为每个 worker 分配一个任务（使用各自的初始分块大小）
+        info!("开始初始任务分配");
         for worker_id in 0..self.pool.worker_channels.len() {
-            if let Some((task, _)) = self.task_allocator.try_allocate_next_task() {
+            let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+            if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size) {
+                info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
                 if let Err(e) = self.pool.send_task(task, worker_id).await {
                     error!("初始任务分配失败: {:?}", e);
                 }
@@ -462,9 +446,9 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         
         loop {
             tokio::select! {
-                // 定时器触发：更新进度和调整分块大小
+                // 定时器触发：发送进度更新
                 _ = progress_timer.tick() => {
-                    self.adjust_chunk_size_and_send_progress().await;
+                    self.send_progress().await;
                 }
                 
                 // 接收 worker 结果并分配新任务
@@ -473,11 +457,14 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
                         Some(RangeResult::Complete { worker_id }) => {
                             self.progress_reporter.record_range_complete();
                             
-                            // 为该 worker 分配新任务
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task() {
+                            // 根据该 worker 的实时速度计算新的分块大小
+                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
+                            
+                            // 为该 worker 分配新任务（使用计算得到的分块大小）
+                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size) {
                                 debug!(
-                                    "Worker #{} 完成任务，分配新任务到 Worker #{}",
-                                    worker_id, target_worker
+                                    "Worker #{} 完成任务，分配新任务到 Worker #{}，分块大小 {} bytes",
+                                    worker_id, target_worker, chunk_size
                                 );
                                 if let Err(e) = self.pool.send_task(task, target_worker).await {
                                     error!("分配新任务失败: {:?}", e);
@@ -497,11 +484,12 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
                             failed_ranges.push((range, error));
                             self.progress_reporter.record_range_complete();
                             
-                            // 失败后也需要分配新任务
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task() {
+                            // 失败后也需要分配新任务（使用该 worker 的分块大小）
+                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
+                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size) {
                                 debug!(
-                                    "Worker #{} 任务失败，分配新任务到 Worker #{}",
-                                    worker_id, target_worker
+                                    "Worker #{} 任务失败，分配新任务到 Worker #{}，分块大小 {} bytes",
+                                    worker_id, target_worker, chunk_size
                                 );
                                 if let Err(e) = self.pool.send_task(task, target_worker).await {
                                     error!("分配新任务失败: {:?}", e);
@@ -529,26 +517,11 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         Ok(failed_ranges)
     }
     
-    /// 调整分块大小并发送进度更新
+    /// 发送进度更新
     /// 
-    /// 根据实时速度动态调整分块大小，并发送进度更新
-    async fn adjust_chunk_size_and_send_progress(&mut self) {
-        // 根据实时速度调整分块大小
-        let (instant_speed, instant_valid) = self.pool.get_total_instant_speed();
-        if instant_valid {
-            if let Some((old_size, new_size)) = self.task_allocator.adjust_chunk_size(instant_speed) {
-                info!(
-                    "根据实时速度 {:.2} MB/s 调整分块大小: {} -> {} bytes",
-                    instant_speed / 1024.0 / 1024.0,
-                    old_size,
-                    new_size
-                );
-            }
-        }
-        
-        // 发送进度更新
-        let current_chunk_size = self.task_allocator.current_chunk_size();
-        self.progress_reporter.send_progress_update(&self.pool, current_chunk_size).await;
+    /// 定期发送进度更新（分块大小由各 worker 独立调整）
+    async fn send_progress(&mut self) {
+        self.progress_reporter.send_progress_update(&self.pool).await;
     }
     
     /// 关闭并清理资源
@@ -657,7 +630,7 @@ where
         client, 
         worker_count, 
         Arc::clone(&writer),
-        config.instant_speed_window(),
+        config,
     );
 
     // 创建下载任务（使用动态分块）
@@ -671,9 +644,9 @@ where
         Arc::new(config.clone()),
     );
     
-    // 发送开始事件
+    // 发送开始事件（使用第一个 worker 的初始分块大小）
     let worker_count = task.pool.worker_channels.len();
-    let initial_chunk_size = task.task_allocator.current_chunk_size();
+    let initial_chunk_size = task.pool.get_worker_chunk_size(0);
     task.progress_reporter.send_started_event(worker_count, initial_chunk_size).await;
 
     // 等待所有任务完成（内部会动态分配任务）
@@ -741,11 +714,11 @@ where
 /// // 监听进度
 /// while let Some(progress) = handle.progress_receiver().recv().await {
 ///     match progress {
-///         DownloadProgress::Progress { percentage, avg_speed, current_chunk_size, worker_stats, .. } => {
-///             println!("进度: {:.1}%, 速度: {:.2} MB/s, 分块: {:.2} MB, {} workers", 
+///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
+///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers", 
 ///                 percentage, 
 ///                 avg_speed / 1024.0 / 1024.0,
-///                 current_chunk_size as f64 / 1024.0 / 1024.0,
 ///                 worker_stats.len());
 ///         }
 ///         DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {
