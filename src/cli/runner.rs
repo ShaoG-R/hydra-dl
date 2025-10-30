@@ -1,9 +1,8 @@
-use anyhow::Result;
 use log::info;
 use std::path::PathBuf;
 
 use crate::{download_ranged, DownloadConfig};
-use super::Cli;
+use super::{Cli, Result};
 use super::progress::ProgressManager;
 use super::utils::format_bytes;
 

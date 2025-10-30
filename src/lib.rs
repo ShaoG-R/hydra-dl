@@ -20,7 +20,7 @@
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
+//! async fn main() -> Result<(), rs_dn::DownloadError> {
 //!     // 简单下载单个文件
 //!     rs_dn::download_file("https://example.com/file.zip", "file.zip").await?;
 //!     Ok(())
@@ -34,7 +34,7 @@
 //! use rs_dn::{DownloadConfig, DownloadProgress};
 //!
 //! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
+//! async fn main() -> Result<(), rs_dn::DownloadError> {
 //!     // 使用默认配置：4个worker，动态分块（2-50 MB）
 //!     let config = DownloadConfig::default();
 //!     let mut handle = rs_dn::download_ranged(
@@ -82,7 +82,7 @@
 //! use rs_dn::{DownloadConfig, DownloadProgress};
 //!
 //! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
+//! async fn main() -> Result<(), rs_dn::DownloadError> {
 //!     // 自定义配置：更多 worker，更大的分块范围
 //!     let config = DownloadConfig::builder()
 //!         .worker_count(8)                         // 8 个并发 worker
@@ -129,8 +129,42 @@ pub use config::{DownloadConfig, DownloadConfigBuilder};
 pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
 pub use task::FileTask;
 
-use anyhow::Result;
 use std::path::Path;
+
+/// 下载错误类型
+#[derive(thiserror::Error, Debug)]
+pub enum DownloadError {
+    /// Fetch 错误
+    #[error(transparent)]
+    Fetch(#[from] tools::fetch::FetchError),
+    
+    /// Range Writer 错误
+    #[error(transparent)]
+    RangeWriter(#[from] tools::range_writer::RangeWriterError),
+    
+    /// 任务发送错误
+    #[error("任务发送失败: {0}")]
+    TaskSend(String),
+    
+    /// 下载任务 panic
+    #[error("下载任务 panic: {0}")]
+    TaskPanic(String),
+    
+    /// Worker 退出失败
+    #[error("等待 Worker #{0} 退出失败")]
+    WorkerExit(usize),
+    
+    /// Range Writer 所有权错误
+    #[error("无法获取 RangeWriter 的所有权（仍有其他引用）")]
+    WriterOwnership,
+    
+    /// 通用错误
+    #[error("{0}")]
+    Other(String),
+}
+
+/// 下载结果类型
+pub type Result<T> = std::result::Result<T, DownloadError>;
 
 /// 下载单个文件
 ///
@@ -145,7 +179,7 @@ use std::path::Path;
 /// ```no_run
 /// # use rs_dn::download_file;
 /// # #[tokio::main]
-/// # async fn main() -> anyhow::Result<()> {
+/// # async fn main() -> Result<(), rs_dn::DownloadError> {
 /// download_file("https://example.com/file.txt", "file.txt").await?;
 /// # Ok(())
 /// # }

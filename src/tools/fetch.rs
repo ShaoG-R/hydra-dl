@@ -1,13 +1,39 @@
-use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use log::{debug, info};
 use std::sync::Arc;
+use thiserror::Error;
 
-use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient, HttpResponse};
+use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient, HttpResponse, IoError};
 use crate::tools::range_writer::AllocatedRange;
 use crate::task::{FileTask, RangeSupport};
 use crate::tools::stats::DownloadStats;
+
+/// Fetch 操作错误类型
+#[derive(Error, Debug)]
+pub enum FetchError {
+    /// IO 错误
+    #[error(transparent)]
+    Io(#[from] IoError),
+    
+    /// HTTP 请求失败
+    #[error("HTTP 请求失败，状态码: {0}")]
+    HttpStatus(u16),
+    
+    /// Content-Range header 缺失
+    #[error("缺少 Content-Range header")]
+    MissingContentRange,
+    
+    /// Content-Range 格式错误
+    #[error("Content-Range 格式错误，缺少 '/' 分隔符")]
+    InvalidContentRangeFormat,
+    
+    /// 无法解析文件总大小
+    #[error("无法解析文件总大小为 u64: {0}")]
+    InvalidContentRangeSize(String),
+}
+
+pub type Result<T> = std::result::Result<T, FetchError>;
 
 /// 获取并保存完整文件
 pub async fn fetch_file<C, FS>(
@@ -21,31 +47,26 @@ where
 {
     info!("开始下载: {} -> {:?}", task.url, task.save_path);
 
-    let response = client
-        .get(&task.url)
-        .await
-        .context("发送 HTTP 请求失败")?;
+    let response = client.get(&task.url).await?;
 
     if !response.status().is_success() {
-        anyhow::bail!("HTTP 请求失败，状态码: {}", response.status());
+        return Err(FetchError::HttpStatus(response.status().as_u16()));
     }
 
     // 创建文件
-    let mut file = fs.create(&task.save_path)
-        .await
-        .context("创建文件失败")?;
+    let mut file = fs.create(&task.save_path).await?;
 
     // 流式下载
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("读取数据块失败")?;
-        file.write_all(&chunk).await.context("写入文件失败")?;
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
     }
 
-    file.flush().await.context("刷新文件缓冲区失败")?;
+    file.flush().await?;
 
     info!(
         "下载完成: {} ({} bytes) -> {:?}",
@@ -82,11 +103,10 @@ where
 
     let response = client
         .get_with_range(url, range.start(), range.end() - 1)
-        .await
-        .context("发送 HTTP Range 请求失败")?;
+        .await?;
 
     if !response.status().is_success() && response.status().as_u16() != 206 {
-        anyhow::bail!("HTTP 请求失败，状态码: {}", response.status());
+        return Err(FetchError::HttpStatus(response.status().as_u16()));
     }
 
     // 流式下载到内存，每个 chunk 到达时实时更新统计
@@ -94,7 +114,7 @@ where
     let mut buffer = BytesMut::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("读取数据块失败")?;
+        let chunk = chunk?;
         let chunk_size = chunk.len() as u64;
         
         // 实时记录 chunk
@@ -158,7 +178,7 @@ impl<'a, C: HttpClient> RangeSupportChecker<'a, C> {
         
         // 检查状态码，如果不是 2xx 成功状态，返回错误触发回退
         if !response.status().is_success() {
-            anyhow::bail!("HEAD 请求返回非成功状态码: {}", response.status());
+            return Err(FetchError::HttpStatus(response.status().as_u16()));
         }
         
         Self::parse_from_head_response(&response)
@@ -232,7 +252,7 @@ impl<'a, C: HttpClient> RangeSupportChecker<'a, C> {
                 content_length,
             })
         } else {
-            anyhow::bail!("Range 检测失败，状态码: {}", status);
+            Err(FetchError::HttpStatus(status.as_u16()))
         }
     }
     
@@ -245,16 +265,16 @@ impl<'a, C: HttpClient> RangeSupportChecker<'a, C> {
             .headers()
             .get("content-range")
             .and_then(|v| v.to_str().ok())
-            .context("缺少 Content-Range header")?;
+            .ok_or(FetchError::MissingContentRange)?;
         
         // 解析 "bytes 0-0/12345" 格式，提取 "/" 后的总大小
         let total = content_range
             .split('/')
             .nth(1)
-            .context("Content-Range 格式错误，缺少 '/' 分隔符")?
+            .ok_or(FetchError::InvalidContentRangeFormat)?
             .trim()
             .parse::<u64>()
-            .context("无法解析文件总大小为 u64")?;
+            .map_err(|e| FetchError::InvalidContentRangeSize(e.to_string()))?;
         
         Ok(total)
     }
@@ -263,6 +283,7 @@ impl<'a, C: HttpClient> RangeSupportChecker<'a, C> {
 /// 检查服务器是否支持 Range 请求
 /// 
 /// 内部使用 `RangeSupportChecker`，会自动处理 HEAD 失败的情况
+#[inline]
 pub async fn check_range_support<C>(client: &C, url: &str) -> Result<RangeSupport>
 where
     C: HttpClient,

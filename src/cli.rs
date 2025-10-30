@@ -1,9 +1,39 @@
-use anyhow::Result;
 use clap::Parser;
 
 mod progress;
 mod runner;
 pub mod utils;
+
+/// CLI 错误类型
+#[derive(thiserror::Error, Debug)]
+pub enum CliError {
+    /// 下载错误
+    #[error(transparent)]
+    Download(#[from] crate::DownloadError),
+    
+    /// URL 解析错误
+    #[error("URL 解析失败: {0}")]
+    UrlParse(#[from] url::ParseError),
+    
+    /// URL 解码错误
+    #[error("URL 解码失败: {0}")]
+    UrlDecode(String),
+    
+    /// IO 错误
+    #[error("IO 错误: {0}")]
+    Io(#[from] std::io::Error),
+    
+    /// 路径错误
+    #[error("{0}")]
+    Path(String),
+    
+    /// 通用错误
+    #[error("{0}")]
+    Other(String),
+}
+
+/// CLI 结果类型
+pub type Result<T> = std::result::Result<T, CliError>;
 
 /// 高性能 Rust 下载器
 #[derive(Parser, Debug)]

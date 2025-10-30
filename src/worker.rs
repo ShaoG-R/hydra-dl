@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::{DownloadError, Result};
 use log::{debug, error, info};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -213,7 +213,7 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
         self.worker_channels[worker_id].task_sender
             .send(task)
             .await
-            .context("发送任务失败")?;
+            .map_err(|e| DownloadError::TaskSend(e.to_string()))?;
         Ok(())
     }
 

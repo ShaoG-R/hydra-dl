@@ -29,7 +29,7 @@
 //! # use bytes::Bytes;
 //! # use std::path::PathBuf;
 //! # #[tokio::main]
-//! # async fn main() -> anyhow::Result<()> {
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let fs = TokioFileSystem::default();
 //! // 创建写入器和分配器
 //! let (writer, mut allocator) = RangeWriter::new(
@@ -54,7 +54,6 @@
 //! # }
 //! ```
 
-use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::info;
 use std::io::SeekFrom;
@@ -62,9 +61,27 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::tools::io_traits::{AsyncFile, FileSystem};
+use crate::tools::io_traits::{AsyncFile, FileSystem, IoError};
+
+/// Range Writer 错误类型
+#[derive(Error, Debug)]
+pub enum RangeWriterError {
+    /// IO 错误
+    #[error(transparent)]
+    Io(#[from] IoError),
+    
+    /// 数据大小与 Range 大小不匹配
+    #[error("数据大小 ({data_len} bytes) 与 Range 大小 ({range_size} bytes) 不匹配")]
+    SizeMismatch {
+        data_len: u64,
+        range_size: u64,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, RangeWriterError>;
 
 /// 已分配的 Range
 /// 
@@ -219,36 +236,36 @@ impl RangeAllocator {
 /// 
 /// 通过已写入字节数与文件总大小比较来判断完成状态
 /// 
-/// # Example
-/// 
-/// ```no_run
-/// # use rs_dn::tools::range_writer::RangeWriter;
-/// # use rs_dn::tools::io_traits::TokioFileSystem;
-/// # use std::path::PathBuf;
-/// # use bytes::Bytes;
-/// # #[tokio::main]
-/// # async fn main() -> anyhow::Result<()> {
-/// let fs = TokioFileSystem::default();
-/// let (writer, mut allocator) = RangeWriter::new(
-///     &fs,
-///     PathBuf::from("output.dat"),
-///     1000  // 总大小 1000 bytes
-/// ).await?;
-///
-/// // 使用 allocator 分配 Range（保证不重叠且有效）
-/// let range1 = allocator.allocate(100).unwrap();
-/// writer.write_range(range1, Bytes::from(vec![1; 100])).await?;
-///
-/// let range2 = allocator.allocate(100).unwrap();
-/// writer.write_range(range2, Bytes::from(vec![2; 100])).await?;
-///
-/// // 当所有字节都写入后，自动判断完成
-/// if writer.is_complete() {
-///     writer.finalize().await?;
-/// }
-/// # Ok(())
-/// # }
-/// ```
+    /// # Example
+    /// 
+    /// ```no_run
+    /// # use rs_dn::tools::range_writer::RangeWriter;
+    /// # use rs_dn::tools::io_traits::TokioFileSystem;
+    /// # use std::path::PathBuf;
+    /// # use bytes::Bytes;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let fs = TokioFileSystem::default();
+    /// let (writer, mut allocator) = RangeWriter::new(
+    ///     &fs,
+    ///     PathBuf::from("output.dat"),
+    ///     1000  // 总大小 1000 bytes
+    /// ).await?;
+    ///
+    /// // 使用 allocator 分配 Range（保证不重叠且有效）
+    /// let range1 = allocator.allocate(100).unwrap();
+    /// writer.write_range(range1, Bytes::from(vec![1; 100])).await?;
+    ///
+    /// let range2 = allocator.allocate(100).unwrap();
+    /// writer.write_range(range2, Bytes::from(vec![2; 100])).await?;
+    ///
+    /// // 当所有字节都写入后，自动判断完成
+    /// if writer.is_complete() {
+    ///     writer.finalize().await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
 #[derive(Clone)]
 pub struct RangeWriter<F: AsyncFile> {
     file: Arc<Mutex<F>>,
@@ -281,14 +298,10 @@ impl<F: AsyncFile> RangeWriter<F> {
     {
         info!("创建 RangeWriter: {:?} ({} bytes)", path, total_size);
         
-        let file = fs.create(&path)
-            .await
-            .context("创建文件失败")?;
+        let file = fs.create(&path).await?;
         
         // 预分配文件大小
-        file.set_len(total_size)
-            .await
-            .context("预分配文件大小失败")?;
+        file.set_len(total_size).await?;
         
         let writer = Self {
             file: Arc::new(Mutex::new(file)),
@@ -323,26 +336,19 @@ impl<F: AsyncFile> RangeWriter<F> {
         let range_size = range.len();
         let data_len = data.len() as u64;
         
-        anyhow::ensure!(
-            data_len == range_size,
-            "数据大小 ({} bytes) 与 Range 大小 ({} bytes) 不匹配",
-            data_len,
-            range_size
-        );
+        if data_len != range_size {
+            return Err(RangeWriterError::SizeMismatch { data_len, range_size });
+        }
         
         // 锁定文件进行写入
         {
             let mut file = self.file.lock().await;
             
             // 定位到文件指定位置
-            file.seek(SeekFrom::Start(range.start()))
-                .await
-                .context("文件定位失败")?;
+            file.seek(SeekFrom::Start(range.start())).await?;
             
             // 写入数据
-            file.write_all(&data)
-                .await
-                .context("写入数据失败")?;
+            file.write_all(&data).await?;
         }
         
         // 无锁更新已写入字节数
@@ -391,9 +397,7 @@ impl<F: AsyncFile> RangeWriter<F> {
     /// 如果刷新失败，返回错误
     pub async fn finalize(self) -> Result<()> {
         let mut file = self.file.lock().await;
-        file.flush()
-            .await
-            .context("刷新文件缓冲区失败")?;
+        file.flush().await?;
         
         let written = self.written_bytes.load(Ordering::SeqCst);
         info!(

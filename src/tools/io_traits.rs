@@ -2,7 +2,6 @@
 //!
 //! 为HTTP客户端和文件系统操作提供trait抽象，便于测试
 
-use anyhow::Result;
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::{header::HeaderMap, StatusCode};
@@ -11,6 +10,53 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::pin::Pin;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use thiserror::Error;
+
+/// IO 操作错误类型
+#[derive(Error, Debug)]
+pub enum IoError {
+    /// HTTP GET 请求失败
+    #[error("HTTP GET请求失败: {0}")]
+    HttpGet(#[source] reqwest::Error),
+    
+    /// HTTP HEAD 请求失败
+    #[error("HTTP HEAD请求失败: {0}")]
+    HttpHead(#[source] reqwest::Error),
+    
+    /// HTTP Range 请求失败
+    #[error("HTTP Range请求失败: {0}")]
+    HttpRange(#[source] reqwest::Error),
+    
+    /// 创建文件失败
+    #[error("创建文件失败: {0}")]
+    FileCreate(#[source] std::io::Error),
+    
+    /// 写入文件失败
+    #[error("写入文件失败: {0}")]
+    FileWrite(#[source] std::io::Error),
+    
+    /// 刷新文件缓冲区失败
+    #[error("刷新文件缓冲区失败: {0}")]
+    FileFlush(#[source] std::io::Error),
+    
+    /// 设置文件大小失败
+    #[error("设置文件大小失败: {0}")]
+    FileSetLen(#[source] std::io::Error),
+    
+    /// 文件定位失败
+    #[error("文件定位失败: {0}")]
+    FileSeek(#[source] std::io::Error),
+    
+    /// 流式读取数据块失败
+    #[error("读取数据块失败: {0}")]
+    StreamRead(String),
+    
+    /// Mock 测试错误
+    #[error("{0}")]
+    Mock(String),
+}
+
+pub type Result<T> = std::result::Result<T, IoError>;
 
 /// HTTP客户端trait
 ///
@@ -35,7 +81,7 @@ pub trait HttpClient: Send + Sync {
 /// 抽象HTTP响应的核心操作
 pub trait HttpResponse: Send {
     /// 字节流类型
-    type BytesStream: Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin;
+    type BytesStream: Stream<Item = Result<Bytes>> + Send + Unpin;
 
     /// 获取HTTP状态码
     fn status(&self) -> StatusCode;
@@ -83,11 +129,11 @@ pub trait AsyncFile: Send + 'static {
 
 /// reqwest::Response的字节流包装器
 pub struct ReqwestBytesStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>,   
 }
 
 impl Stream for ReqwestBytesStream {
-    type Item = Result<Bytes, anyhow::Error>;
+    type Item = Result<Bytes>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -95,7 +141,7 @@ impl Stream for ReqwestBytesStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner)
             .poll_next(cx)
-            .map(|opt| opt.map(|res| res.map_err(|e| anyhow::anyhow!(e))))
+            .map(|opt| opt.map(|res| res.map_err(|e| IoError::StreamRead(e.to_string()))))
     }
 }
 
@@ -109,7 +155,7 @@ impl HttpClient for reqwest::Client {
         self.get(&url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("HTTP GET请求失败: {}", e))
+            .map_err(IoError::HttpGet)
     }
 
     async fn head(&self, url: &str) -> Result<Self::Response> {
@@ -117,7 +163,7 @@ impl HttpClient for reqwest::Client {
         self.head(&url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("HTTP HEAD请求失败: {}", e))
+            .map_err(IoError::HttpHead)
     }
 
     async fn get_with_range(&self, url: &str, start: u64, end: u64) -> Result<Self::Response> {
@@ -126,7 +172,7 @@ impl HttpClient for reqwest::Client {
             .header("Range", format!("bytes={}-{}", start, end))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("HTTP Range请求失败: {}", e))
+            .map_err(IoError::HttpRange)
     }
 }
 
@@ -162,7 +208,7 @@ impl FileSystem for TokioFileSystem {
         let path = path.to_path_buf();
         tokio::fs::File::create(&path)
             .await
-            .map_err(|e| anyhow::anyhow!("创建文件失败: {}", e))
+            .map_err(IoError::FileCreate)
     }
 }
 
@@ -172,25 +218,25 @@ impl AsyncFile for tokio::fs::File {
     async fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Result<()> {
         AsyncWriteExt::write_all(self, buf)
             .await
-            .map_err(|e| anyhow::anyhow!("写入文件失败: {}", e))
+            .map_err(IoError::FileWrite)
     }
 
     async fn flush(&mut self) -> Result<()> {
         AsyncWriteExt::flush(self)
             .await
-            .map_err(|e| anyhow::anyhow!("刷新文件缓冲区失败: {}", e))
+            .map_err(IoError::FileFlush)
     }
 
     async fn set_len(&self, size: u64) -> Result<()> {
         self.set_len(size)
             .await
-            .map_err(|e| anyhow::anyhow!("设置文件大小失败: {}", e))
+            .map_err(IoError::FileSetLen)
     }
 
     async fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         AsyncSeekExt::seek(self, pos)
             .await
-            .map_err(|e| anyhow::anyhow!("文件定位失败: {}", e))
+            .map_err(IoError::FileSeek)
     }
 }
 
@@ -215,7 +261,7 @@ pub mod mock {
     }
     
     impl HttpResponse for MockHttpResponse {
-        type BytesStream = Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>>;
+        type BytesStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>>;
         
         fn status(&self) -> StatusCode {
             self.status
@@ -321,7 +367,7 @@ pub mod mock {
             
             self.get_responses.lock().unwrap()
                 .remove(url)
-                .ok_or_else(|| anyhow::anyhow!("未找到预设 GET 响应: {}", url))
+                .ok_or_else(|| IoError::Mock(format!("未找到预设 GET 响应: {}", url)))
         }
         
         async fn head(&self, url: &str) -> Result<Self::Response> {
@@ -329,7 +375,7 @@ pub mod mock {
             
             self.head_responses.lock().unwrap()
                 .remove(url)
-                .ok_or_else(|| anyhow::anyhow!("未找到预设 HEAD 响应: {}", url))
+                .ok_or_else(|| IoError::Mock(format!("未找到预设 HEAD 响应: {}", url)))
         }
         
         async fn get_with_range(&self, url: &str, start: u64, end: u64) -> Result<Self::Response> {
@@ -337,7 +383,7 @@ pub mod mock {
             
             self.range_responses.lock().unwrap()
                 .remove(&(url.to_string(), start, end))
-                .ok_or_else(|| anyhow::anyhow!("未找到预设 Range 响应: {} ({}-{})", url, start, end))
+                .ok_or_else(|| IoError::Mock(format!("未找到预设 Range 响应: {} ({}-{})", url, start, end)))
         }
     }
     
@@ -424,7 +470,10 @@ pub mod mock {
             };
             
             if new_pos < 0 {
-                anyhow::bail!("Seek 位置无效: {}", new_pos);
+                return Err(IoError::FileSeek(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Seek 位置无效: {}", new_pos)
+                )));
             }
             
             *position = new_pos as u64;

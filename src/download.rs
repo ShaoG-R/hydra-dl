@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::{DownloadError, Result};
 use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -95,7 +95,7 @@ impl DownloadHandle {
     pub async fn wait(self) -> Result<()> {
         self.completion_handle
             .await
-            .context("下载任务 panic")?
+            .map_err(|e| DownloadError::TaskPanic(e.to_string()))?
     }
     
     /// 获取进度接收器的可变引用
@@ -159,13 +159,13 @@ impl DownloadHandle {
                     while let Ok(progress) = self.progress_rx.try_recv() {
                         callback(progress);
                     }
-                    return result.context("下载任务 panic")?;
+                    return result.map_err(|e| DownloadError::TaskPanic(e.to_string()))?;
                 }
             }
         }
         
         // channel 关闭后等待任务完成
-        self.completion_handle.await.context("下载任务 panic")?
+        self.completion_handle.await.map_err(|e| DownloadError::TaskPanic(e.to_string()))?
     }
 }
 
@@ -568,7 +568,7 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         }
         
         if let Some(msg) = error_msg {
-            anyhow::bail!(msg);
+            return Err(DownloadError::Other(msg));
         }
         
         Ok(())
@@ -586,12 +586,12 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         for (id, handle) in self.pool.worker_handles.into_iter().enumerate() {
             handle
                 .await
-                .context(format!("等待 Worker #{} 退出失败", id))?;
+                .map_err(|_| DownloadError::WorkerExit(id))?;
         }
         
         // 完成写入（从 Arc 中提取 writer）
         let writer = Arc::try_unwrap(self.writer)
-            .map_err(|_| anyhow::anyhow!("无法获取 RangeWriter 的所有权（仍有其他引用）"))?;
+            .map_err(|_| DownloadError::WriterOwnership)?;
         writer.finalize().await?;
         
         info!("Range 下载任务完成: {:?}", save_path);
@@ -636,10 +636,10 @@ where
             url: url.to_string(),
             save_path: save_path.clone(),
         };
-        return crate::tools::fetch::fetch_file(&client, task, &fs).await;
+        return Ok(crate::tools::fetch::fetch_file(&client, task, &fs).await?);
     }
 
-    let content_length = range_support.content_length.context("无法获取文件大小")?;
+    let content_length = range_support.content_length.ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
     info!("文件大小: {} bytes ({:.2} MB)", content_length, content_length as f64 / 1024.0 / 1024.0);
     info!(
         "动态分块配置: 初始 {} bytes, 范围 {} ~ {} bytes",

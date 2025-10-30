@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+use super::{CliError, Result};
 
 /// 从 URL 提取文件名
 ///
@@ -11,25 +11,25 @@ use std::path::PathBuf;
 /// ```
 pub fn extract_filename_from_url(url: &str) -> Result<String> {
     // 解析 URL
-    let parsed_url = url::Url::parse(url).context("无效的 URL")?;
+    let parsed_url = url::Url::parse(url)?;
     
     // 获取路径段
     let path_segments = parsed_url
         .path_segments()
-        .context("无法提取 URL 路径")?;
+        .ok_or_else(|| CliError::Path("无法提取 URL 路径".to_string()))?;
     
     // 获取最后一个段作为文件名
     let filename = path_segments
         .last()
-        .context("URL 中没有文件名")?;
+        .ok_or_else(|| CliError::Path("URL 中没有文件名".to_string()))?;
     
     if filename.is_empty() {
-        bail!("无法从 URL 提取文件名，请使用 -o 参数指定输出路径");
+        return Err(CliError::Path("无法从 URL 提取文件名，请使用 -o 参数指定输出路径".to_string()));
     }
     
     // URL 解码
     let decoded = urlencoding::decode(filename)
-        .context("URL 解码失败")?
+        .map_err(|e| CliError::UrlDecode(e.to_string()))?
         .to_string();
     
     Ok(decoded)
@@ -50,7 +50,7 @@ pub fn validate_output_path(path: &str) -> Result<PathBuf> {
     if let Some(parent) = path_buf.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent)
-                .context(format!("无法创建目录: {:?}", parent))?;
+                .map_err(|e| CliError::Io(e))?;
         }
     }
     
