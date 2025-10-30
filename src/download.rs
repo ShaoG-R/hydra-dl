@@ -278,65 +278,56 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
                     self.adjust_chunk_size_and_send_progress().await;
                 }
                 
-                // 轮询 worker 结果并分配新任务
-                _ = async {
-                    let mut found = false;
-                    let mut completed_workers = Vec::new();
-                    
-                    // 轮询所有 worker 的结果
-                    for (worker_id, channel) in self.pool.worker_channels.iter_mut().enumerate() {
-                        match channel.result_receiver.try_recv() {
-                            Ok(RangeResult::Complete(_)) => {
-                                self.total_ranges_completed += 1;
-                                found = true;
-                                
-                                // 记录需要分配新任务的 worker
-                                completed_workers.push(worker_id);
-                            }
-                            Ok(RangeResult::Failed { range, error }) => {
-                                error!(
-                                    "Worker #{} Range {}..{} 失败: {}",
-                                    worker_id,
-                                    range.start(),
-                                    range.end(),
-                                    error
+                // 接收 worker 结果并分配新任务
+                result = self.pool.result_receiver.recv() => {
+                    match result {
+                        Some(RangeResult::Complete { worker_id }) => {
+                            self.total_ranges_completed += 1;
+                            
+                            // 为该 worker 分配新任务
+                            if let Some((task, target_worker)) = self.try_allocate_next_task() {
+                                debug!(
+                                    "Worker #{} 完成任务，分配新任务到 Worker #{}",
+                                    worker_id, target_worker
                                 );
-                                failed_ranges.push((range, error));
-                                self.total_ranges_completed += 1;
-                                found = true;
-                                
-                                // 失败后也需要分配新任务
-                                completed_workers.push(worker_id);
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => {
-                                // 该 receiver 暂时没有数据
-                            }
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                // 该 worker 已退出
+                                if let Err(e) = self.pool.send_task(task, target_worker).await {
+                                    error!("分配新任务失败: {:?}", e);
+                                }
+                            } else {
+                                debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
                             }
                         }
-                    }
-                    
-                    // 为完成任务的 worker 分配新任务
-                    for worker_id in completed_workers {
-                        if let Some((task, target_worker)) = self.try_allocate_next_task() {
-                            debug!(
-                                "Worker #{} 完成任务，分配新任务到 Worker #{}",
-                                worker_id, target_worker
+                        Some(RangeResult::Failed { worker_id, range, error }) => {
+                            error!(
+                                "Worker #{} Range {}..{} 失败: {}",
+                                worker_id,
+                                range.start(),
+                                range.end(),
+                                error
                             );
-                            if let Err(e) = self.pool.send_task(task, target_worker).await {
-                                error!("分配新任务失败: {:?}", e);
+                            failed_ranges.push((range, error));
+                            self.total_ranges_completed += 1;
+                            
+                            // 失败后也需要分配新任务
+                            if let Some((task, target_worker)) = self.try_allocate_next_task() {
+                                debug!(
+                                    "Worker #{} 任务失败，分配新任务到 Worker #{}",
+                                    worker_id, target_worker
+                                );
+                                if let Err(e) = self.pool.send_task(task, target_worker).await {
+                                    error!("分配新任务失败: {:?}", e);
+                                }
+                            } else {
+                                debug!("Worker #{} 任务失败，但没有更多任务可分配", worker_id);
                             }
-                        } else {
-                            debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
+                        }
+                        None => {
+                            // 所有 worker 的 result_sender 都已关闭
+                            info!("所有 worker 已退出");
+                            break;
                         }
                     }
-                    
-                    if !found {
-                        // 没有任何信号到达，稍等一下
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                } => {}
+                }
             }
             
             // 检查是否所有任务完成

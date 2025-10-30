@@ -65,7 +65,7 @@ where
                                         stats.record_range_complete();
                                         
                                         // 发送完成信号
-                                        if let Err(e) = result_sender.send(RangeResult::Complete(())).await {
+                                        if let Err(e) = result_sender.send(RangeResult::Complete { worker_id: id }).await {
                                             error!("Worker #{} 发送完成信号失败: {:?}", id, e);
                                         }
                                     }
@@ -74,6 +74,7 @@ where
                                         let error_msg = format!("写入失败: {:?}", e);
                                         error!("Worker #{} {}", id, error_msg);
                                         if let Err(e) = result_sender.send(RangeResult::Failed { 
+                                            worker_id: id,
                                             range, 
                                             error: error_msg 
                                         }).await {
@@ -87,6 +88,7 @@ where
                                 let error_msg = format!("下载失败: {:?}", e);
                                 error!("Worker #{} Range {}..{} {}", id, range.start(), range.end(), error_msg);
                                 if let Err(e) = result_sender.send(RangeResult::Failed { 
+                                    worker_id: id,
                                     range, 
                                     error: error_msg 
                                 }).await {
@@ -114,8 +116,6 @@ where
 pub(crate) struct WorkerChannel {
     /// 向 worker 发送任务的通道
     pub(crate) task_sender: mpsc::Sender<WorkerTask>,
-    /// 从 worker 接收结果的通道
-    pub(crate) result_receiver: mpsc::Receiver<RangeResult>,
     /// 向 worker 发送关闭信号的 oneshot channel
     pub(crate) shutdown_sender: Option<oneshot::Sender<()>>,
     /// 该 worker 的独立下载统计
@@ -131,6 +131,8 @@ pub(crate) struct WorkerPool<F: AsyncFile> {
     pub(crate) worker_channels: Vec<WorkerChannel>,
     /// Worker 协程的句柄
     pub(crate) worker_handles: Vec<JoinHandle<()>>,
+    /// 统一的结果接收器（所有 worker 共享）
+    pub(crate) result_receiver: mpsc::Receiver<RangeResult>,
     /// 全局统计管理器（聚合所有 worker 的数据）
     global_stats: DownloadStatsParent,
     _phantom: PhantomData<F>,
@@ -159,42 +161,48 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
         // 创建全局统计管理器（使用配置的时间窗口）
         let global_stats = DownloadStatsParent::with_window(instant_speed_window);
         
+        // 创建统一的 result channel（所有 worker 共享同一个 sender）
+        let (result_sender, result_receiver) = mpsc::channel::<RangeResult>(100);
+        
         let mut worker_channels = Vec::new();
         let mut worker_handles = Vec::new();
 
-        // 为每个 worker 创建独立的 task channel、result channel、shutdown channel 和统计信息
+        // 为每个 worker 创建独立的 task channel、shutdown channel 和统计信息
         for id in 0..worker_count {
             let (task_sender, task_receiver) = mpsc::channel::<WorkerTask>(100);
-            let (result_sender, result_receiver) = mpsc::channel::<RangeResult>(100);
             let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
             
             // 通过 parent 创建 child stats 并包装为 Arc
             let worker_stats = Arc::new(global_stats.create_child());
             
-            // 克隆 client、writer 和 stats Arc 给每个 worker
+            // 克隆 client、writer、result_sender 和 stats Arc 给每个 worker
             let client_clone = client.clone();
             let writer_clone = Arc::clone(&writer);
             let stats_clone = Arc::clone(&worker_stats);
+            let result_sender_clone = result_sender.clone();
             
             // 启动 worker 协程
             let handle = tokio::spawn(async move {
-                run_worker(id, client_clone, task_receiver, result_sender, shutdown_receiver, writer_clone, stats_clone).await;
+                run_worker(id, client_clone, task_receiver, result_sender_clone, shutdown_receiver, writer_clone, stats_clone).await;
             });
 
             worker_channels.push(WorkerChannel {
                 task_sender,
-                result_receiver,
                 shutdown_sender: Some(shutdown_sender),
                 stats: worker_stats,
             });
             worker_handles.push(handle);
         }
+        
+        // 释放原始的 result_sender，只保留 worker 持有的克隆
+        drop(result_sender);
 
         info!("创建协程池，{} 个 workers", worker_count);
 
         Self {
             worker_channels,
             worker_handles,
+            result_receiver,
             global_stats,
             _phantom: PhantomData,
         }
@@ -330,8 +338,8 @@ mod tests {
         assert!(result.is_some(), "应该收到结果");
         
         match result.unwrap() {
-            RangeResult::Complete(_) => {
-                // 成功
+            RangeResult::Complete { worker_id } => {
+                assert_eq!(worker_id, 0, "应该是 Worker #0 完成的任务");
             }
             RangeResult::Failed { error, .. } => {
                 panic!("任务不应该失败: {}", error);
@@ -559,11 +567,12 @@ mod tests {
         assert!(result.is_some(), "应该收到结果");
         
         match result.unwrap() {
-            RangeResult::Failed { error, .. } => {
+            RangeResult::Failed { worker_id, error, .. } => {
                 // 预期失败
+                assert_eq!(worker_id, 0, "应该是 Worker #0 失败的任务");
                 assert!(error.contains("下载失败"), "错误消息应该包含'下载失败'");
             }
-            RangeResult::Complete(_) => {
+            RangeResult::Complete { .. } => {
                 panic!("任务应该失败");
             }
         }

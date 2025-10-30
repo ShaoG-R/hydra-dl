@@ -29,10 +29,17 @@ pub(crate) enum WorkerTask {
 #[derive(Debug)]
 pub(crate) enum RangeResult {
     /// Range 成功完成
-    Complete(()),
+    Complete {
+        /// 完成此任务的 worker ID
+        worker_id: usize,
+    },
     /// Range 失败
     Failed {
+        /// 失败的 worker ID
+        worker_id: usize,
+        /// 失败的 range
         range: AllocatedRange,
+        /// 错误信息
         error: String,
     },
 }
