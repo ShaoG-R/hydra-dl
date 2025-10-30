@@ -3,7 +3,7 @@ use clap::Parser;
 
 mod progress;
 mod runner;
-mod utils;
+pub mod utils;
 
 /// 高性能 Rust 下载器
 #[derive(Parser, Debug)]

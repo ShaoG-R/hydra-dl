@@ -111,38 +111,172 @@ where
     Ok(buffer.freeze())
 }
 
+/// Range 支持检测器
+/// 
+/// 封装检测服务器是否支持 Range 请求的逻辑，提供多种检测策略：
+/// 1. 首先尝试 HEAD 请求（高效，无需下载数据）
+/// 2. HEAD 失败时回退到小的 Range GET 请求（bytes=0-0，处理不支持 HEAD 的服务器）
+pub struct RangeSupportChecker<'a, C: HttpClient> {
+    client: &'a C,
+    url: &'a str,
+}
+
+impl<'a, C: HttpClient> RangeSupportChecker<'a, C> {
+    /// 创建新的 Range 支持检测器
+    pub fn new(client: &'a C, url: &'a str) -> Self {
+        Self { client, url }
+    }
+    
+    /// 检测 Range 支持
+    /// 
+    /// 策略：
+    /// 1. 首先尝试 HEAD 请求（高效）
+    /// 2. HEAD 失败时（如 405 Method Not Allowed）回退到小的 Range GET 请求（bytes=0-0）
+    /// 
+    /// 这种策略能够处理以下场景：
+    /// - 服务器不支持 HEAD 方法
+    /// - 原始 URL 通过 302 重定向到实际下载链接
+    /// - reqwest 自动跟随重定向，Range GET 可到达最终 URL
+    pub async fn check(&self) -> Result<RangeSupport> {
+        // 尝试 HEAD
+        match self.check_with_head().await {
+            Ok(support) => {
+                debug!("HEAD 请求成功检测 Range 支持: supported={}, content_length={:?}", 
+                    support.supported, support.content_length);
+                Ok(support)
+            }
+            Err(e) => {
+                debug!("HEAD 请求失败: {}, 尝试 Range GET 回退", e);
+                self.check_with_range_get().await
+            }
+        }
+    }
+    
+    /// 使用 HEAD 请求检测
+    async fn check_with_head(&self) -> Result<RangeSupport> {
+        let response = self.client.head(self.url).await?;
+        
+        // 检查状态码，如果不是 2xx 成功状态，返回错误触发回退
+        if !response.status().is_success() {
+            anyhow::bail!("HEAD 请求返回非成功状态码: {}", response.status());
+        }
+        
+        Self::parse_from_head_response(&response)
+    }
+    
+    /// 使用小的 Range GET 请求检测（bytes=0-0）
+    /// 
+    /// 发送一个只请求第一个字节的 Range 请求：
+    /// - 如果服务器支持 Range，返回 206 Partial Content + Content-Range header
+    /// - 如果不支持，可能返回 200 OK + 完整内容（或部分内容）
+    async fn check_with_range_get(&self) -> Result<RangeSupport> {
+        debug!("发送 Range GET 请求 (bytes=0-0) 到: {}", self.url);
+        let response = self.client.get_with_range(self.url, 0, 0).await?;
+        Self::parse_from_range_response(&response)
+    }
+    
+    /// 从 HEAD 响应解析 Range 支持
+    /// 
+    /// 检查 Accept-Ranges header：
+    /// - "bytes" 表示支持
+    /// - "none" 表示不支持
+    /// - 缺失时默认不支持
+    fn parse_from_head_response<R: HttpResponse>(response: &R) -> Result<RangeSupport> {
+        let supported = response
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v != "none")
+            .unwrap_or(false);
+
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+
+        Ok(RangeSupport {
+            supported,
+            content_length,
+        })
+    }
+    
+    /// 从 Range GET 响应解析支持情况
+    /// 
+    /// 根据状态码判断：
+    /// - 206 Partial Content：支持 Range，从 Content-Range 获取总大小
+    /// - 200 OK：不支持 Range，从 Content-Length 获取大小
+    /// - 其他：检测失败
+    fn parse_from_range_response<R: HttpResponse>(response: &R) -> Result<RangeSupport> {
+        let status = response.status();
+        
+        if status.as_u16() == 206 {
+            // 支持 Range，从 Content-Range 获取总大小
+            let content_length = Self::parse_content_range_total(response)?;
+            debug!("Range GET 返回 206，支持 Range，文件大小: {} bytes", content_length);
+            Ok(RangeSupport {
+                supported: true,
+                content_length: Some(content_length),
+            })
+        } else if status.is_success() {
+            // 不支持 Range，从 Content-Length 获取大小
+            let content_length = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            
+            debug!("Range GET 返回 {}, 不支持 Range，文件大小: {:?}", status, content_length);
+            Ok(RangeSupport {
+                supported: false,
+                content_length,
+            })
+        } else {
+            anyhow::bail!("Range 检测失败，状态码: {}", status);
+        }
+    }
+    
+    /// 从 Content-Range header 解析总大小
+    /// 
+    /// Content-Range 格式：`bytes <start>-<end>/<total>`
+    /// 例如：`bytes 0-0/12345` 表示总大小为 12345 字节
+    fn parse_content_range_total<R: HttpResponse>(response: &R) -> Result<u64> {
+        let content_range = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .context("缺少 Content-Range header")?;
+        
+        // 解析 "bytes 0-0/12345" 格式，提取 "/" 后的总大小
+        let total = content_range
+            .split('/')
+            .nth(1)
+            .context("Content-Range 格式错误，缺少 '/' 分隔符")?
+            .trim()
+            .parse::<u64>()
+            .context("无法解析文件总大小为 u64")?;
+        
+        Ok(total)
+    }
+}
+
 /// 检查服务器是否支持 Range 请求
+/// 
+/// 内部使用 `RangeSupportChecker`，会自动处理 HEAD 失败的情况
 pub async fn check_range_support<C>(client: &C, url: &str) -> Result<RangeSupport>
 where
     C: HttpClient,
 {
-    let response = client.head(url).await?;
-
-    let supported = response
-        .headers()
-        .get("accept-ranges")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v != "none")
-        .unwrap_or(false);
-
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-
-    Ok(RangeSupport {
-        supported,
-        content_length,
-    })
+    RangeSupportChecker::new(client, url).check().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::io_traits::mock::{MockHttpClient, MockFileSystem};
+    use crate::tools::io_traits::mock::{MockHttpClient, MockFileSystem, MockHttpResponse};
     use crate::tools::range_writer::RangeAllocator;
     use reqwest::header::HeaderMap;
+    use reqwest::StatusCode;
     use std::path::PathBuf;
 
     #[tokio::test]
@@ -390,6 +524,259 @@ mod tests {
         // 验证统计信息（应该记录了多个 chunk）
         let (total_bytes, _, _) = stats.get_summary();
         assert_eq!(total_bytes, large_data.len() as u64, "统计的字节数应该匹配");
+    }
+
+    #[tokio::test]
+    async fn test_range_support_checker_head_success_with_range() {
+        // 测试 HEAD 成功且支持 Range
+        let test_url = "http://example.com/file.bin";
+        let client = MockHttpClient::new();
+
+        // 设置支持 Range 的 HEAD 响应
+        let mut headers = HeaderMap::new();
+        headers.insert("accept-ranges", "bytes".parse().unwrap());
+        headers.insert("content-length", "1024".parse().unwrap());
+        client.set_head_response(
+            test_url,
+            StatusCode::OK,
+            headers,
+        );
+
+        // 执行检测
+        let checker = RangeSupportChecker::new(&client, test_url);
+        let result = checker.check().await;
+        
+        assert!(result.is_ok(), "检测应该成功");
+        let support = result.unwrap();
+        assert!(support.supported, "应该支持 Range");
+        assert_eq!(support.content_length, Some(1024), "文件大小应该匹配");
+
+        // 验证只使用了 HEAD 请求
+        let log = client.get_request_log();
+        assert_eq!(log.len(), 1, "应该只有一个请求");
+        assert_eq!(log[0], format!("HEAD {}", test_url));
+    }
+
+    #[tokio::test]
+    async fn test_range_support_checker_head_success_without_range() {
+        // 测试 HEAD 成功但不支持 Range
+        let test_url = "http://example.com/file.bin";
+        let client = MockHttpClient::new();
+
+        // 设置不支持 Range 的 HEAD 响应
+        let mut headers = HeaderMap::new();
+        headers.insert("accept-ranges", "none".parse().unwrap());
+        headers.insert("content-length", "2048".parse().unwrap());
+        client.set_head_response(
+            test_url,
+            StatusCode::OK,
+            headers,
+        );
+
+        // 执行检测
+        let checker = RangeSupportChecker::new(&client, test_url);
+        let result = checker.check().await;
+        
+        assert!(result.is_ok(), "检测应该成功");
+        let support = result.unwrap();
+        assert!(!support.supported, "应该不支持 Range");
+        assert_eq!(support.content_length, Some(2048), "文件大小应该匹配");
+    }
+
+    #[tokio::test]
+    async fn test_range_support_checker_head_fail_fallback_to_range_get_206() {
+        // 测试 HEAD 失败（405）但 Range GET 返回 206（支持 Range）
+        let test_url = "http://example.com/file.bin";
+        let client = MockHttpClient::new();
+        let file_size = 12345u64;
+
+        // 不设置 HEAD 响应，导致 HEAD 请求失败
+
+        // 设置 Range GET 响应（返回 206）
+        let mut headers = HeaderMap::new();
+        headers.insert("content-range", format!("bytes 0-0/{}", file_size).parse().unwrap());
+        headers.insert("content-length", "1".parse().unwrap());
+        client.set_range_response(
+            test_url,
+            0,
+            0,
+            StatusCode::PARTIAL_CONTENT,
+            headers,
+            Bytes::from_static(b"X"),
+        );
+
+        // 执行检测
+        let checker = RangeSupportChecker::new(&client, test_url);
+        let result = checker.check().await;
+        
+        assert!(result.is_ok(), "检测应该成功: {:?}", result);
+        let support = result.unwrap();
+        assert!(support.supported, "应该支持 Range（通过 Range GET 检测到）");
+        assert_eq!(support.content_length, Some(file_size), "文件大小应该从 Content-Range 解析");
+
+        // 验证先尝试了 HEAD，失败后使用了 Range GET
+        let log = client.get_request_log();
+        assert_eq!(log.len(), 2, "应该有两个请求：HEAD + Range GET");
+        assert_eq!(log[0], format!("HEAD {}", test_url));
+        assert_eq!(log[1], format!("GET {} Range: 0-0", test_url));
+    }
+
+    #[tokio::test]
+    async fn test_range_support_checker_head_fail_fallback_to_range_get_200() {
+        // 测试 HEAD 失败且 Range GET 返回 200（不支持 Range）
+        let test_url = "http://example.com/file.bin";
+        let client = MockHttpClient::new();
+        let file_size = 9999u64;
+
+        // 不设置 HEAD 响应
+
+        // 设置 Range GET 响应（返回 200，表示不支持 Range）
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", file_size.to_string().parse().unwrap());
+        client.set_range_response(
+            test_url,
+            0,
+            0,
+            StatusCode::OK,
+            headers,
+            Bytes::from_static(b"X"),
+        );
+
+        // 执行检测
+        let checker = RangeSupportChecker::new(&client, test_url);
+        let result = checker.check().await;
+        
+        assert!(result.is_ok(), "检测应该成功");
+        let support = result.unwrap();
+        assert!(!support.supported, "应该不支持 Range");
+        assert_eq!(support.content_length, Some(file_size), "文件大小应该从 Content-Length 解析");
+
+        // 验证使用了两个请求
+        let log = client.get_request_log();
+        assert_eq!(log.len(), 2, "应该有两个请求");
+    }
+
+    #[tokio::test]
+    async fn test_range_support_checker_parse_content_range() {
+        // 测试 Content-Range header 解析
+        let test_cases = vec![
+            ("bytes 0-0/12345", 12345u64),
+            ("bytes 0-99/1000000", 1000000u64),
+            ("bytes 100-199/500", 500u64),
+        ];
+
+        for (header_value, expected_total) in test_cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-range", header_value.parse().unwrap());
+            
+            let response = MockHttpResponse {
+                status: StatusCode::PARTIAL_CONTENT,
+                headers,
+                body: Bytes::new(),
+            };
+
+            let result = RangeSupportChecker::<MockHttpClient>::parse_content_range_total(&response);
+            assert!(result.is_ok(), "解析 '{}' 应该成功", header_value);
+            assert_eq!(result.unwrap(), expected_total, "解析 '{}' 的结果应该匹配", header_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_range_support_checker_parse_content_range_invalid() {
+        // 测试无效的 Content-Range header
+        let invalid_cases = vec![
+            "",                     // 空字符串
+            "bytes 0-0",            // 缺少总大小
+            "invalid",              // 完全无效
+            "bytes 0-0/abc",        // 非数字总大小
+        ];
+
+        for header_value in invalid_cases {
+            let mut headers = HeaderMap::new();
+            if !header_value.is_empty() {
+                headers.insert("content-range", header_value.parse().unwrap());
+            }
+            
+            let response = MockHttpResponse {
+                status: StatusCode::PARTIAL_CONTENT,
+                headers,
+                body: Bytes::new(),
+            };
+
+            let result = RangeSupportChecker::<MockHttpClient>::parse_content_range_total(&response);
+            assert!(result.is_err(), "解析 '{}' 应该失败", header_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_range_support_uses_checker() {
+        // 测试公共 API 使用新的 RangeSupportChecker
+        let test_url = "http://example.com/test.bin";
+        let client = MockHttpClient::new();
+
+        // 设置 HEAD 响应
+        let mut headers = HeaderMap::new();
+        headers.insert("accept-ranges", "bytes".parse().unwrap());
+        headers.insert("content-length", "8888".parse().unwrap());
+        client.set_head_response(
+            test_url,
+            StatusCode::OK,
+            headers,
+        );
+
+        // 使用公共 API
+        let result = check_range_support(&client, test_url).await;
+        
+        assert!(result.is_ok(), "公共 API 应该成功");
+        let support = result.unwrap();
+        assert!(support.supported, "应该支持 Range");
+        assert_eq!(support.content_length, Some(8888));
+    }
+
+    #[tokio::test]
+    async fn test_range_support_checker_head_405_fallback() {
+        // 测试 HEAD 返回 405 状态码的场景（模拟用户的真实情况）
+        // 这种情况下应该自动回退到 Range GET
+        let test_url = "http://example.com/redirect_file.bin";
+        let client = MockHttpClient::new();
+        let file_size = 212768400u64;
+
+        // 设置 HEAD 响应为 405 Method Not Allowed
+        let mut head_headers = HeaderMap::new();
+        head_headers.insert("content-length", "19".parse().unwrap());
+        client.set_head_response(
+            test_url,
+            StatusCode::METHOD_NOT_ALLOWED,
+            head_headers,
+        );
+
+        // 设置 Range GET 响应（返回 206，模拟重定向后的服务器支持 Range）
+        let mut range_headers = HeaderMap::new();
+        range_headers.insert("content-range", format!("bytes 0-0/{}", file_size).parse().unwrap());
+        range_headers.insert("content-length", "1".parse().unwrap());
+        range_headers.insert("accept-ranges", "bytes".parse().unwrap());
+        client.set_range_response(
+            test_url,
+            0,
+            0,
+            StatusCode::PARTIAL_CONTENT,
+            range_headers,
+            Bytes::from_static(b"X"),
+        );
+
+        // 执行检测
+        let result = check_range_support(&client, test_url).await;
+        
+        assert!(result.is_ok(), "检测应该成功（通过 Range GET 回退）: {:?}", result);
+        let support = result.unwrap();
+        assert!(support.supported, "应该检测到支持 Range");
+        assert_eq!(support.content_length, Some(file_size), "应该正确解析文件大小");
+
+        // 验证使用了两个请求：HEAD (405) + Range GET (206)
+        let log = client.get_request_log();
+        assert_eq!(log.len(), 2, "应该有两个请求");
+        assert_eq!(log[0], format!("HEAD {}", test_url), "第一个应该是 HEAD");
+        assert_eq!(log[1], format!("GET {} Range: 0-0", test_url), "第二个应该是 Range GET");
     }
 }
 
