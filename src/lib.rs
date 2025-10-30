@@ -21,8 +21,9 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), rs_dn::DownloadError> {
-//!     // 简单下载单个文件
-//!     rs_dn::download_file("https://example.com/file.zip", "file.zip").await?;
+//!     // 简单下载单个文件（自动检测文件名）
+//!     let save_path = rs_dn::download_file("https://example.com/file.zip", ".").await?;
+//!     println!("文件已保存到: {:?}", save_path);
 //!     Ok(())
 //! }
 //! ```
@@ -37,11 +38,13 @@
 //! async fn main() -> Result<(), rs_dn::DownloadError> {
 //!     // 使用默认配置：4个worker，动态分块（2-50 MB）
 //!     let config = DownloadConfig::default();
-//!     let mut handle = rs_dn::download_ranged(
+//!     let (mut handle, save_path) = rs_dn::download_ranged(
 //!         "https://example.com/large_file.zip",
-//!         PathBuf::from("large_file.zip"),
+//!         PathBuf::from("."),  // 保存到当前目录
 //!         config
 //!     ).await?;
+//!
+//!     println!("文件将保存到: {:?}", save_path);
 //!
 //!     // 监听下载进度
 //!     while let Some(progress) = handle.progress_receiver().recv().await {
@@ -91,11 +94,13 @@
 //!         .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB（高速时）
 //!         .build();
 //!     
-//!     let handle = rs_dn::download_ranged(
+//!     let (handle, save_path) = rs_dn::download_ranged(
 //!         "https://example.com/large_file.zip",
-//!         PathBuf::from("large_file.zip"),
+//!         PathBuf::from("."),
 //!         config
 //!     ).await?;
+//!
+//!     println!("文件将保存到: {:?}", save_path);
 //!
 //!     // 使用回调函数同时接收进度和等待完成
 //!     handle.wait_with_progress(|progress| {
@@ -128,6 +133,7 @@ pub mod tools {
 pub use config::{DownloadConfig, DownloadConfigBuilder};
 pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
 pub use task::FileTask;
+pub use tools::fetch::{fetch_file_metadata, FileMetadata};
 
 use std::path::Path;
 
@@ -168,37 +174,61 @@ pub type Result<T> = std::result::Result<T, DownloadError>;
 
 /// 下载单个文件
 ///
-/// 使用单个协程下载文件
+/// 使用单个协程下载文件，自动从服务器或 URL 检测文件名
 ///
 /// # Arguments
 /// * `url` - 下载 URL
-/// * `path` - 保存路径
+/// * `save_dir` - 保存目录路径
+///
+/// # Returns
+///
+/// 返回实际保存的文件路径（目录 + 自动检测的文件名）
+///
+/// # 文件名检测优先级
+///
+/// 1. Content-Disposition header（服务器建议的文件名）
+/// 2. 重定向后 URL 中的文件名
+/// 3. 原始 URL 中的文件名
+/// 4. 时间戳文件名 `file_{unix_timestamp}`
 ///
 /// # Example
 ///
 /// ```no_run
 /// # use rs_dn::download_file;
+/// # use std::path::PathBuf;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), rs_dn::DownloadError> {
-/// download_file("https://example.com/file.txt", "file.txt").await?;
+/// let save_path = download_file("https://example.com/file.txt", ".").await?;
+/// println!("文件已保存到: {:?}", save_path);
 /// # Ok(())
 /// # }
 /// ```
-pub async fn download_file(url: &str, path: impl AsRef<Path>) -> Result<()> {
+pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std::path::PathBuf> {
     use reqwest::Client;
     use tools::fetch;
     use tools::io_traits::TokioFileSystem;
 
-    let task = FileTask {
-        url: url.to_string(),
-        save_path: path.as_ref().to_path_buf(),
-    };
-
     let client = Client::new();
     let fs = TokioFileSystem::default();
+    
+    // 获取文件元数据以确定文件名
+    let metadata = fetch::fetch_file_metadata(&client, url).await?;
+    
+    // 确定文件名
+    let filename = metadata.suggested_filename
+        .ok_or_else(|| DownloadError::Other("无法确定文件名".to_string()))?;
+    
+    // 组合完整路径
+    let save_path = save_dir.as_ref().join(&filename);
+
+    let task = FileTask {
+        url: url.to_string(),
+        save_path: save_path.clone(),
+    };
+
     fetch::fetch_file(&client, task, &fs).await?;
 
-    Ok(())
+    Ok(save_path)
 }
 
 #[cfg(test)]

@@ -43,11 +43,3 @@ pub(crate) enum RangeResult {
         error: String,
     },
 }
-
-/// Range 请求支持检测结果
-#[derive(Debug)]
-pub struct RangeSupport {
-    pub supported: bool,
-    pub content_length: Option<u64>,
-}
-

@@ -6,7 +6,6 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use crate::tools::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
-use crate::tools::fetch::check_range_support;
 use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::tools::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
 use crate::task::{RangeResult, WorkerTask};
@@ -107,9 +106,10 @@ impl DownloadHandle {
     /// ```no_run
     /// # use rs_dn::{download_ranged, DownloadProgress, DownloadConfig};
     /// # use std::path::PathBuf;
-    /// # async fn example() {
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let config = DownloadConfig::default();
-    /// let mut handle = download_ranged("http://example.com/file", PathBuf::from("file"), config).await.unwrap();
+    /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config).await.unwrap();
     /// 
     /// while let Some(progress) = handle.progress_receiver().recv().await {
     ///     match progress {
@@ -627,10 +627,10 @@ where
     
     info!("准备 Range 下载: {} ({} 个 workers, 动态分块)", url, worker_count);
 
-    // 检查服务器是否支持 Range 请求
-    let range_support = check_range_support(&client, url).await?;
+    // 获取文件元数据
+    let metadata = crate::tools::fetch::fetch_file_metadata(&client, url).await?;
 
-    if !range_support.supported {
+    if !metadata.range_supported {
         warn!("服务器不支持 Range 请求，回退到普通下载");
         let task = crate::task::FileTask {
             url: url.to_string(),
@@ -639,7 +639,7 @@ where
         return Ok(crate::tools::fetch::fetch_file(&client, task, &fs).await?);
     }
 
-    let content_length = range_support.content_length.ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
+    let content_length = metadata.content_length.ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
     info!("文件大小: {} bytes ({:.2} MB)", content_length, content_length as f64 / 1024.0 / 1024.0);
     info!(
         "动态分块配置: 初始 {} bytes, 范围 {} ~ {} bytes",
@@ -701,36 +701,42 @@ where
 /// Workers 直接写入共享的 RangeWriter，减少内存拷贝
 /// 使用动态分块机制，根据实时下载速度自动调整分块大小
 /// 
+/// **破坏性变更**：此函数现在接受目录路径而非文件路径，并自动从服务器或 URL 提取文件名
+/// 
 /// # Arguments
 /// * `url` - 下载 URL
-/// * `save_path` - 保存路径
+/// * `save_dir` - 保存目录路径
 /// * `config` - 下载配置（包含动态分块参数、worker数等）
 /// 
 /// # Returns
 /// 
-/// 返回 `DownloadHandle`，可以通过它监听下载进度并等待完成
+/// 返回 `(DownloadHandle, PathBuf)`，其中：
+/// - `DownloadHandle` - 可以通过它监听下载进度并等待完成
+/// - `PathBuf` - 实际保存的文件路径（目录 + 自动检测的文件名）
+/// 
+/// # 文件名检测优先级
+/// 
+/// 1. Content-Disposition header（服务器建议的文件名）
+/// 2. 重定向后 URL 中的文件名
+/// 3. 原始 URL 中的文件名
+/// 4. 时间戳文件名 `file_{unix_timestamp}`
 /// 
 /// # Example
 /// 
 /// ```no_run
 /// # use rs_dn::{download_ranged, DownloadConfig, DownloadProgress};
 /// # use std::path::PathBuf;
-/// # async fn example() -> anyhow::Result<()> {
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), rs_dn::DownloadError> {
 /// // 使用默认配置（推荐）
 /// let config = DownloadConfig::default();
-/// let mut handle = download_ranged(
+/// let (mut handle, save_path) = download_ranged(
 ///     "http://example.com/file.bin",
-///     PathBuf::from("file.bin"),
+///     PathBuf::from("."),  // 保存到当前目录
 ///     config
 /// ).await?;
 /// 
-/// // 或使用自定义配置
-/// let config = DownloadConfig::builder()
-///     .worker_count(8)                         // 8 个并发 worker
-///     .initial_chunk_size(10 * 1024 * 1024)    // 初始 10 MB 分块
-///     .min_chunk_size(2 * 1024 * 1024)         // 最小 2 MB（慢速时）
-///     .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB（高速时）
-///     .build();
+/// println!("文件将保存到: {:?}", save_path);
 /// 
 /// // 监听进度
 /// while let Some(progress) = handle.progress_receiver().recv().await {
@@ -757,20 +763,34 @@ where
 /// ```
 pub async fn download_ranged(
     url: &str,
-    save_path: PathBuf,
+    save_dir: impl AsRef<std::path::Path>,
     config: crate::config::DownloadConfig,
-) -> Result<DownloadHandle> {
+) -> Result<(DownloadHandle, std::path::PathBuf)> {
     use crate::tools::io_traits::TokioFileSystem;
     use reqwest::Client;
     
     let client = Client::new();
     let fs = TokioFileSystem::default();
     
+    // 获取文件元数据以确定文件名
+    let metadata = crate::tools::fetch::fetch_file_metadata(&client, url).await?;
+    
+    // 确定文件名
+    let filename = metadata.suggested_filename
+        .ok_or_else(|| DownloadError::Other("无法确定文件名".to_string()))?;
+    
+    // 组合完整路径
+    let save_path = save_dir.as_ref().join(&filename);
+    
+    info!("自动检测到文件名: {}", filename);
+    info!("保存路径: {:?}", save_path);
+    
     // 创建进度 channel
     let (progress_tx, progress_rx) = mpsc::channel(100);
     
     // 克隆必要的参数给后台任务
     let url = url.to_string();
+    let save_path_clone = save_path.clone();
     
     // 启动后台下载任务
     let completion_handle = tokio::spawn(async move {
@@ -778,16 +798,19 @@ pub async fn download_ranged(
             client, 
             fs, 
             &url, 
-            save_path, 
+            save_path_clone, 
             &config,
             Some(progress_tx)
         ).await
     });
     
-    Ok(DownloadHandle {
-        progress_rx,
-        completion_handle,
-    })
+    Ok((
+        DownloadHandle {
+            progress_rx,
+            completion_handle,
+        },
+        save_path,
+    ))
 }
 
 #[cfg(test)]

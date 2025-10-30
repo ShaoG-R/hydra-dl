@@ -1,5 +1,4 @@
 use log::info;
-use std::path::PathBuf;
 
 use crate::{download_ranged, DownloadConfig};
 use super::{Cli, Result};
@@ -9,7 +8,7 @@ use super::utils::format_bytes;
 /// 执行下载任务
 ///
 /// 根据 CLI 参数构建配置并启动下载
-pub async fn execute_download(cli: &Cli, output_path: PathBuf) -> Result<()> {
+pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     // 构建下载配置
     let config = DownloadConfig::builder()
         .worker_count(cli.workers)
@@ -19,9 +18,8 @@ pub async fn execute_download(cli: &Cli, output_path: PathBuf) -> Result<()> {
         .build();
 
     info!(
-        "开始下载: {} -> {:?}",
-        cli.url,
-        output_path
+        "开始下载: {}",
+        cli.url
     );
     info!(
         "配置: {} workers, 分块大小: {} ~ {} (初始: {})",
@@ -31,13 +29,15 @@ pub async fn execute_download(cli: &Cli, output_path: PathBuf) -> Result<()> {
         format_bytes(config.initial_chunk_size()),
     );
 
-    // 启动下载任务
-    let mut handle = download_ranged(&cli.url, output_path.clone(), config).await?;
+    // 启动下载任务（会自动检测文件名）
+    let (mut handle, save_path) = download_ranged(&cli.url, save_dir, config).await?;
+
+    info!("保存路径: {:?}", save_path);
 
     if cli.quiet {
         // 静默模式：只等待完成
         handle.wait().await?;
-        println!("下载完成: {:?}", output_path);
+        println!("下载完成: {:?}", save_path);
     } else {
         // 进度条模式
         let mut progress_manager = ProgressManager::new(cli.verbose);
@@ -52,6 +52,8 @@ pub async fn execute_download(cli: &Cli, output_path: PathBuf) -> Result<()> {
 
         // 确保进度条完成
         progress_manager.finish();
+        
+        println!("文件已保存到: {:?}", save_path);
     }
 
     Ok(())

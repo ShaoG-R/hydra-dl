@@ -91,6 +91,9 @@ pub trait HttpResponse: Send {
 
     /// 获取字节流
     fn bytes_stream(self) -> Self::BytesStream;
+    
+    /// 获取响应的最终 URL（重定向后的 URL）
+    fn url(&self) -> &str;
 }
 
 /// 文件系统trait
@@ -194,6 +197,10 @@ impl HttpResponse for reqwest::Response {
             inner: Box::pin(stream),
         }
     }
+    
+    fn url(&self) -> &str {
+        self.url().as_str()
+    }
 }
 
 /// Tokio文件系统实现
@@ -258,6 +265,7 @@ pub mod mock {
         pub status: StatusCode,
         pub headers: HeaderMap,
         pub body: Bytes,
+        pub url: String,
     }
     
     impl HttpResponse for MockHttpResponse {
@@ -283,6 +291,10 @@ pub mod mock {
             }
             
             Box::pin(stream::iter(chunks))
+        }
+        
+        fn url(&self) -> &str {
+            &self.url
         }
     }
     
@@ -313,32 +325,38 @@ pub mod mock {
         
         /// 设置 GET 请求的响应
         pub fn set_response(&self, url: impl Into<String>, status: StatusCode, headers: HeaderMap, body: Bytes) {
+            let url_string = url.into();
             let response = MockHttpResponse {
                 status,
                 headers,
                 body,
+                url: url_string.clone(),
             };
-            self.get_responses.lock().unwrap().insert(url.into(), response);
+            self.get_responses.lock().unwrap().insert(url_string, response);
         }
         
         /// 设置 HEAD 请求的响应
         pub fn set_head_response(&self, url: impl Into<String>, status: StatusCode, headers: HeaderMap) {
+            let url_string = url.into();
             let response = MockHttpResponse {
                 status,
                 headers,
                 body: Bytes::new(),
+                url: url_string.clone(),
             };
-            self.head_responses.lock().unwrap().insert(url.into(), response);
+            self.head_responses.lock().unwrap().insert(url_string, response);
         }
         
         /// 设置 Range 请求的响应
         pub fn set_range_response(&self, url: impl Into<String>, start: u64, end: u64, status: StatusCode, headers: HeaderMap, body: Bytes) {
+            let url_string = url.into();
             let response = MockHttpResponse {
                 status,
                 headers,
                 body,
+                url: url_string.clone(),
             };
-            self.range_responses.lock().unwrap().insert((url.into(), start, end), response);
+            self.range_responses.lock().unwrap().insert((url_string, start, end), response);
         }
         
         /// 获取请求日志

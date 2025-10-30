@@ -44,8 +44,8 @@ pub struct Cli {
     #[arg(value_name = "URL")]
     pub url: String,
 
-    /// 保存路径（如不指定，自动从 URL 提取文件名）
-    #[arg(short, long, value_name = "FILE")]
+    /// 保存目录（如不指定，保存到当前目录）
+    #[arg(short, long, value_name = "DIRECTORY")]
     pub output: Option<String>,
 
     /// Worker 并发数
@@ -75,16 +75,10 @@ pub struct Cli {
 
 /// 运行 CLI 程序
 pub async fn run(cli: Cli) -> Result<()> {
-    // 确定输出路径
-    let output_path = match cli.output.clone() {
-        Some(path) => path,
-        None => utils::extract_filename_from_url(&cli.url)?,
-    };
-
-    // 验证输出路径
-    let output_path = utils::validate_output_path(&output_path)?;
+    // 确定保存目录（默认为当前目录）
+    let save_dir = cli.output.as_deref().unwrap_or(".");
 
     // 执行下载
-    runner::execute_download(&cli, output_path).await
+    runner::execute_download(&cli, save_dir).await
 }
 

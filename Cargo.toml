@@ -17,9 +17,7 @@ bytes = "1.10.1"
 parking_lot = "0.12.5"
 async-trait = "0.1.89"
 clap = { version = "4.5", features = ["derive"] }
-indicatif = "0.17"
-console = "0.15"
-env_logger = "0.11"
+indicatif = "0.18.2"
 url = "2.5"
 urlencoding = "2.1"
 
