@@ -51,15 +51,16 @@
 //!                     total_size as f64 / 1024.0 / 1024.0,
 //!                     initial_chunk_size as f64 / 1024.0 / 1024.0);
 //!             }
-//!             DownloadProgress::Progress { percentage, avg_speed, current_chunk_size, .. } => {
-//!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, 当前分块: {:.2} MB",
+//!             DownloadProgress::Progress { percentage, avg_speed, current_chunk_size, worker_stats, .. } => {
+//!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, 当前分块: {:.2} MB, {} 个 workers",
 //!                     percentage,
 //!                     avg_speed / 1024.0 / 1024.0,
-//!                     current_chunk_size as f64 / 1024.0 / 1024.0);
+//!                     current_chunk_size as f64 / 1024.0 / 1024.0,
+//!                     worker_stats.len());
 //!             }
-//!             DownloadProgress::Completed { total_bytes, total_time, .. } => {
-//!                 println!("下载完成！{:.2} MB in {:.2}s",
-//!                     total_bytes as f64 / 1024.0 / 1024.0, total_time);
+//!             DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {
+//!                 println!("下载完成！{:.2} MB in {:.2}s, {} 个 workers 完成",
+//!                     total_bytes as f64 / 1024.0 / 1024.0, total_time, worker_stats.len());
 //!             }
 //!             DownloadProgress::Error { message } => {
 //!                 eprintln!("下载出错: {}", message);
@@ -124,7 +125,7 @@ pub mod tools {
 
 // 重新导出核心类型和函数
 pub use config::{DownloadConfig, DownloadConfigBuilder};
-pub use download::{download_ranged, DownloadHandle, DownloadProgress};
+pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
 pub use task::FileTask;
 
 use anyhow::Result;

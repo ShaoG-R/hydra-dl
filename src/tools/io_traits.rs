@@ -63,7 +63,7 @@ pub trait FileSystem: Send + Sync {
 ///
 /// 抽象异步文件操作
 #[async_trait]
-pub trait AsyncFile: Send {
+pub trait AsyncFile: Send + 'static {
     /// 写入所有数据
     async fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Result<()>;
 
