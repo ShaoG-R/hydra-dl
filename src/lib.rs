@@ -148,6 +148,10 @@ pub enum DownloadError {
     #[error(transparent)]
     RangeWriter(#[from] tools::range_writer::RangeWriterError),
     
+    /// HTTP 客户端构建错误
+    #[error("创建 HTTP 客户端失败: {0}")]
+    BuildClient(#[from] reqwest::Error),
+    
     /// 任务发送错误
     #[error("任务发送失败: {0}")]
     TaskSend(String),
@@ -208,7 +212,13 @@ pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std:
     use tools::fetch;
     use tools::io_traits::TokioFileSystem;
 
-    let client = Client::new();
+    // 创建带超时设置的 HTTP 客户端（使用默认超时配置）
+    let default_config = DownloadConfig::default();
+    let client = Client::builder()
+        .timeout(default_config.timeout())
+        .connect_timeout(default_config.connect_timeout())
+        .build()?;
+    
     let fs = TokioFileSystem::default();
     
     // 获取文件元数据以确定文件名

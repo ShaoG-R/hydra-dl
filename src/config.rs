@@ -25,6 +25,12 @@ pub const DEFAULT_EXPECTED_CHUNK_DURATION_SECS: u64 = 5;
 /// 默认分块大小平滑系数：0.7
 pub const DEFAULT_SMOOTHING_FACTOR: f64 = 0.7;
 
+/// 默认请求超时时间：30 秒
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// 默认连接超时时间：10 秒
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// 下载配置
 ///
 /// 控制下载任务的动态分块策略和并发行为
@@ -63,6 +69,16 @@ pub struct DownloadConfig {
     /// 用于平滑调整：新大小 = 旧大小 + (理想大小 - 旧大小) * 系数
     /// 越接近 1.0 响应越快，越接近 0.0 越平滑
     pub(crate) smoothing_factor: f64,
+    
+    /// HTTP 请求总体超时时间
+    ///
+    /// 包含连接建立、请求发送和响应接收的总时长
+    pub(crate) timeout: Duration,
+    
+    /// HTTP 连接超时时间
+    ///
+    /// 只计算 TCP 连接建立的时长
+    pub(crate) connect_timeout: Duration,
 }
 
 impl DownloadConfig {
@@ -90,6 +106,8 @@ impl DownloadConfig {
     /// - 实时速度窗口: 1 秒
     /// - 预期分块时长: 5 秒
     /// - 平滑系数: 0.7
+    /// - 请求超时: 30 秒
+    /// - 连接超时: 10 秒
     pub fn default() -> Self {
         Self {
             worker_count: DEFAULT_WORKER_COUNT,
@@ -99,6 +117,8 @@ impl DownloadConfig {
             instant_speed_window: Duration::from_secs(DEFAULT_INSTANT_SPEED_WINDOW_SECS),
             expected_chunk_duration: Duration::from_secs(DEFAULT_EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: DEFAULT_SMOOTHING_FACTOR,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
         }
     }
     
@@ -136,6 +156,16 @@ impl DownloadConfig {
     pub fn smoothing_factor(&self) -> f64 {
         self.smoothing_factor
     }
+    
+    /// 获取请求超时时间
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+    
+    /// 获取连接超时时间
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
 }
 
 /// 下载配置构建器
@@ -161,6 +191,8 @@ pub struct DownloadConfigBuilder {
     instant_speed_window: Duration,
     expected_chunk_duration: Duration,
     smoothing_factor: f64,
+    timeout: Duration,
+    connect_timeout: Duration,
 }
 
 impl DownloadConfigBuilder {
@@ -174,6 +206,8 @@ impl DownloadConfigBuilder {
             instant_speed_window: Duration::from_secs(DEFAULT_INSTANT_SPEED_WINDOW_SECS),
             expected_chunk_duration: Duration::from_secs(DEFAULT_EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: DEFAULT_SMOOTHING_FACTOR,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
         }
     }
     
@@ -259,6 +293,26 @@ impl DownloadConfigBuilder {
         self
     }
     
+    /// 设置 HTTP 请求总体超时时间
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - 请求超时时间
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+    
+    /// 设置 HTTP 连接超时时间
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - 连接超时时间
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+    
     /// 构建配置对象
     pub fn build(self) -> DownloadConfig {
         // 确保配置的合理性：min <= initial <= max
@@ -274,6 +328,8 @@ impl DownloadConfigBuilder {
             instant_speed_window: self.instant_speed_window,
             expected_chunk_duration: self.expected_chunk_duration,
             smoothing_factor: self.smoothing_factor,
+            timeout: self.timeout,
+            connect_timeout: self.connect_timeout,
         }
     }
 }

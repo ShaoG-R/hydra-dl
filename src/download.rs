@@ -742,10 +742,16 @@ pub async fn download_ranged(
     use crate::tools::io_traits::TokioFileSystem;
     use reqwest::Client;
     
-    let client = Client::new();
+    // 创建带超时设置的 HTTP 客户端
+    let client = Client::builder()
+        .timeout(config.timeout())
+        .connect_timeout(config.connect_timeout())
+        .build()?;
+    
     let fs = TokioFileSystem::default();
     
     // 获取文件元数据以确定文件名
+    info!("正在获取文件元数据: {}", url);
     let metadata = crate::tools::fetch::fetch_file_metadata(&client, url).await?;
     
     // 确定文件名
