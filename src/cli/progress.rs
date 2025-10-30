@@ -41,9 +41,6 @@ impl ProgressManager {
                 .progress_chars("#>-"),
         );
         
-        // 启用定期刷新，让进度条实时显示
-        main_bar.enable_steady_tick(Duration::from_millis(100));
-
         Self {
             main_bar,
             multi,
@@ -78,8 +75,6 @@ impl ProgressManager {
                                     .expect("无效的进度条模板"),
                             );
                             worker_bar.set_message("等待任务...");
-                            // 启用定期刷新
-                            worker_bar.enable_steady_tick(Duration::from_millis(100));
                             self.worker_bars.push(worker_bar);
                         }
                     }
