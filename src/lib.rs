@@ -115,6 +115,7 @@ mod download;
 mod task;
 mod worker;
 pub mod tools {
+    pub(crate) mod chunk_strategy;
     pub(crate) mod fetch;
     pub(crate) mod stats;
     pub mod io_traits;

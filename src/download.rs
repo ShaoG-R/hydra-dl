@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
+use crate::tools::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::tools::fetch::check_range_support;
 use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::tools::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
@@ -175,7 +176,7 @@ struct DownloadTask<F: AsyncFile> {
     allocator: RangeAllocator,
     url: String,
     total_size: u64,
-    current_chunk_size: u64,
+    chunk_strategy: Box<dyn ChunkStrategy + Send + Sync>,
     config: Arc<crate::config::DownloadConfig>,
     next_worker_id: usize, // 用于轮询分配任务
     total_ranges_completed: usize, // 已完成的 range 总数
@@ -192,7 +193,7 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         total_size: u64,
         config: Arc<crate::config::DownloadConfig>,
     ) -> Self {
-        let current_chunk_size = config.initial_chunk_size();
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config));
         Self {
             pool,
             progress_sender,
@@ -200,7 +201,7 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
             allocator,
             url,
             total_size,
-            current_chunk_size,
+            chunk_strategy,
             config,
             next_worker_id: 0,
             total_ranges_completed: 0,
@@ -218,34 +219,6 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         }
     }
     
-    /// 根据实时速度计算合适的分块大小
-    /// 
-    /// 速度越快，分块越大（减少请求开销）
-    /// 速度越慢，分块越小（提高并发，更灵活的任务分配）
-    fn calculate_chunk_size(&self, instant_speed: f64) -> u64 {
-        const KB: f64 = 1024.0;
-        const MB: f64 = 1024.0 * 1024.0;
-        
-        let min_size = self.config.min_chunk_size();
-        let max_size = self.config.max_chunk_size();
-        
-        let chunk_size = if instant_speed < 500.0 * KB {
-            // < 500 KB/s: 使用最小分块
-            min_size
-        } else if instant_speed < 2.0 * MB {
-            // 500 KB/s ~ 2 MB/s: 2 倍最小分块
-            (min_size * 2).min(max_size)
-        } else if instant_speed < 10.0 * MB {
-            // 2 MB/s ~ 10 MB/s: 5 倍最小分块
-            (min_size * 5).min(max_size)
-        } else {
-            // > 10 MB/s: 使用最大分块
-            max_size
-        };
-        
-        // 确保在合理范围内
-        chunk_size.clamp(min_size, max_size)
-    }
     
     /// 尝试分配下一个任务
     /// 
@@ -257,7 +230,7 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         }
         
         // 计算实际分配大小（不超过剩余空间）
-        let alloc_size = self.current_chunk_size.min(remaining);
+        let alloc_size = self.chunk_strategy.current_chunk_size().min(remaining);
         
         // 分配 range
         let range = self.allocator.allocate(alloc_size)?;
@@ -286,7 +259,7 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         progress_timer.tick().await; // 跳过首次立即触发
         
         // 初始任务分配：为每个 worker 分配一个任务
-        info!("开始初始任务分配，每个 worker 分配一个 {} bytes 的分块", self.current_chunk_size);
+        info!("开始初始任务分配，每个 worker 分配一个 {} bytes 的分块", self.chunk_strategy.current_chunk_size());
         for worker_id in 0..self.pool.worker_channels.len() {
             if let Some((task, _)) = self.try_allocate_next_task() {
                 if let Err(e) = self.pool.send_task(task, worker_id).await {
@@ -383,15 +356,16 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         // 根据实时速度调整分块大小
         let (instant_speed, instant_valid) = self.pool.get_total_instant_speed();
         if instant_valid {
-            let new_chunk_size = self.calculate_chunk_size(instant_speed);
-            if new_chunk_size != self.current_chunk_size {
+            let new_chunk_size = self.chunk_strategy.calculate_chunk_size(instant_speed);
+            let current_chunk_size = self.chunk_strategy.current_chunk_size();
+            if new_chunk_size != current_chunk_size {
                 info!(
                     "根据实时速度 {:.2} MB/s 调整分块大小: {} -> {} bytes",
                     instant_speed / 1024.0 / 1024.0,
-                    self.current_chunk_size,
+                    current_chunk_size,
                     new_chunk_size
                 );
-                self.current_chunk_size = new_chunk_size;
+                self.chunk_strategy.update_chunk_size(new_chunk_size);
             }
         }
         
@@ -419,7 +393,7 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
                 percentage,
                 avg_speed: total_avg_speed,
                 instant_speed: if instant_valid { Some(total_instant_speed) } else { None },
-                current_chunk_size: self.current_chunk_size,
+                current_chunk_size: self.chunk_strategy.current_chunk_size(),
             }).await;
             
             // 发送每个 worker 的统计信息
