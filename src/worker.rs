@@ -143,15 +143,21 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
     /// * `client` - HTTP客户端（将被克隆给每个worker）
     /// * `worker_count` - worker 协程数量
     /// * `writer` - 共享的 RangeWriter，所有 worker 将直接写入此文件
+    /// * `instant_speed_window` - 实时速度窗口，用于计算瞬时速度
     /// 
     /// 每个 worker 都有独立的 DownloadStats，用于监控单个 worker 的性能
     /// 所有 worker 的统计会自动聚合到 global_stats，实现 O(1) 获取
-    pub(crate) fn new<C>(client: C, worker_count: usize, writer: Arc<RangeWriter<F>>) -> Self
+    pub(crate) fn new<C>(
+        client: C, 
+        worker_count: usize, 
+        writer: Arc<RangeWriter<F>>,
+        instant_speed_window: std::time::Duration,
+    ) -> Self
     where
         C: HttpClient + Clone + Send + 'static,
     {
-        // 创建全局统计管理器
-        let global_stats = DownloadStatsParent::default();
+        // 创建全局统计管理器（使用配置的时间窗口）
+        let global_stats = DownloadStatsParent::with_window(instant_speed_window);
         
         let mut worker_channels = Vec::new();
         let mut worker_handles = Vec::new();
@@ -395,7 +401,12 @@ mod tests {
         let writer = Arc::new(writer);
 
         let worker_count = 4;
-        let pool = WorkerPool::<MockFile>::new(client, worker_count, writer);
+        let pool = WorkerPool::<MockFile>::new(
+            client, 
+            worker_count, 
+            writer,
+            std::time::Duration::from_secs(1),
+        );
 
         assert_eq!(pool.worker_channels.len(), worker_count);
         assert_eq!(pool.worker_handles.len(), worker_count);
@@ -410,7 +421,12 @@ mod tests {
         let (writer, mut allocator) = RangeWriter::new(&fs, save_path, 100).await.unwrap();
         let writer = Arc::new(writer);
 
-        let pool = WorkerPool::<MockFile>::new(client, 2, writer);
+        let pool = WorkerPool::<MockFile>::new(
+            client, 
+            2, 
+            writer,
+            std::time::Duration::from_secs(1),
+        );
 
         // 分配一个 range
         let range = allocator.allocate(10).unwrap();
@@ -435,7 +451,12 @@ mod tests {
         let writer = Arc::new(writer);
 
         let worker_count = 3;
-        let pool = WorkerPool::<MockFile>::new(client, worker_count, writer);
+        let pool = WorkerPool::<MockFile>::new(
+            client, 
+            worker_count, 
+            writer,
+            std::time::Duration::from_secs(1),
+        );
 
         // 初始统计应该都是 0
         let (total_bytes, total_secs, ranges) = pool.get_total_stats();
@@ -456,7 +477,12 @@ mod tests {
         let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
         let writer = Arc::new(writer);
 
-        let mut pool = WorkerPool::<MockFile>::new(client.clone(), 2, writer);
+        let mut pool = WorkerPool::<MockFile>::new(
+            client.clone(), 
+            2, 
+            writer,
+            std::time::Duration::from_secs(1),
+        );
 
         // 关闭 workers
         pool.shutdown();

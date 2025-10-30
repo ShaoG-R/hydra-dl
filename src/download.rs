@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 
 use crate::tools::fetch::check_range_support;
 use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient};
-use crate::tools::range_writer::{AllocatedRange, RangeWriter};
+use crate::tools::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
 use crate::task::{RangeResult, WorkerTask};
 use crate::worker::WorkerPool;
 
@@ -17,24 +17,26 @@ pub enum DownloadProgress {
     /// 下载已开始
     Started { 
         /// 文件总大小（bytes）
-        total_size: u64, 
-        /// Range 分段数量
-        range_count: usize,
+        total_size: u64,
         /// Worker 数量
         worker_count: usize,
+        /// 初始分块大小（bytes）
+        initial_chunk_size: u64,
     },
-    /// Range 完成更新
-    RangeComplete {
-        /// 已完成的 range 数量
-        completed: usize,
-        /// 总 range 数量
-        total: usize,
+    /// 下载进度更新
+    Progress {
         /// 已下载字节数
         bytes_downloaded: u64,
+        /// 文件总大小（bytes）
+        total_size: u64,
+        /// 下载百分比 (0.0 ~ 100.0)
+        percentage: f64,
         /// 平均速度 (bytes/s)
         avg_speed: f64,
         /// 实时速度 (bytes/s)，如果无效则为 None
         instant_speed: Option<f64>,
+        /// 当前分块大小（bytes）
+        current_chunk_size: u64,
     },
     /// Worker 统计信息
     WorkerStats {
@@ -96,15 +98,17 @@ impl DownloadHandle {
     /// # Example
     /// 
     /// ```no_run
-    /// # use rs_dn::{download_ranged, DownloadProgress};
+    /// # use rs_dn::{download_ranged, DownloadProgress, DownloadConfig};
     /// # use std::path::PathBuf;
     /// # async fn example() {
-    /// let mut handle = download_ranged("http://example.com/file", PathBuf::from("file"), 10, 4).await.unwrap();
+    /// let config = DownloadConfig::default();
+    /// let mut handle = download_ranged("http://example.com/file", PathBuf::from("file"), config).await.unwrap();
     /// 
     /// while let Some(progress) = handle.progress_receiver().recv().await {
     ///     match progress {
-    ///         DownloadProgress::RangeComplete { completed, total, .. } => {
-    ///             println!("进度: {}/{}", completed, total);
+    ///         DownloadProgress::Progress { percentage, avg_speed, .. } => {
+    ///             println!("进度: {:.1}%, 速度: {:.2} MB/s", 
+    ///                 percentage, avg_speed / 1024.0 / 1024.0);
     ///         }
     ///         DownloadProgress::Completed { .. } => {
     ///             println!("下载完成！");
@@ -163,12 +167,18 @@ type FailedRange = (AllocatedRange, String);
 
 /// 下载任务执行器
 /// 
-/// 封装了下载任务的执行逻辑，包括进度监控、统计收集和资源清理
+/// 封装了下载任务的执行逻辑，包括进度监控、统计收集、动态分块和资源清理
 struct DownloadTask<F: AsyncFile> {
     pool: WorkerPool<F>,
     progress_sender: Option<Sender<DownloadProgress>>,
-    range_count: usize,
     writer: Arc<RangeWriter<F>>,
+    allocator: RangeAllocator,
+    url: String,
+    total_size: u64,
+    current_chunk_size: u64,
+    config: Arc<crate::config::DownloadConfig>,
+    next_worker_id: usize, // 用于轮询分配任务
+    total_ranges_completed: usize, // 已完成的 range 总数
 }
 
 impl<F: AsyncFile + 'static> DownloadTask<F> {
@@ -176,101 +186,240 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
     fn new(
         pool: WorkerPool<F>,
         progress_sender: Option<Sender<DownloadProgress>>,
-        range_count: usize,
         writer: Arc<RangeWriter<F>>,
+        allocator: RangeAllocator,
+        url: String,
+        total_size: u64,
+        config: Arc<crate::config::DownloadConfig>,
     ) -> Self {
+        let current_chunk_size = config.initial_chunk_size();
         Self {
             pool,
             progress_sender,
-            range_count,
             writer,
+            allocator,
+            url,
+            total_size,
+            current_chunk_size,
+            config,
+            next_worker_id: 0,
+            total_ranges_completed: 0,
         }
     }
     
     /// 发送开始事件
-    async fn send_started_event(&self, total_size: u64, worker_count: usize) {
+    async fn send_started_event(&self) {
         if let Some(ref sender) = self.progress_sender {
             let _ = sender.send(DownloadProgress::Started {
-                total_size,
-                range_count: self.range_count,
-                worker_count,
+                total_size: self.total_size,
+                worker_count: self.pool.worker_channels.len(),
+                initial_chunk_size: self.config.initial_chunk_size(),
             }).await;
         }
     }
     
+    /// 根据实时速度计算合适的分块大小
+    /// 
+    /// 速度越快，分块越大（减少请求开销）
+    /// 速度越慢，分块越小（提高并发，更灵活的任务分配）
+    fn calculate_chunk_size(&self, instant_speed: f64) -> u64 {
+        const KB: f64 = 1024.0;
+        const MB: f64 = 1024.0 * 1024.0;
+        
+        let min_size = self.config.min_chunk_size();
+        let max_size = self.config.max_chunk_size();
+        
+        let chunk_size = if instant_speed < 500.0 * KB {
+            // < 500 KB/s: 使用最小分块
+            min_size
+        } else if instant_speed < 2.0 * MB {
+            // 500 KB/s ~ 2 MB/s: 2 倍最小分块
+            (min_size * 2).min(max_size)
+        } else if instant_speed < 10.0 * MB {
+            // 2 MB/s ~ 10 MB/s: 5 倍最小分块
+            (min_size * 5).min(max_size)
+        } else {
+            // > 10 MB/s: 使用最大分块
+            max_size
+        };
+        
+        // 确保在合理范围内
+        chunk_size.clamp(min_size, max_size)
+    }
+    
+    /// 尝试分配下一个任务
+    /// 
+    /// 返回 (任务, worker_id)，如果没有剩余空间则返回 None
+    fn try_allocate_next_task(&mut self) -> Option<(WorkerTask, usize)> {
+        let remaining = self.allocator.remaining();
+        if remaining == 0 {
+            return None;
+        }
+        
+        // 计算实际分配大小（不超过剩余空间）
+        let alloc_size = self.current_chunk_size.min(remaining);
+        
+        // 分配 range
+        let range = self.allocator.allocate(alloc_size)?;
+        
+        // 创建任务
+        let task = WorkerTask::Range {
+            url: self.url.clone(),
+            range,
+        };
+        
+        // 轮询选择 worker
+        let worker_id = self.next_worker_id;
+        self.next_worker_id = (self.next_worker_id + 1) % self.pool.worker_channels.len();
+        
+        Some((task, worker_id))
+    }
+    
     /// 等待所有 range 完成
     /// 
-    /// 轮询所有 worker 的结果，收集完成和失败的 range
-    /// 定期发送进度更新
+    /// 动态分配任务，收集完成和失败的 range，定期发送进度更新和调整分块大小
     async fn wait_for_completion(&mut self) -> Result<Vec<FailedRange>> {
-        let mut completed_count = 0;
         let mut failed_ranges = Vec::new();
-        let mut should_send_progress = false;
         
-        while completed_count < self.range_count {
-            let mut found = false;
-            
-            for (worker_id, channel) in self.pool.worker_channels.iter_mut().enumerate() {
-                match channel.result_receiver.try_recv() {
-                    Ok(RangeResult::Complete(_)) => {
-                        completed_count += 1;
-                        found = true;
-                        
-                        // 每完成 10% 的任务标记需要发送进度
-                        if completed_count % (self.range_count / 10).max(1) == 0 {
-                            should_send_progress = true;
+        // 创建定时器，用于定期更新进度和调整分块大小
+        let mut progress_timer = tokio::time::interval(self.config.instant_speed_window());
+        progress_timer.tick().await; // 跳过首次立即触发
+        
+        // 初始任务分配：为每个 worker 分配一个任务
+        info!("开始初始任务分配，每个 worker 分配一个 {} bytes 的分块", self.current_chunk_size);
+        for worker_id in 0..self.pool.worker_channels.len() {
+            if let Some((task, _)) = self.try_allocate_next_task() {
+                if let Err(e) = self.pool.send_task(task, worker_id).await {
+                    error!("初始任务分配失败: {:?}", e);
+                }
+            } else {
+                info!("没有足够的数据为所有 worker 分配初始任务");
+                break;
+            }
+        }
+        
+        loop {
+            tokio::select! {
+                // 定时器触发：更新进度和调整分块大小
+                _ = progress_timer.tick() => {
+                    self.adjust_chunk_size_and_send_progress().await;
+                }
+                
+                // 轮询 worker 结果并分配新任务
+                _ = async {
+                    let mut found = false;
+                    let mut completed_workers = Vec::new();
+                    
+                    // 轮询所有 worker 的结果
+                    for (worker_id, channel) in self.pool.worker_channels.iter_mut().enumerate() {
+                        match channel.result_receiver.try_recv() {
+                            Ok(RangeResult::Complete(_)) => {
+                                self.total_ranges_completed += 1;
+                                found = true;
+                                
+                                // 记录需要分配新任务的 worker
+                                completed_workers.push(worker_id);
+                            }
+                            Ok(RangeResult::Failed { range, error }) => {
+                                error!(
+                                    "Worker #{} Range {}..{} 失败: {}",
+                                    worker_id,
+                                    range.start(),
+                                    range.end(),
+                                    error
+                                );
+                                failed_ranges.push((range, error));
+                                self.total_ranges_completed += 1;
+                                found = true;
+                                
+                                // 失败后也需要分配新任务
+                                completed_workers.push(worker_id);
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                // 该 receiver 暂时没有数据
+                            }
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                // 该 worker 已退出
+                            }
                         }
                     }
-                    Ok(RangeResult::Failed { range, error }) => {
-                        error!(
-                            "Worker #{} Range {}..{} 失败: {}",
-                            worker_id,
-                            range.start(),
-                            range.end(),
-                            error
-                        );
-                        failed_ranges.push((range, error));
-                        completed_count += 1;
-                        found = true;
+                    
+                    // 为完成任务的 worker 分配新任务
+                    for worker_id in completed_workers {
+                        if let Some((task, target_worker)) = self.try_allocate_next_task() {
+                            debug!(
+                                "Worker #{} 完成任务，分配新任务到 Worker #{}",
+                                worker_id, target_worker
+                            );
+                            if let Err(e) = self.pool.send_task(task, target_worker).await {
+                                error!("分配新任务失败: {:?}", e);
+                            }
+                        } else {
+                            debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
+                        }
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        // 该 receiver 暂时没有数据
+                    
+                    if !found {
+                        // 没有任何信号到达，稍等一下
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // 该 worker 已退出
-                    }
-                }
+                } => {}
             }
             
-            // 发送进度更新
-            if should_send_progress {
-                self.send_progress_update(completed_count).await;
-                should_send_progress = false;
-            }
-            
-            if !found {
-                // 没有任何信号到达，稍等一下
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            // 检查是否所有任务完成
+            if self.allocator.remaining() == 0 && self.writer.is_complete() {
+                info!("所有任务已完成，总共完成 {} 个 range", self.total_ranges_completed);
+                break;
             }
         }
         
         Ok(failed_ranges)
     }
     
+    /// 调整分块大小并发送进度更新
+    /// 
+    /// 根据实时速度动态调整分块大小，并发送进度更新
+    async fn adjust_chunk_size_and_send_progress(&mut self) {
+        // 根据实时速度调整分块大小
+        let (instant_speed, instant_valid) = self.pool.get_total_instant_speed();
+        if instant_valid {
+            let new_chunk_size = self.calculate_chunk_size(instant_speed);
+            if new_chunk_size != self.current_chunk_size {
+                info!(
+                    "根据实时速度 {:.2} MB/s 调整分块大小: {} -> {} bytes",
+                    instant_speed / 1024.0 / 1024.0,
+                    self.current_chunk_size,
+                    new_chunk_size
+                );
+                self.current_chunk_size = new_chunk_size;
+            }
+        }
+        
+        self.send_progress_update().await;
+    }
+    
     /// 发送进度更新
-    async fn send_progress_update(&self, completed: usize) {
+    async fn send_progress_update(&self) {
         if let Some(ref sender) = self.progress_sender {
             let total_avg_speed = self.pool.get_total_speed();
             let (total_instant_speed, instant_valid) = self.pool.get_total_instant_speed();
             let (total_bytes, _, _) = self.pool.get_total_stats();
             
+            // 计算百分比
+            let percentage = if self.total_size > 0 {
+                (total_bytes as f64 / self.total_size as f64) * 100.0
+            } else {
+                0.0
+            };
+            
             // 发送总体进度
-            let _ = sender.send(DownloadProgress::RangeComplete {
-                completed,
-                total: self.range_count,
+            let _ = sender.send(DownloadProgress::Progress {
                 bytes_downloaded: total_bytes,
+                total_size: self.total_size,
+                percentage,
                 avg_speed: total_avg_speed,
                 instant_speed: if instant_valid { Some(total_instant_speed) } else { None },
+                current_chunk_size: self.current_chunk_size,
             }).await;
             
             // 发送每个 worker 的统计信息
@@ -373,10 +522,11 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
 /// 
 /// 为此下载任务创建独立的协程池，下载完成后销毁
 /// Workers 直接写入共享的 RangeWriter，减少内存拷贝
+/// 使用动态分块机制，根据实时速度自动调整分块大小
 /// 
 /// # Arguments
 /// 
-/// * `config` - 下载配置，包含分块策略和并发控制参数
+/// * `config` - 下载配置，包含动态分块策略和并发控制参数
 /// * `progress_sender` - 可选的进度更新发送器，通过 channel 发送进度信息
 async fn download_ranged_generic<C, FS>(
     client: C,
@@ -391,11 +541,9 @@ where
     FS: FileSystem,
     FS::File: Send + 'static,
 {
-    let range_count = config.range_count();
     let worker_count = config.worker_count();
-    let min_chunk_size = config.min_chunk_size();
     
-    info!("准备 Range 下载: {} ({} 个分段, {} 个 workers)", url, range_count, worker_count);
+    info!("准备 Range 下载: {} ({} 个 workers, 动态分块)", url, worker_count);
 
     // 检查服务器是否支持 Range 请求
     let range_support = check_range_support(&client, url).await?;
@@ -410,62 +558,39 @@ where
     }
 
     let content_length = range_support.content_length.context("无法获取文件大小")?;
-    info!("文件大小: {} bytes", content_length);
-
-    // 动态调整 range_count，确保每个分块不小于 min_chunk_size
-    let actual_range_count = if (content_length / range_count as u64) < min_chunk_size {
-        // 计算满足最小分块大小的最大分块数
-        let adjusted = (content_length / min_chunk_size).max(1) as usize;
-        info!(
-            "根据最小分块大小 ({} bytes) 调整分块数: {} -> {}",
-            min_chunk_size, range_count, adjusted
-        );
-        adjusted
-    } else {
-        range_count
-    };
+    info!("文件大小: {} bytes ({:.2} MB)", content_length, content_length as f64 / 1024.0 / 1024.0);
+    info!(
+        "动态分块配置: 初始 {} bytes, 范围 {} ~ {} bytes",
+        config.initial_chunk_size(),
+        config.min_chunk_size(),
+        config.max_chunk_size()
+    );
 
     // 创建 RangeWriter 和 RangeAllocator（会预分配文件）
-    let (writer, mut allocator) = RangeWriter::new(&fs, save_path.clone(), content_length).await?;
-
-    // 预先分配所有 Range（保证不重叠且有效）
-    let range_size = content_length / actual_range_count as u64;
-    let mut allocated_ranges = Vec::with_capacity(actual_range_count);
-    for i in 0..actual_range_count {
-        let size = if i == actual_range_count - 1 {
-            allocator.remaining()
-        } else {
-            range_size
-        };
-        
-        let range = allocator
-            .allocate(size)
-            .context(format!("分配 Range #{} 失败", i))?;
-        
-        allocated_ranges.push(range);
-    }
+    let (writer, allocator) = RangeWriter::new(&fs, save_path.clone(), content_length).await?;
 
     // 将 writer 包装在 Arc 中，创建协程池
     let writer = Arc::new(writer);
-    let pool = WorkerPool::new(client, worker_count, Arc::clone(&writer));
+    let pool = WorkerPool::new(
+        client, 
+        worker_count, 
+        Arc::clone(&writer),
+        config.instant_speed_window(),
+    );
 
-    // 创建下载任务
-    let mut task = DownloadTask::new(pool, progress_sender, actual_range_count, writer);
-    task.send_started_event(content_length, worker_count).await;
+    // 创建下载任务（使用动态分块）
+    let mut task = DownloadTask::new(
+        pool,
+        progress_sender,
+        writer,
+        allocator,
+        url.to_string(),
+        content_length,
+        Arc::new(config.clone()),
+    );
+    task.send_started_event().await;
 
-    // 分发 Range 任务给 workers
-    for (i, &range) in allocated_ranges.iter().enumerate() {
-        let worker_task = WorkerTask::Range {
-            url: url.to_string(),
-            range,
-        };
-        let worker_id = i % worker_count;
-        task.pool.send_task(worker_task, worker_id).await?;
-    }
-
-    info!("已提交 {} 个 Range 任务", actual_range_count);
-
-    // 等待所有任务完成
+    // 等待所有任务完成（内部会动态分配任务）
     let failed_ranges = task.wait_for_completion().await?;
 
     // 处理失败的任务
@@ -488,11 +613,12 @@ where
 /// 
 /// 为此下载任务创建独立的协程池，下载完成后销毁
 /// Workers 直接写入共享的 RangeWriter，减少内存拷贝
+/// 使用动态分块机制，根据实时下载速度自动调整分块大小
 /// 
 /// # Arguments
 /// * `url` - 下载 URL
 /// * `save_path` - 保存路径
-/// * `config` - 下载配置（包含分块数、worker数等参数）
+/// * `config` - 下载配置（包含动态分块参数、worker数等）
 /// 
 /// # Returns
 /// 
@@ -504,7 +630,7 @@ where
 /// # use rs_dn::{download_ranged, DownloadConfig, DownloadProgress};
 /// # use std::path::PathBuf;
 /// # async fn example() -> anyhow::Result<()> {
-/// // 使用默认配置
+/// // 使用默认配置（推荐）
 /// let config = DownloadConfig::default();
 /// let mut handle = download_ranged(
 ///     "http://example.com/file.bin",
@@ -514,17 +640,20 @@ where
 /// 
 /// // 或使用自定义配置
 /// let config = DownloadConfig::builder()
-///     .range_count(16)
-///     .worker_count(8)
-///     .min_chunk_size(5 * 1024 * 1024)  // 5 MB
+///     .worker_count(8)                         // 8 个并发 worker
+///     .initial_chunk_size(10 * 1024 * 1024)    // 初始 10 MB 分块
+///     .min_chunk_size(2 * 1024 * 1024)         // 最小 2 MB（慢速时）
+///     .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB（高速时）
 ///     .build();
 /// 
 /// // 监听进度
 /// while let Some(progress) = handle.progress_receiver().recv().await {
 ///     match progress {
-///         DownloadProgress::RangeComplete { completed, total, avg_speed, .. } => {
-///             println!("进度: {}/{}, 速度: {:.2} MB/s", 
-///                 completed, total, avg_speed / 1024.0 / 1024.0);
+///         DownloadProgress::Progress { percentage, avg_speed, current_chunk_size, .. } => {
+///             println!("进度: {:.1}%, 速度: {:.2} MB/s, 分块: {:.2} MB", 
+///                 percentage, 
+///                 avg_speed / 1024.0 / 1024.0,
+///                 current_chunk_size as f64 / 1024.0 / 1024.0);
 ///         }
 ///         DownloadProgress::Completed { total_bytes, total_time, .. } => {
 ///             println!("下载完成！{:.2} MB in {:.2}s", 
@@ -634,10 +763,12 @@ mod tests {
         }
 
         // 执行下载（使用 1 个 worker 以简化测试）
+        let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
-            .range_count(range_count)
             .worker_count(1)
+            .initial_chunk_size(chunk_size)
             .min_chunk_size(1)  // 设置为 1 以允许小文件测试
+            .max_chunk_size(chunk_size)  // 固定分块大小以便测试
             .build();
         
         let result = download_ranged_generic(
@@ -693,9 +824,10 @@ mod tests {
 
         // 执行下载
         let config = crate::config::DownloadConfig::builder()
-            .range_count(3)
             .worker_count(2)
+            .initial_chunk_size(test_data.len() as u64)  // 单次分块完成
             .min_chunk_size(1)
+            .max_chunk_size(test_data.len() as u64)
             .build();
         
         let result = download_ranged_generic(
@@ -767,11 +899,13 @@ mod tests {
             );
         }
 
-        // 使用 2 个 workers 下载 4 个 ranges
+        // 使用 2 个 workers 下载
+        let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
-            .range_count(range_count)
             .worker_count(2)
+            .initial_chunk_size(chunk_size)
             .min_chunk_size(1)
+            .max_chunk_size(chunk_size)  // 固定分块大小以便测试
             .build();
         
         let result = download_ranged_generic(
@@ -824,11 +958,12 @@ mod tests {
             Bytes::from(test_data.clone()),
         );
 
-        // 期望 10 个分块，但因为文件只有 1MB，最小分块 2MB，应该调整为 1 个
+        // 使用 1 MB 的初始分块大小下载 1 MB 文件
         let config = crate::config::DownloadConfig::builder()
-            .range_count(10)
             .worker_count(4)
-            .min_chunk_size(2 * 1024 * 1024)  // 2 MB
+            .initial_chunk_size(1 * 1024 * 1024)  // 1 MB
+            .min_chunk_size(512 * 1024)  // 512 KB
+            .max_chunk_size(2 * 1024 * 1024)  // 2 MB
             .build();
 
         let result = download_ranged_generic(
@@ -865,10 +1000,9 @@ mod tests {
             head_headers,
         );
 
-        // 期望 10 个分块，最小分块 2MB
-        // 10MB / 10 = 1MB < 2MB，应该调整为 10MB / 2MB = 5 个分块
-        let expected_chunks = 5;
-        let chunk_size = file_size / expected_chunks;
+        // 使用 2MB 的分块大小
+        let chunk_size = 2 * 1024 * 1024;
+        let expected_chunks = (file_size + chunk_size - 1) / chunk_size;
 
         for i in 0..expected_chunks {
             let start = i * chunk_size;
@@ -898,9 +1032,10 @@ mod tests {
         }
 
         let config = crate::config::DownloadConfig::builder()
-            .range_count(10)
             .worker_count(3)
-            .min_chunk_size(2 * 1024 * 1024)  // 2 MB
+            .initial_chunk_size(chunk_size as u64)
+            .min_chunk_size(chunk_size as u64)
+            .max_chunk_size(chunk_size as u64)  // 固定 2 MB 分块
             .build();
 
         let result = download_ranged_generic(
@@ -936,10 +1071,9 @@ mod tests {
             head_headers,
         );
 
-        // 期望 10 个分块，最小分块 2MB
-        // 100MB / 10 = 10MB > 2MB，不需要调整
-        let expected_chunks = 10;
-        let chunk_size = file_size / expected_chunks;
+        // 使用 10MB 的分块大小
+        let chunk_size = 10 * 1024 * 1024;
+        let expected_chunks = (file_size + chunk_size - 1) / chunk_size;
 
         for i in 0..expected_chunks {
             let start = i * chunk_size;
@@ -969,9 +1103,10 @@ mod tests {
         }
 
         let config = crate::config::DownloadConfig::builder()
-            .range_count(10)
             .worker_count(4)
-            .min_chunk_size(2 * 1024 * 1024)  // 2 MB
+            .initial_chunk_size(chunk_size as u64)
+            .min_chunk_size(chunk_size as u64)
+            .max_chunk_size(chunk_size as u64)  // 固定 10 MB 分块
             .build();
 
         let result = download_ranged_generic(

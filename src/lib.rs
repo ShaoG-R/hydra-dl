@@ -6,8 +6,10 @@
 //!
 //! - 多 URL 并发下载
 //! - 单文件分块下载（支持 HTTP Range 请求）
+//! - **动态分块机制**：根据实时下载速度自动调整分块大小
 //! - Worker 池架构，基于 channel 任务调度
 //! - 流式下载，内存占用低
+//! - 实时进度监控和统计
 //! - 使用 `log` crate 进行日志记录
 //!
 //! ## 示例
@@ -25,7 +27,7 @@
 //! }
 //! ```
 //!
-//! ### Range 分段下载（带进度监听）
+//! ### Range 分段下载（带进度监听和动态分块）
 //!
 //! ```no_run
 //! use std::path::PathBuf;
@@ -33,7 +35,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // 使用默认配置：8个分段，4个worker，最小分块2MB
+//!     // 使用默认配置：4个worker，动态分块（2-50 MB）
 //!     let config = DownloadConfig::default();
 //!     let mut handle = rs_dn::download_ranged(
 //!         "https://example.com/large_file.zip",
@@ -44,14 +46,16 @@
 //!     // 监听下载进度
 //!     while let Some(progress) = handle.progress_receiver().recv().await {
 //!         match progress {
-//!             DownloadProgress::Started { total_size, .. } => {
-//!                 println!("开始下载，总大小: {:.2} MB", total_size as f64 / 1024.0 / 1024.0);
+//!             DownloadProgress::Started { total_size, initial_chunk_size, .. } => {
+//!                 println!("开始下载，总大小: {:.2} MB, 初始分块: {:.2} MB", 
+//!                     total_size as f64 / 1024.0 / 1024.0,
+//!                     initial_chunk_size as f64 / 1024.0 / 1024.0);
 //!             }
-//!             DownloadProgress::RangeComplete { completed, total, avg_speed, .. } => {
-//!                 println!("进度: {}/{} ({:.1}%), 速度: {:.2} MB/s",
-//!                     completed, total,
-//!                     completed as f64 / total as f64 * 100.0,
-//!                     avg_speed / 1024.0 / 1024.0);
+//!             DownloadProgress::Progress { percentage, avg_speed, current_chunk_size, .. } => {
+//!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, 当前分块: {:.2} MB",
+//!                     percentage,
+//!                     avg_speed / 1024.0 / 1024.0,
+//!                     current_chunk_size as f64 / 1024.0 / 1024.0);
 //!             }
 //!             DownloadProgress::Completed { total_bytes, total_time, .. } => {
 //!                 println!("下载完成！{:.2} MB in {:.2}s",
@@ -70,7 +74,7 @@
 //! }
 //! ```
 //!
-//! ### 使用回调函数监听进度
+//! ### 使用回调函数监听进度和自定义配置
 //!
 //! ```no_run
 //! use std::path::PathBuf;
@@ -78,11 +82,12 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // 自定义配置
+//!     // 自定义配置：更多 worker，更大的分块范围
 //!     let config = DownloadConfig::builder()
-//!         .range_count(16)
-//!         .worker_count(8)
-//!         .min_chunk_size(5 * 1024 * 1024)  // 5 MB 最小分块
+//!         .worker_count(8)                         // 8 个并发 worker
+//!         .initial_chunk_size(10 * 1024 * 1024)    // 初始 10 MB 分块
+//!         .min_chunk_size(5 * 1024 * 1024)         // 最小 5 MB（慢速时）
+//!         .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB（高速时）
 //!         .build();
 //!     
 //!     let handle = rs_dn::download_ranged(
@@ -94,8 +99,8 @@
 //!     // 使用回调函数同时接收进度和等待完成
 //!     handle.wait_with_progress(|progress| {
 //!         match progress {
-//!             DownloadProgress::RangeComplete { completed, total, .. } => {
-//!                 println!("进度: {}/{}", completed, total);
+//!             DownloadProgress::Progress { percentage, .. } => {
+//!                 println!("进度: {:.1}%", percentage);
 //!             }
 //!             _ => {}
 //!         }
