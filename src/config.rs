@@ -29,6 +29,16 @@ pub const DEFAULT_EXPECTED_CHUNK_DURATION_SECS: u64 = 5;
 /// 默认分块大小平滑系数：0.7
 pub const DEFAULT_SMOOTHING_FACTOR: f64 = 0.7;
 
+/// 默认瞬时速度权重：0.7
+///
+/// 在计算理想分块大小时，瞬时速度的权重
+pub const DEFAULT_INSTANT_SPEED_WEIGHT: f64 = 0.7;
+
+/// 默认平均速度权重：0.3
+///
+/// 在计算理想分块大小时，平均速度的权重
+pub const DEFAULT_AVG_SPEED_WEIGHT: f64 = 0.3;
+
 /// 默认请求超时时间：30 秒
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
@@ -91,6 +101,18 @@ pub struct DownloadConfig {
     /// 越接近 1.0 响应越快，越接近 0.0 越平滑
     pub(crate) smoothing_factor: f64,
     
+    /// 瞬时速度权重 (0.0 ~ 1.0)
+    ///
+    /// 在计算理想分块大小时，瞬时速度的权重
+    /// 理想分块大小 = (瞬时速度 * 瞬时速度权重 + 平均速度 * 平均速度权重) * 预期时间
+    pub(crate) instant_speed_weight: f64,
+    
+    /// 平均速度权重 (0.0 ~ 1.0)
+    ///
+    /// 在计算理想分块大小时，平均速度的权重
+    /// 理想分块大小 = (瞬时速度 * 瞬时速度权重 + 平均速度 * 平均速度权重) * 预期时间
+    pub(crate) avg_speed_weight: f64,
+    
     /// HTTP 请求总体超时时间
     ///
     /// 包含连接建立、请求发送和响应接收的总时长
@@ -138,6 +160,8 @@ impl DownloadConfig {
     /// - 实时速度窗口: 1 秒
     /// - 预期分块时长: 5 秒
     /// - 平滑系数: 0.7
+    /// - 瞬时速度权重: 0.7
+    /// - 平均速度权重: 0.3
     /// - 请求超时: 30 秒
     /// - 连接超时: 10 秒
     /// - 渐进启动比例: [0.25, 0.5, 0.75, 1.0]
@@ -151,6 +175,8 @@ impl DownloadConfig {
             instant_speed_window: Duration::from_secs(DEFAULT_INSTANT_SPEED_WINDOW_SECS),
             expected_chunk_duration: Duration::from_secs(DEFAULT_EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: DEFAULT_SMOOTHING_FACTOR,
+            instant_speed_weight: DEFAULT_INSTANT_SPEED_WEIGHT,
+            avg_speed_weight: DEFAULT_AVG_SPEED_WEIGHT,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             progressive_worker_ratios: DEFAULT_PROGRESSIVE_WORKER_RATIOS.to_vec(),
@@ -191,6 +217,16 @@ impl DownloadConfig {
     /// 获取平滑系数
     pub fn smoothing_factor(&self) -> f64 {
         self.smoothing_factor
+    }
+    
+    /// 获取瞬时速度权重
+    pub fn instant_speed_weight(&self) -> f64 {
+        self.instant_speed_weight
+    }
+    
+    /// 获取平均速度权重
+    pub fn avg_speed_weight(&self) -> f64 {
+        self.avg_speed_weight
     }
     
     /// 获取请求超时时间
@@ -237,6 +273,8 @@ pub struct DownloadConfigBuilder {
     instant_speed_window: Duration,
     expected_chunk_duration: Duration,
     smoothing_factor: f64,
+    instant_speed_weight: f64,
+    avg_speed_weight: f64,
     timeout: Duration,
     connect_timeout: Duration,
     progressive_worker_ratios: Vec<f64>,
@@ -254,6 +292,8 @@ impl DownloadConfigBuilder {
             instant_speed_window: Duration::from_secs(DEFAULT_INSTANT_SPEED_WINDOW_SECS),
             expected_chunk_duration: Duration::from_secs(DEFAULT_EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: DEFAULT_SMOOTHING_FACTOR,
+            instant_speed_weight: DEFAULT_INSTANT_SPEED_WEIGHT,
+            avg_speed_weight: DEFAULT_AVG_SPEED_WEIGHT,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             progressive_worker_ratios: DEFAULT_PROGRESSIVE_WORKER_RATIOS.to_vec(),
@@ -340,6 +380,30 @@ impl DownloadConfigBuilder {
     /// * `factor` - 平滑系数（会被限制在 0.0 ~ 1.0 范围内）
     pub fn smoothing_factor(mut self, factor: f64) -> Self {
         self.smoothing_factor = factor.clamp(0.0, 1.0);
+        self
+    }
+    
+    /// 设置瞬时速度权重
+    ///
+    /// 在计算理想分块大小时，瞬时速度的权重
+    ///
+    /// # Arguments
+    ///
+    /// * `weight` - 瞬时速度权重（会被限制在 0.0 ~ 1.0 范围内）
+    pub fn instant_speed_weight(mut self, weight: f64) -> Self {
+        self.instant_speed_weight = weight.clamp(0.0, 1.0);
+        self
+    }
+    
+    /// 设置平均速度权重
+    ///
+    /// 在计算理想分块大小时，平均速度的权重
+    ///
+    /// # Arguments
+    ///
+    /// * `weight` - 平均速度权重（会被限制在 0.0 ~ 1.0 范围内）
+    pub fn avg_speed_weight(mut self, weight: f64) -> Self {
+        self.avg_speed_weight = weight.clamp(0.0, 1.0);
         self
     }
     
@@ -443,6 +507,8 @@ impl DownloadConfigBuilder {
             instant_speed_window: self.instant_speed_window,
             expected_chunk_duration: self.expected_chunk_duration,
             smoothing_factor: self.smoothing_factor,
+            instant_speed_weight: self.instant_speed_weight,
+            avg_speed_weight: self.avg_speed_weight,
             timeout: self.timeout,
             connect_timeout: self.connect_timeout,
             progressive_worker_ratios: self.progressive_worker_ratios,

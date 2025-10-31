@@ -18,7 +18,6 @@ use crate::utils::stats::{DownloadStats, DownloadStatsParent};
 use crate::Result;
 use async_trait::async_trait;
 use log::{debug, error, info};
-use parking_lot::RwLock;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -36,8 +35,8 @@ impl WorkerResult for RangeResult {}
 pub(crate) struct DownloadWorkerContext {
     /// 该 worker 的独立下载统计
     pub(crate) stats: Arc<DownloadStats>,
-    /// 该 worker 的独立分块策略（使用 parking_lot::RwLock 包装以支持内部可变性）
-    pub(crate) chunk_strategy: Arc<RwLock<Box<dyn ChunkStrategy + Send + Sync>>>,
+    /// 该 worker 的独立分块策略（ChunkStrategy 内部使用原子操作，无需外部锁）
+    pub(crate) chunk_strategy: Box<dyn ChunkStrategy>,
 }
 
 impl WorkerContext for DownloadWorkerContext {}
@@ -200,11 +199,9 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
             .map(|_| {
                 // 通过 parent 创建 child stats
                 let worker_stats = Arc::new(global_stats.create_child());
-                // 创建独立的分块策略（使用 Arc<RwLock> 包装）
-                let chunk_strategy = Arc::new(RwLock::new(
-                    Box::new(SpeedBasedChunkStrategy::from_config(&config))
-                        as Box<dyn ChunkStrategy + Send + Sync>,
-                ));
+                // 创建独立的分块策略（策略内部使用原子操作，无需外部锁）
+                let chunk_strategy = 
+                    Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
 
                 DownloadWorkerContext {
                     stats: worker_stats,
@@ -245,11 +242,9 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         let contexts: Vec<DownloadWorkerContext> = (0..count)
             .map(|_| {
                 let worker_stats = Arc::new(self.global_stats.create_child());
-                // 创建独立的分块策略（使用 Arc<RwLock> 包装）
-                let chunk_strategy = Arc::new(RwLock::new(
-                    Box::new(SpeedBasedChunkStrategy::from_config(&self.config))
-                        as Box<dyn ChunkStrategy + Send + Sync>,
-                ));
+                // 创建独立的分块策略（策略内部使用原子操作，无需外部锁）
+                let chunk_strategy = 
+                    Box::new(SpeedBasedChunkStrategy::from_config(&self.config)) as Box<dyn ChunkStrategy + Send + Sync>;
 
                 DownloadWorkerContext {
                     stats: worker_stats,
@@ -314,13 +309,12 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     /// 当前分块大小 (bytes)，如果 worker 不存在返回 None
     pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> Option<u64> {
         let context = self.pool.worker_context(worker_id)?;
-        let strategy = context.chunk_strategy.read();
-        Some(strategy.current_chunk_size())
+        Some(context.chunk_strategy.current_chunk_size())
     }
 
-    /// 根据 worker 的实时速度计算新的分块大小
+    /// 根据 worker 的实时速度和平均速度计算新的分块大小
     ///
-    /// 使用该 worker 的独立分块策略和实时速度来计算，并更新策略状态
+    /// 使用该 worker 的独立分块策略、实时速度和平均速度来计算，并更新策略状态
     ///
     /// # Arguments
     ///
@@ -332,20 +326,19 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     ///
     /// # Note
     ///
-    /// 此方法会根据实时速度动态调整分块大小，并通过 RwLock 更新策略状态
+    /// 此方法会根据实时速度和平均速度（带权重）动态调整分块大小，策略内部使用原子操作更新状态
     pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> Option<u64> {
         let context_arc = self.pool.worker_context(worker_id)?;
         let (instant_speed, valid) = context_arc.stats.get_instant_speed();
+        let avg_speed = context_arc.stats.get_speed();
         
         if valid && instant_speed > 0.0 {
-            // 获取锁并更新策略
-            let mut strategy = context_arc.chunk_strategy.write();
-            let new_chunk_size = strategy.calculate_chunk_size(instant_speed);
+            // 直接调用策略计算（内部使用原子操作更新）
+            let new_chunk_size = context_arc.chunk_strategy.calculate_chunk_size(instant_speed, avg_speed);
             Some(new_chunk_size)
         } else {
             // 速度无效时返回当前分块大小
-            let strategy = context_arc.chunk_strategy.read();
-            Some(strategy.current_chunk_size())
+            Some(context_arc.chunk_strategy.current_chunk_size())
         }
     }
 
@@ -402,10 +395,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
                 slot_arc.as_ref().as_ref().map(|worker| {
                     let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
                         worker.context.stats.get_full_summary();
-                    let current_chunk_size = {
-                        let strategy = worker.context.chunk_strategy.read();
-                        strategy.current_chunk_size()
-                    };
+                    let current_chunk_size = worker.context.chunk_strategy.current_chunk_size();
                     crate::download::WorkerStatSnapshot {
                         worker_id: id,
                         bytes: worker_bytes,
@@ -563,10 +553,8 @@ mod tests {
         // 创建上下文
         let stats = Arc::new(DownloadStats::default());
         let config = crate::config::DownloadConfig::default();
-        let chunk_strategy = Arc::new(RwLock::new(
-            Box::new(SpeedBasedChunkStrategy::from_config(&config))
-                as Box<dyn ChunkStrategy + Send + Sync>,
-        ));
+        let chunk_strategy = 
+            Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
         let context = DownloadWorkerContext {
             stats: Arc::clone(&stats),
             chunk_strategy,
@@ -623,10 +611,8 @@ mod tests {
 
         let stats = Arc::new(DownloadStats::default());
         let config = crate::config::DownloadConfig::default();
-        let chunk_strategy = Arc::new(RwLock::new(
-            Box::new(SpeedBasedChunkStrategy::from_config(&config))
-                as Box<dyn ChunkStrategy + Send + Sync>,
-        ));
+        let chunk_strategy = 
+            Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
         let context = DownloadWorkerContext {
             stats,
             chunk_strategy,
