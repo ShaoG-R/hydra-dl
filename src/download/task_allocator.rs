@@ -36,6 +36,8 @@ pub(super) struct TaskAllocator {
     pub(super) idle_workers: VecDeque<usize>,
     /// 待重试的失败任务映射（定时器 TaskId -> 失败任务信息）
     failed_tasks: FxHashMap<TaskId, FailedTaskInfo>,
+    /// 已就绪的重试任务队列（定时器已触发但尚未分配）
+    ready_retry_queue: VecDeque<FailedTaskInfo>,
     /// 永久失败的任务（达到最大重试次数）
     permanently_failed: Vec<(AllocatedRange, String)>,
 }
@@ -51,15 +53,18 @@ impl TaskAllocator {
             url,
             idle_workers: VecDeque::new(),
             failed_tasks: FxHashMap::default(),
+            ready_retry_queue: VecDeque::new(),
             permanently_failed: Vec::new(),
         }
     }
     
     /// 尝试为空闲 worker 分配任务
     /// 
+    /// 优先从重试队列中取任务，如果队列为空则分配新任务
+    /// 
     /// # Arguments
     /// 
-    /// * `chunk_size` - 要分配的分块大小
+    /// * `chunk_size` - 要分配的分块大小（仅用于新任务）
     /// 
     /// # Returns
     /// 
@@ -68,6 +73,25 @@ impl TaskAllocator {
         // 从队列中获取空闲 worker
         let worker_id = self.idle_workers.pop_front()?;
         
+        // 优先从重试队列中取任务
+        if let Some(retry_info) = self.ready_retry_queue.pop_front() {
+            debug!(
+                "从重试队列分配任务 range {}..{}, 重试次数 {}",
+                retry_info.range.start(),
+                retry_info.range.end(),
+                retry_info.retry_count
+            );
+            
+            let task = WorkerTask::Range {
+                url: self.url.clone(),
+                range: retry_info.range,
+                retry_count: retry_info.retry_count,
+            };
+            
+            return Some((task, worker_id));
+        }
+        
+        // 重试队列为空，分配新任务
         let remaining = self.allocator.remaining();
         if remaining == 0 {
             // 没有剩余任务，将 worker 放回队列
@@ -116,6 +140,24 @@ impl TaskAllocator {
     /// 返回对应的失败任务信息，如果不存在则返回 None
     pub(super) fn pop_failed_task(&mut self, timer_id: TaskId) -> Option<FailedTaskInfo> {
         self.failed_tasks.remove(&timer_id)
+    }
+    
+    /// 将失败任务推入就绪重试队列
+    /// 
+    /// 当定时器触发但没有空闲 worker 时，将任务推入此队列
+    /// 任务会在下次有 worker 空闲时优先分配
+    /// 
+    /// # Arguments
+    /// 
+    /// * `task_info` - 失败任务信息
+    pub(super) fn push_ready_retry_task(&mut self, task_info: FailedTaskInfo) {
+        debug!(
+            "推入重试任务到就绪队列 range {}..{}, 重试次数 {}",
+            task_info.range.start(),
+            task_info.range.end(),
+            task_info.retry_count
+        );
+        self.ready_retry_queue.push_back(task_info);
     }
     
     /// 记录失败任务
@@ -189,8 +231,10 @@ impl TaskAllocator {
     }
     
     /// 获取待重试的任务数量
+    /// 
+    /// 包括定时器等待中的任务和已就绪等待分配的任务
     pub(super) fn pending_retry_count(&self) -> usize {
-        self.failed_tasks.len()
+        self.failed_tasks.len() + self.ready_retry_queue.len()
     }
     
     /// 获取下载 URL

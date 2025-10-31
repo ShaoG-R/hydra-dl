@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use kestrel_protocol_timer::TimerService;
+use kestrel_protocol_timer::{TimerService, TaskId};
 use crate::pool::download::DownloadWorkerPool;
 use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient};
-use crate::utils::range_writer::{RangeAllocator, RangeWriter};
+use crate::utils::range_writer::{RangeAllocator, RangeWriter, AllocatedRange};
 use crate::task::RangeResult;
 
 mod progressive;
@@ -17,6 +17,16 @@ mod progress_reporter;
 use progressive::ProgressiveLauncher;
 use task_allocator::{TaskAllocator, FailedRange};
 use progress_reporter::ProgressReporter;
+
+/// 下载循环控制流
+/// 
+/// 用于控制下载事件循环的行为
+enum LoopControl {
+    /// 继续循环
+    Continue,
+    /// 正常完成，退出循环
+    Break,
+}
 
 /// Worker 统计信息
 #[derive(Debug, Clone)]
@@ -256,8 +266,6 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
     /// 动态分配任务，支持失败重试，定期发送进度更新和调整分块大小
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
     async fn wait_for_completion(&mut self) -> Result<Vec<FailedRange>> {
-        let _failed_ranges: Vec<FailedRange> = Vec::new(); // 保留以兼容现有代码，但不再使用
-        
         // 获取定时器超时接收器
         let mut timeout_rx = self.timer_service.take_receiver()
             .ok_or_else(|| DownloadError::Other("无法获取定时器接收器".to_string()))?;
@@ -266,7 +274,153 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         let mut progress_timer = tokio::time::interval(self.config.instant_speed_window());
         progress_timer.tick().await; // 跳过首次立即触发
         
-        // 初始任务分配：从空闲队列中取出 worker 并分配任务
+        // 分配初始任务
+        self.allocate_initial_tasks().await?;
+        
+        // 事件循环：分发各种事件到对应的处理器
+        loop {
+            let control = tokio::select! {
+                _ = progress_timer.tick() => self.handle_progress_tick().await,
+                Some(timer_id) = timeout_rx.recv() => self.handle_retry_timeout(timer_id).await,
+                result = self.pool.result_receiver().recv() => self.handle_worker_result(result).await,
+            };
+            
+            match control {
+                LoopControl::Continue => continue,
+                LoopControl::Break => break,
+            }
+        }
+        
+        // 检查最终状态并返回结果
+        self.check_final_status()
+    }
+    
+    /// 处理进度更新定时器触发
+    async fn handle_progress_tick(&mut self) -> LoopControl {
+        self.send_progress().await;
+        
+        // 检查是否可以启动下一批worker（渐进式启动）
+        if self.progressive_launcher.should_check_next_stage() {
+            if let Err(e) = self.progressive_launcher.check_and_launch_next_stage(
+                &mut self.pool,
+                self.client.clone(),
+                &self.config,
+                &mut self.task_allocator,
+            ).await {
+                error!("渐进式启动下一批 worker 失败: {:?}", e);
+            }
+        }
+        
+        LoopControl::Continue
+    }
+    
+    /// 处理重试超时事件
+    async fn handle_retry_timeout(&mut self, timer_id: TaskId) -> LoopControl {
+        // 根据 timer_id 获取失败任务信息
+        let Some(info) = self.task_allocator.pop_failed_task(timer_id) else {
+            return LoopControl::Continue;
+        };
+        
+        info!(
+            "定时器触发，重试任务 range {}..{}, 重试次数 {}",
+            info.range.start(),
+            info.range.end(),
+            info.retry_count
+        );
+        
+        // 从空闲队列获取 worker
+        if let Some(worker_id) = self.task_allocator.idle_workers.pop_front() {
+            // 有空闲 worker，立即分配任务
+            let task = crate::task::WorkerTask::Range {
+                url: self.task_allocator.url().to_string(),
+                range: info.range,
+                retry_count: info.retry_count,
+            };
+            
+            if let Err(e) = self.pool.send_task(task, worker_id).await {
+                error!("分配重试任务失败: {:?}", e);
+                self.task_allocator.mark_worker_idle(worker_id);
+                // 任务发送失败，放回就绪队列
+                self.task_allocator.push_ready_retry_task(info);
+            }
+        } else {
+            // 没有空闲 worker，推入就绪队列等待下次分配
+            debug!("定时器触发但没有空闲 worker，推入就绪队列");
+            self.task_allocator.push_ready_retry_task(info);
+        }
+        
+        LoopControl::Continue
+    }
+    
+    /// 处理 worker 结果
+    async fn handle_worker_result(&mut self, result: Option<RangeResult>) -> LoopControl {
+        let Some(result) = result else {
+            // 所有 worker 的 result_sender 都已关闭
+            info!("所有 worker 已退出");
+            return LoopControl::Break;
+        };
+        
+        match result {
+            RangeResult::Complete { worker_id } => self.handle_complete(worker_id).await,
+            RangeResult::Failed { worker_id, range, error, retry_count } => {
+                self.handle_failed(worker_id, range, error, retry_count).await
+            }
+        }
+    }
+    
+    /// 处理任务完成事件
+    async fn handle_complete(&mut self, worker_id: usize) -> LoopControl {
+        self.progress_reporter.record_range_complete();
+        
+        // 将完成的 worker 标记为空闲
+        self.task_allocator.mark_worker_idle(worker_id);
+        
+        // 尝试为空闲 worker 分配新任务
+        self.try_allocate_next_task(worker_id).await;
+        
+        // 检查是否所有任务已完成
+        self.check_completion_status()
+    }
+    
+    /// 处理任务失败事件
+    async fn handle_failed(
+        &mut self,
+        worker_id: usize,
+        range: AllocatedRange,
+        error: String,
+        retry_count: usize,
+    ) -> LoopControl {
+        warn!(
+            "Worker #{} Range {}..{} 失败 (重试 {}): {}",
+            worker_id,
+            range.start(),
+            range.end(),
+            retry_count,
+            error
+        );
+        
+        // 将失败的 worker 标记为空闲
+        self.task_allocator.mark_worker_idle(worker_id);
+        
+        // 调度重试任务
+        self.schedule_retry_task(range, retry_count);
+        
+        // 尝试为空闲 worker 分配新任务
+        self.try_allocate_next_task(worker_id).await;
+        
+        // 检查是否所有任务已完成
+        self.check_completion_status()
+    }
+    
+    /// 发送进度更新
+    /// 
+    /// 定期发送进度更新（分块大小由各 worker 独立调整）
+    async fn send_progress(&mut self) {
+        self.progress_reporter.send_progress_update(&self.pool).await;
+    }
+    
+    /// 分配初始任务给所有空闲的 worker
+    async fn allocate_initial_tasks(&mut self) -> Result<()> {
         let current_worker_count = self.pool.worker_count();
         info!(
             "渐进式启动 - 第1批: 已启动 {} 个 workers",
@@ -291,202 +445,59 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             }
         }
         
-        loop {
-            tokio::select! {
-                // 定时器触发：发送进度更新和检查是否启动下一批worker
-                _ = progress_timer.tick() => {
-                    self.send_progress().await;
-                    
-                    // 检查是否可以启动下一批worker（渐进式启动）
-                    if self.progressive_launcher.should_check_next_stage() {
-                        if let Err(e) = self.progressive_launcher.check_and_launch_next_stage(
-                            &mut self.pool,
-                            self.client.clone(),
-                            &self.config,
-                            &mut self.task_allocator,
-                        ).await {
-                            error!("渐进式启动下一批 worker 失败: {:?}", e);
-                        }
-                    }
-                }
-                
-                // 监听定时器超时事件
-                Some(timer_id) = timeout_rx.recv() => {
-                    // 根据 timer_id 获取失败任务信息
-                    if let Some(info) = self.task_allocator.pop_failed_task(timer_id) {
-                        // 从空闲队列获取 worker
-                        if let Some(worker_id) = self.task_allocator.idle_workers.pop_front() {
-                            info!(
-                                "定时器触发，重试任务 range {}..{}, 重试次数 {}",
-                                info.range.start(),
-                                info.range.end(),
-                                info.retry_count
-                            );
-                            
-                            // 重新分配任务
-                            let task = crate::task::WorkerTask::Range {
-                                url: self.task_allocator.url().to_string(),
-                                range: info.range,
-                                retry_count: info.retry_count,
-                            };
-                            
-                            if let Err(e) = self.pool.send_task(task, worker_id).await {
-                                error!("分配重试任务失败: {:?}", e);
-                                self.task_allocator.mark_worker_idle(worker_id);
-                            }
-                        } else {
-                            // 没有空闲 worker，需要重新注册定时器
-                            warn!("定时器触发但没有空闲 worker，延迟 100ms 后重试");
-                            // 重新注册一个短延迟定时器
-                            if let Err(e) = self.task_allocator.record_failed_task(
-                                info.range,
-                                info.retry_count,
-                                std::time::Duration::from_millis(100),
-                                &self.timer_service,
-                            ) {
-                                error!("重新注册定时器失败: {:?}", e);
-                                // 标记为永久失败
-                                self.task_allocator.record_permanent_failure(
-                                    info.range,
-                                    format!("重新注册定时器失败: {}", e)
-                                );
-                            }
-                        }
-                    }
-                }
-                
-                // 接收 worker 结果并分配新任务
-                result = self.pool.result_receiver().recv() => {
-                    match result {
-                        Some(RangeResult::Complete { worker_id }) => {
-                            self.progress_reporter.record_range_complete();
-                            
-                            // 将完成的 worker 标记为空闲
-                            self.task_allocator.mark_worker_idle(worker_id);
-                            
-                            // 根据该 worker 的实时速度计算新的分块大小
-                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
-                                .unwrap_or(self.config.initial_chunk_size());
-                            
-                            // 尝试为空闲 worker 分配新任务
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
-                                debug!(
-                                    "Worker #{} 完成任务，分配新任务到空闲 Worker #{}，分块大小 {} bytes",
-                                    worker_id, target_worker, chunk_size
-                                );
-                                if let Err(e) = self.pool.send_task(task, target_worker).await {
-                                    error!("分配新任务失败: {:?}", e);
-                                    // 失败了，将 worker 放回队列
-                                    self.task_allocator.mark_worker_idle(target_worker);
-                                }
-                            } else {
-                                debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
-                            }
-                        }
-                        Some(RangeResult::Failed { worker_id, range, error, retry_count }) => {
-                            warn!(
-                                "Worker #{} Range {}..{} 失败 (重试 {}): {}",
-                                worker_id,
-                                range.start(),
-                                range.end(),
-                                retry_count,
-                                error
-                            );
-                            
-                            // 将失败的 worker 标记为空闲
-                            self.task_allocator.mark_worker_idle(worker_id);
-                            
-                            // 判断是否应该重试
-                            let max_retry = self.config.max_retry_count();
-                            
-                            if retry_count < max_retry {
-                                // 还可以重试，计算延迟时间
-                                let retry_delays = self.config.retry_delays();
-                                let delay = if retry_count < retry_delays.len() {
-                                    retry_delays[retry_count]
-                                } else {
-                                    // 如果重试次数超过序列长度，使用最后一个值
-                                    *retry_delays.last().unwrap_or(&std::time::Duration::from_secs(3))
-                                };
-                                
-                                info!(
-                                    "任务 range {}..{} 将在 {:.1}s 后进行第 {} 次重试",
-                                    range.start(),
-                                    range.end(),
-                                    delay.as_secs_f64(),
-                                    retry_count + 1
-                                );
-                                
-                                // 记录失败任务以便稍后重试
-                                if let Err(e) = self.task_allocator.record_failed_task(
-                                    range,
-                                    retry_count + 1,  // 下次重试的次数
-                                    delay,
-                                    &self.timer_service,
-                                ) {
-                                    error!("注册重试定时器失败: {:?}", e);
-                                    // 失败则标记为永久失败
-                                    self.task_allocator.record_permanent_failure(
-                                        range,
-                                        format!("注册定时器失败: {}", e)
-                                    );
-                                    self.progress_reporter.record_range_complete();
-                                }
-                            } else {
-                                // 已达到最大重试次数，记录为永久失败
-                                error!(
-                                    "任务 range {}..{} 已达到最大重试次数 {}，标记为永久失败",
-                                    range.start(),
-                                    range.end(),
-                                    max_retry
-                                );
-                                self.task_allocator.record_permanent_failure(range, error);
-                                self.progress_reporter.record_range_complete();
-                            }
-                            
-                            // 尝试为空闲 worker 分配新任务
-                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
-                                .unwrap_or(self.config.initial_chunk_size());
-                            
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
-                                debug!(
-                                    "Worker #{} 任务失败，分配新任务到空闲 Worker #{}，分块大小 {} bytes",
-                                    worker_id, target_worker, chunk_size
-                                );
-                                if let Err(e) = self.pool.send_task(task, target_worker).await {
-                                    error!("分配新任务失败: {:?}", e);
-                                    self.task_allocator.mark_worker_idle(target_worker);
-                                }
-                            }
-                        }
-                        None => {
-                            // 所有 worker 的 result_sender 都已关闭
-                            info!("所有 worker 已退出");
-                            break;
-                        }
-                    }
-                }
+        Ok(())
+    }
+    
+    /// 尝试为指定 worker 分配下一个任务
+    /// 
+    /// 计算该 worker 的分块大小，并尝试分配新任务
+    async fn try_allocate_next_task(&mut self, worker_id: usize) {
+        let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
+            .unwrap_or(self.config.initial_chunk_size());
+        
+        if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+            debug!(
+                "Worker #{} 分配新任务到空闲 Worker #{}，分块大小 {} bytes",
+                worker_id, target_worker, chunk_size
+            );
+            if let Err(e) = self.pool.send_task(task, target_worker).await {
+                error!("分配新任务失败: {:?}", e);
+                // 失败了，将 worker 放回队列
+                self.task_allocator.mark_worker_idle(target_worker);
             }
-            
-            // 检查是否所有任务完成（包括新任务和重试任务）
-            if self.task_allocator.remaining() == 0 
-                && self.task_allocator.pending_retry_count() == 0 
-                && self.writer.is_complete() {
-                info!(
-                    "所有任务已完成，总共完成 {} 个 range",
-                    self.progress_reporter.total_ranges_completed()
-                );
-                break;
-            }
-            
-            // 检查是否有永久失败的任务
-            if self.task_allocator.has_permanent_failures() {
-                error!("检测到永久失败的任务，准备终止下载");
-                break;
-            }
+        } else {
+            debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
+        }
+    }
+    
+    /// 检查是否所有任务已完成
+    /// 
+    /// 返回相应的 LoopControl 来控制主循环行为
+    fn check_completion_status(&self) -> LoopControl {
+        // 检查是否所有任务完成（包括新任务和重试任务）
+        if self.task_allocator.remaining() == 0 
+            && self.task_allocator.pending_retry_count() == 0 
+            && self.writer.is_complete() {
+            info!(
+                "所有任务已完成，总共完成 {} 个 range",
+                self.progress_reporter.total_ranges_completed()
+            );
+            return LoopControl::Break;
         }
         
         // 检查是否有永久失败的任务
+        if self.task_allocator.has_permanent_failures() {
+            error!("检测到永久失败的任务，准备终止下载");
+            return LoopControl::Break;
+        }
+        
+        LoopControl::Continue
+    }
+    
+    /// 检查最终状态并返回结果
+    /// 
+    /// 如果有永久失败的任务，返回错误；否则返回成功
+    fn check_final_status(&self) -> Result<Vec<FailedRange>> {
         if self.task_allocator.has_permanent_failures() {
             let failures = self.task_allocator.get_permanent_failures();
             let error_details: Vec<String> = failures
@@ -509,11 +520,60 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         Ok(Vec::new())
     }
     
-    /// 发送进度更新
+    /// 调度重试任务
     /// 
-    /// 定期发送进度更新（分块大小由各 worker 独立调整）
-    async fn send_progress(&mut self) {
-        self.progress_reporter.send_progress_update(&self.pool).await;
+    /// 根据重试次数计算延迟并注册定时器
+    fn schedule_retry_task(
+        &mut self,
+        range: AllocatedRange,
+        retry_count: usize,
+    ) {
+        let max_retry = self.config.max_retry_count();
+        
+        if retry_count < max_retry {
+            // 还可以重试，计算延迟时间
+            let retry_delays = self.config.retry_delays();
+            let delay = if retry_count < retry_delays.len() {
+                retry_delays[retry_count]
+            } else {
+                // 如果重试次数超过序列长度，使用最后一个值
+                *retry_delays.last().unwrap_or(&std::time::Duration::from_secs(3))
+            };
+            
+            info!(
+                "任务 range {}..{} 将在 {:.1}s 后进行第 {} 次重试",
+                range.start(),
+                range.end(),
+                delay.as_secs_f64(),
+                retry_count + 1
+            );
+            
+            // 记录失败任务以便稍后重试
+            if let Err(e) = self.task_allocator.record_failed_task(
+                range,
+                retry_count + 1,  // 下次重试的次数
+                delay,
+                &self.timer_service,
+            ) {
+                error!("注册重试定时器失败: {:?}", e);
+                // 失败则标记为永久失败
+                self.task_allocator.record_permanent_failure(
+                    range,
+                    format!("注册定时器失败: {}", e)
+                );
+                self.progress_reporter.record_range_complete();
+            }
+        } else {
+            // 已达到最大重试次数，记录为永久失败
+            error!(
+                "任务 range {}..{} 已达到最大重试次数 {}，标记为永久失败",
+                range.start(),
+                range.end(),
+                max_retry
+            );
+            self.task_allocator.record_permanent_failure(range, "达到最大重试次数".to_string());
+            self.progress_reporter.record_range_complete();
+        }
     }
     
     /// 关闭并清理资源
