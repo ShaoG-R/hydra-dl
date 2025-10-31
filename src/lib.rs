@@ -125,7 +125,7 @@ pub(crate) mod pool {
     pub(crate) mod download;
     pub(crate) mod worker_mask;
 }
-pub mod tools {
+pub mod utils {
     pub(crate) mod chunk_strategy;
     pub(crate) mod fetch;
     pub(crate) mod stats;
@@ -161,7 +161,7 @@ pub mod constants {
 pub use config::{DownloadConfig, DownloadConfigBuilder};
 pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
 pub use task::FileTask;
-pub use tools::fetch::{fetch_file_metadata, FileMetadata};
+pub use utils::fetch::{fetch_file_metadata, FileMetadata};
 
 use std::path::Path;
 
@@ -170,11 +170,11 @@ use std::path::Path;
 pub enum DownloadError {
     /// Fetch 错误
     #[error(transparent)]
-    Fetch(#[from] tools::fetch::FetchError),
+    Fetch(#[from] utils::fetch::FetchError),
     
     /// Range Writer 错误
     #[error(transparent)]
-    RangeWriter(#[from] tools::range_writer::RangeWriterError),
+    RangeWriter(#[from] utils::range_writer::RangeWriterError),
     
     /// HTTP 客户端构建错误
     #[error("创建 HTTP 客户端失败: {0}")]
@@ -253,8 +253,8 @@ pub type Result<T> = std::result::Result<T, DownloadError>;
 /// ```
 pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std::path::PathBuf> {
     use reqwest::Client;
-    use tools::fetch;
-    use tools::io_traits::TokioFileSystem;
+    use utils::fetch;
+    use utils::io_traits::TokioFileSystem;
 
     // 创建带超时设置的 HTTP 客户端（使用默认超时配置）
     let default_config = DownloadConfig::default();

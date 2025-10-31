@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use crate::tools::range_writer::AllocatedRange;
+use crate::utils::range_writer::AllocatedRange;
 
 /// 完整文件下载任务
 #[derive(Debug, Clone)]

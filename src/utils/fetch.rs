@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient, HttpResponse, IoError};
-use crate::tools::range_writer::AllocatedRange;
+use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient, HttpResponse, IoError};
+use crate::utils::range_writer::AllocatedRange;
 use crate::task::FileTask;
-use crate::tools::stats::DownloadStats;
+use crate::utils::stats::DownloadStats;
 
 /// Fetch 操作错误类型
 #[derive(Error, Debug)]
@@ -523,8 +523,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::io_traits::mock::{MockHttpClient, MockFileSystem, MockHttpResponse};
-    use crate::tools::range_writer::RangeAllocator;
+    use crate::utils::io_traits::mock::{MockHttpClient, MockFileSystem, MockHttpResponse};
+    use crate::utils::range_writer::RangeAllocator;
     use reqwest::header::HeaderMap;
     use reqwest::StatusCode;
     use std::path::PathBuf;

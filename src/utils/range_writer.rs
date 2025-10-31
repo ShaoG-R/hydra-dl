@@ -24,8 +24,8 @@
 //! # 使用示例
 //! 
 //! ```no_run
-//! # use rs_dn::tools::range_writer::RangeWriter;
-//! # use rs_dn::tools::io_traits::TokioFileSystem;
+//! # use rs_dn::utils::range_writer::RangeWriter;
+//! # use rs_dn::utils::io_traits::TokioFileSystem;
 //! # use bytes::Bytes;
 //! # use std::path::PathBuf;
 //! # #[tokio::main]
@@ -64,7 +64,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::tools::io_traits::{AsyncFile, FileSystem, IoError};
+use crate::utils::io_traits::{AsyncFile, FileSystem, IoError};
 
 /// Range Writer 错误类型
 #[derive(Error, Debug)]
@@ -151,7 +151,7 @@ impl From<AllocatedRange> for Range<u64> {
 /// # Example
 /// 
 /// ```
-/// # use rs_dn::tools::range_writer::RangeAllocator;
+/// # use rs_dn::utils::range_writer::RangeAllocator;
 /// let mut allocator = RangeAllocator::new(1000);
 ///
 /// // 分配 100 字节
@@ -239,8 +239,8 @@ impl RangeAllocator {
 /// # Example
 /// 
 /// ```no_run
-/// # use rs_dn::tools::range_writer::RangeWriter;
-/// # use rs_dn::tools::io_traits::TokioFileSystem;
+/// # use rs_dn::utils::range_writer::RangeWriter;
+/// # use rs_dn::utils::io_traits::TokioFileSystem;
 /// # use std::path::PathBuf;
 /// # use bytes::Bytes;
 /// # #[tokio::main]
@@ -412,7 +412,7 @@ impl<F: AsyncFile> RangeWriter<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::io_traits::TokioFileSystem;
+    use crate::utils::io_traits::TokioFileSystem;
     use tempfile::tempdir;
     use tokio::fs;
     use tokio::io::AsyncReadExt;

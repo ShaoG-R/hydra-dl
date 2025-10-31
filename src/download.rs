@@ -6,8 +6,8 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use crate::pool::download::DownloadWorkerPool;
-use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient};
-use crate::tools::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
+use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient};
+use crate::utils::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
 use crate::task::{RangeResult, WorkerTask};
 
 /// Worker 统计信息
@@ -685,7 +685,7 @@ where
     info!("准备 Range 下载: {} ({} 个 workers, 动态分块)", url, worker_count);
 
     // 获取文件元数据
-    let metadata = crate::tools::fetch::fetch_file_metadata(&client, url).await?;
+    let metadata = crate::utils::fetch::fetch_file_metadata(&client, url).await?;
 
     if !metadata.range_supported {
         warn!("服务器不支持 Range 请求，回退到普通下载");
@@ -693,7 +693,7 @@ where
             url: url.to_string(),
             save_path: save_path.clone(),
         };
-        return Ok(crate::tools::fetch::fetch_file(&client, task, &fs).await?);
+        return Ok(crate::utils::fetch::fetch_file(&client, task, &fs).await?);
     }
 
     let content_length = metadata.content_length.ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
@@ -819,7 +819,7 @@ pub async fn download_ranged(
     save_dir: impl AsRef<std::path::Path>,
     config: crate::config::DownloadConfig,
 ) -> Result<(DownloadHandle, std::path::PathBuf)> {
-    use crate::tools::io_traits::TokioFileSystem;
+    use crate::utils::io_traits::TokioFileSystem;
     use reqwest::Client;
     
     // 创建带超时设置的 HTTP 客户端
@@ -832,7 +832,7 @@ pub async fn download_ranged(
     
     // 获取文件元数据以确定文件名
     info!("正在获取文件元数据: {}", url);
-    let metadata = crate::tools::fetch::fetch_file_metadata(&client, url).await?;
+    let metadata = crate::utils::fetch::fetch_file_metadata(&client, url).await?;
     
     // 确定文件名
     let filename = metadata.suggested_filename
@@ -875,7 +875,7 @@ pub async fn download_ranged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::io_traits::mock::{MockHttpClient, MockFileSystem};
+    use crate::utils::io_traits::mock::{MockHttpClient, MockFileSystem};
     use reqwest::{header::HeaderMap, StatusCode};
     use bytes::Bytes;
     use std::path::PathBuf;

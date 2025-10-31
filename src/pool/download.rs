@@ -10,11 +10,11 @@
 
 use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
 use crate::task::{RangeResult, WorkerTask as RangeTask};
-use crate::tools::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
-use crate::tools::fetch::fetch_range;
-use crate::tools::io_traits::{AsyncFile, HttpClient};
-use crate::tools::range_writer::RangeWriter;
-use crate::tools::stats::{DownloadStats, DownloadStatsParent};
+use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
+use crate::utils::fetch::fetch_range;
+use crate::utils::io_traits::{AsyncFile, HttpClient};
+use crate::utils::range_writer::RangeWriter;
+use crate::utils::stats::{DownloadStats, DownloadStatsParent};
 use crate::Result;
 use async_trait::async_trait;
 use log::{debug, error, info};
@@ -421,7 +421,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::io_traits::mock::{MockFile, MockFileSystem, MockHttpClient};
+    use crate::utils::io_traits::mock::{MockFile, MockFileSystem, MockHttpClient};
     use bytes::Bytes;
     use reqwest::{header::HeaderMap, StatusCode};
     use std::path::PathBuf;

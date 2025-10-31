@@ -3,8 +3,8 @@
 //! 测试 RangeWriter 在实际场景中的使用
 
 use bytes::Bytes;
-use rs_dn::tools::range_writer::RangeWriter;
-use rs_dn::tools::io_traits::TokioFileSystem;
+use rs_dn::utils::range_writer::RangeWriter;
+use rs_dn::utils::io_traits::TokioFileSystem;
 use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::fs;
