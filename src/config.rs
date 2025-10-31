@@ -55,6 +55,14 @@ pub const DEFAULT_PROGRESSIVE_WORKER_RATIOS: &[f64] = &[0.25, 0.5, 0.75, 1.0];
 /// 当所有已启动的worker速度都达到此阈值时，才启动下一批worker
 pub const DEFAULT_MIN_SPEED_THRESHOLD: u64 = 1 * MB;
 
+/// 默认最大重试次数：3 次
+pub const DEFAULT_MAX_RETRY_COUNT: usize = 3;
+
+/// 默认重试延迟序列：[1s, 2s, 3s]
+///
+/// 当任务失败时，根据重试次数依次使用这些延迟时间
+pub const DEFAULT_RETRY_DELAYS_SECS: &[u64] = &[1, 2, 3];
+
 /// 构建配置错误
 #[derive(thiserror::Error, Debug)]
 pub enum BuildError {
@@ -133,6 +141,16 @@ pub struct DownloadConfig {
     ///
     /// 当所有已启动的worker的瞬时速度都达到此阈值时，才启动下一批worker
     pub(crate) min_speed_threshold: u64,
+    
+    /// 最大重试次数
+    ///
+    /// 每个失败的任务最多重试的次数，达到此次数后任务将被标记为永久失败
+    pub(crate) max_retry_count: usize,
+    
+    /// 重试延迟序列
+    ///
+    /// 根据重试次数依次使用的延迟时间，如果重试次数超过序列长度，使用最后一个值
+    pub(crate) retry_delays: Vec<Duration>,
 }
 
 impl DownloadConfig {
@@ -166,6 +184,8 @@ impl DownloadConfig {
     /// - 连接超时: 10 秒
     /// - 渐进启动比例: [0.25, 0.5, 0.75, 1.0]
     /// - 最小速度阈值: 1 MB/s
+    /// - 最大重试次数: 3
+    /// - 重试延迟: [1s, 2s, 3s]
     pub fn default() -> Self {
         Self {
             worker_count: DEFAULT_WORKER_COUNT,
@@ -181,6 +201,11 @@ impl DownloadConfig {
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             progressive_worker_ratios: DEFAULT_PROGRESSIVE_WORKER_RATIOS.to_vec(),
             min_speed_threshold: DEFAULT_MIN_SPEED_THRESHOLD,
+            max_retry_count: DEFAULT_MAX_RETRY_COUNT,
+            retry_delays: DEFAULT_RETRY_DELAYS_SECS
+                .iter()
+                .map(|&secs| Duration::from_secs(secs))
+                .collect(),
         }
     }
     
@@ -248,6 +273,16 @@ impl DownloadConfig {
     pub fn min_speed_threshold(&self) -> u64 {
         self.min_speed_threshold
     }
+    
+    /// 获取最大重试次数
+    pub fn max_retry_count(&self) -> usize {
+        self.max_retry_count
+    }
+    
+    /// 获取重试延迟序列
+    pub fn retry_delays(&self) -> &[Duration] {
+        &self.retry_delays
+    }
 }
 
 /// 下载配置构建器
@@ -279,6 +314,8 @@ pub struct DownloadConfigBuilder {
     connect_timeout: Duration,
     progressive_worker_ratios: Vec<f64>,
     min_speed_threshold: u64,
+    max_retry_count: usize,
+    retry_delays: Vec<Duration>,
 }
 
 impl DownloadConfigBuilder {
@@ -298,6 +335,11 @@ impl DownloadConfigBuilder {
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             progressive_worker_ratios: DEFAULT_PROGRESSIVE_WORKER_RATIOS.to_vec(),
             min_speed_threshold: DEFAULT_MIN_SPEED_THRESHOLD,
+            max_retry_count: DEFAULT_MAX_RETRY_COUNT,
+            retry_delays: DEFAULT_RETRY_DELAYS_SECS
+                .iter()
+                .map(|&secs| Duration::from_secs(secs))
+                .collect(),
         }
     }
     
@@ -487,6 +529,62 @@ impl DownloadConfigBuilder {
         self
     }
     
+    /// 设置最大重试次数
+    ///
+    /// 每个失败的任务最多重试的次数，达到此次数后任务将被标记为永久失败
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - 最大重试次数
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use rs_dn::DownloadConfig;
+    /// let config = DownloadConfig::builder()
+    ///     .max_retry_count(5)
+    ///     .build();
+    /// ```
+    pub fn max_retry_count(mut self, count: usize) -> Self {
+        self.max_retry_count = count;
+        self
+    }
+    
+    /// 设置重试延迟序列
+    ///
+    /// 根据重试次数依次使用的延迟时间。如果重试次数超过序列长度，使用最后一个值。
+    /// 如果序列为空，将使用默认序列。
+    ///
+    /// # Arguments
+    ///
+    /// * `delays` - 延迟时间序列
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use rs_dn::DownloadConfig;
+    /// # use std::time::Duration;
+    /// let config = DownloadConfig::builder()
+    ///     .retry_delays(vec![
+    ///         Duration::from_secs(1),
+    ///         Duration::from_secs(2),
+    ///         Duration::from_secs(5),
+    ///     ])
+    ///     .build();
+    /// ```
+    pub fn retry_delays(mut self, delays: Vec<Duration>) -> Self {
+        if delays.is_empty() {
+            // 使用默认延迟序列
+            self.retry_delays = DEFAULT_RETRY_DELAYS_SECS
+                .iter()
+                .map(|&secs| Duration::from_secs(secs))
+                .collect();
+        } else {
+            self.retry_delays = delays;
+        }
+        self
+    }
+    
     /// 构建配置对象
     pub fn build(self) -> Result<DownloadConfig, BuildError> {
         // 验证 worker_count 不超过最大限制
@@ -513,6 +611,8 @@ impl DownloadConfigBuilder {
             connect_timeout: self.connect_timeout,
             progressive_worker_ratios: self.progressive_worker_ratios,
             min_speed_threshold: self.min_speed_threshold,
+            max_retry_count: self.max_retry_count,
+            retry_delays: self.retry_delays,
         })
     }
 }

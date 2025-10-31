@@ -16,7 +16,12 @@ pub(crate) enum WorkerTask {
     /// Range 下载任务
     /// 
     /// 包含 URL 和已分配的 Range，确保不会重叠且有效
-    Range { url: String, range: AllocatedRange },
+    Range { 
+        url: String, 
+        range: AllocatedRange,
+        /// 当前任务的重试次数（首次为 0）
+        retry_count: usize,
+    },
 }
 
 /// Range 下载结果
@@ -41,5 +46,7 @@ pub(crate) enum RangeResult {
         range: AllocatedRange,
         /// 错误信息
         error: String,
+        /// 当前的重试次数
+        retry_count: usize,
     },
 }

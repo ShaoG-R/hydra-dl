@@ -33,15 +33,19 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use rs_dn::{DownloadConfig, DownloadProgress};
+//! use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), rs_dn::DownloadError> {
 //!     // 使用默认配置：4个worker，动态分块（2-50 MB）
 //!     let config = DownloadConfig::default();
+//!     let timer = TimerWheel::with_defaults();
+//!     let timer_service = timer.create_service(ServiceConfig::default());
 //!     let (mut handle, save_path) = rs_dn::download_ranged(
 //!         "https://example.com/large_file.zip",
 //!         PathBuf::from("."),  // 保存到当前目录
-//!         config
+//!         config,
+//!         timer_service
 //!     ).await?;
 //!
 //!     println!("文件将保存到: {:?}", save_path);
@@ -83,6 +87,7 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use rs_dn::{DownloadConfig, DownloadProgress};
+//! use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), rs_dn::DownloadError> {
@@ -94,10 +99,13 @@
 //!         .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB（高速时）
 //!         .build().unwrap();
 //!     
+//!     let timer = TimerWheel::with_defaults();
+//!     let timer_service = timer.create_service(ServiceConfig::default());
 //!     let (handle, save_path) = rs_dn::download_ranged(
 //!         "https://example.com/large_file.zip",
 //!         PathBuf::from("."),
-//!         config
+//!         config,
+//!         timer_service
 //!     ).await?;
 //!
 //!     println!("文件将保存到: {:?}", save_path);
@@ -162,6 +170,9 @@ pub use config::{DownloadConfig, DownloadConfigBuilder};
 pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
 pub use task::FileTask;
 pub use utils::fetch::{fetch_file_metadata, FileMetadata};
+pub mod timer {
+    pub use kestrel_protocol_timer::{TimerWheel, TimerService, ServiceConfig};
+}
 
 use std::path::Path;
 

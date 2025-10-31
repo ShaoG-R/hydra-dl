@@ -4,6 +4,7 @@ use crate::{download_ranged, DownloadConfig};
 use super::{Cli, Result};
 use super::progress::ProgressManager;
 use super::utils::format_bytes;
+use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
 
 /// 执行下载任务
 ///
@@ -16,6 +17,9 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
         .min_chunk_size(cli.min_chunk * 1024 * 1024)
         .max_chunk_size(cli.max_chunk * 1024 * 1024)
         .build()?;
+
+    let timer = TimerWheel::with_defaults();
+    let timer_service = timer.create_service(ServiceConfig::default());
 
     info!(
         "开始下载: {}",
@@ -30,7 +34,7 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     );
 
     // 启动下载任务（会自动检测文件名）
-    let (mut handle, save_path) = download_ranged(&cli.url, save_dir, config).await?;
+    let (mut handle, save_path) = download_ranged(&cli.url, save_dir, config, timer_service).await?;
 
     info!("保存路径: {:?}", save_path);
 

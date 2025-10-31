@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-
+use kestrel_protocol_timer::{TimerService, TaskId};
 use crate::pool::download::DownloadWorkerPool;
 use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::utils::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
@@ -105,11 +105,14 @@ impl DownloadHandle {
     /// 
     /// ```no_run
     /// # use rs_dn::{download_ranged, DownloadProgress, DownloadConfig};
+    /// # use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
     /// # use std::path::PathBuf;
     /// # #[tokio::main]
     /// # async fn main() {
     /// let config = DownloadConfig::default();
-    /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config).await.unwrap();
+    /// let timer = TimerWheel::with_defaults();
+    /// let timer_service = timer.create_service(ServiceConfig::default());
+    /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config, timer_service).await.unwrap();
     /// 
     /// while let Some(progress) = handle.progress_receiver().recv().await {
     ///     match progress {
@@ -173,9 +176,20 @@ impl DownloadHandle {
 /// 失败的 Range 信息
 type FailedRange = (AllocatedRange, String);
 
+/// 失败任务信息
+/// 
+/// 用于跟踪待重试的失败任务
+#[derive(Debug)]
+struct FailedTaskInfo {
+    /// 失败的 range
+    range: AllocatedRange,
+    /// 当前重试次数
+    retry_count: usize,
+}
+
 /// 任务分配器
 /// 
-/// 负责管理任务分配和空闲 worker 队列
+/// 负责管理任务分配、空闲 worker 队列和失败任务重试
 struct TaskAllocator {
     /// Range 分配器
     allocator: RangeAllocator,
@@ -183,6 +197,10 @@ struct TaskAllocator {
     url: String,
     /// 空闲 worker ID 队列
     idle_workers: VecDeque<usize>,
+    /// 待重试的失败任务映射（定时器 TaskId -> 失败任务信息）
+    failed_tasks: std::collections::HashMap<TaskId, FailedTaskInfo>,
+    /// 永久失败的任务（达到最大重试次数）
+    permanently_failed: Vec<(AllocatedRange, String)>,
 }
 
 impl TaskAllocator {
@@ -195,6 +213,8 @@ impl TaskAllocator {
             allocator,
             url,
             idle_workers: VecDeque::new(),
+            failed_tasks: std::collections::HashMap::new(),
+            permanently_failed: Vec::new(),
         }
     }
     
@@ -224,10 +244,11 @@ impl TaskAllocator {
         // 分配 range
         let range = self.allocator.allocate(alloc_size)?;
         
-        // 创建任务
+        // 创建任务（首次分配，重试次数为 0）
         let task = WorkerTask::Range {
             url: self.url.clone(),
             range,
+            retry_count: 0,
         };
         
         Some((task, worker_id))
@@ -245,6 +266,94 @@ impl TaskAllocator {
     /// * `worker_id` - 要标记为空闲的 worker ID
     fn mark_worker_idle(&mut self, worker_id: usize) {
         self.idle_workers.push_back(worker_id);
+    }
+    
+    /// 根据定时器 TaskId 取出失败任务信息
+    /// 
+    /// # Arguments
+    /// 
+    /// * `timer_id` - 定时器任务 ID
+    /// 
+    /// # Returns
+    /// 
+    /// 返回对应的失败任务信息，如果不存在则返回 None
+    fn pop_failed_task(&mut self, timer_id: TaskId) -> Option<FailedTaskInfo> {
+        self.failed_tasks.remove(&timer_id)
+    }
+    
+    /// 记录失败任务
+    /// 
+    /// # Arguments
+    /// 
+    /// * `range` - 失败的 range
+    /// * `retry_count` - 当前重试次数
+    /// * `delay` - 延迟重试的时间
+    /// * `timer_service` - 定时器服务
+    /// 
+    /// # Returns
+    /// 
+    /// 成功返回 Ok(())，失败返回错误
+    fn record_failed_task(
+        &mut self,
+        range: AllocatedRange,
+        retry_count: usize,
+        delay: std::time::Duration,
+        timer_service: &TimerService,
+    ) -> Result<()> {
+        debug!(
+            "记录失败任务 range {}..{}, 重试次数 {}, 将在 {:.1}s 后重试",
+            range.start(),
+            range.end(),
+            retry_count,
+            delay.as_secs_f64()
+        );
+        
+        // 创建定时器任务（无回调，仅通知）
+        let timer_task = TimerService::create_task(delay, None);
+        let timer_id = timer_task.get_id();
+        
+        // 注册到 TimerService
+        timer_service.register(timer_task)
+            .map_err(|e| DownloadError::Other(format!("注册定时器失败: {:?}", e)))?;
+        
+        // 存储映射关系
+        self.failed_tasks.insert(timer_id, FailedTaskInfo {
+            range,
+            retry_count,
+        });
+        
+        Ok(())
+    }
+    
+    /// 记录永久失败的任务
+    /// 
+    /// # Arguments
+    /// 
+    /// * `range` - 失败的 range
+    /// * `error` - 错误信息
+    fn record_permanent_failure(&mut self, range: AllocatedRange, error: String) {
+        error!(
+            "任务永久失败 range {}..{}: {}",
+            range.start(),
+            range.end(),
+            error
+        );
+        self.permanently_failed.push((range, error));
+    }
+    
+    /// 检查是否有永久失败的任务
+    fn has_permanent_failures(&self) -> bool {
+        !self.permanently_failed.is_empty()
+    }
+    
+    /// 获取永久失败任务的详细信息
+    fn get_permanent_failures(&self) -> &[(AllocatedRange, String)] {
+        &self.permanently_failed
+    }
+    
+    /// 获取待重试的任务数量
+    fn pending_retry_count(&self) -> usize {
+        self.failed_tasks.len()
     }
 }
 
@@ -375,6 +484,8 @@ struct DownloadTask<C: HttpClient, F: AsyncFile> {
     worker_launch_stages: Vec<usize>,
     /// 下一个启动阶段的索引（0 表示已完成第一批，1 表示准备启动第二批）
     next_launch_stage: usize,
+    /// 定时器服务（用于管理失败任务的重试定时器）
+    timer_service: TimerService,
 }
 
 impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTask<C, F> {
@@ -386,6 +497,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         allocator: RangeAllocator,
         url: String,
         total_size: u64,
+        timer_service: TimerService,
         config: Arc<crate::config::DownloadConfig>,
     ) -> Result<Self> {
         let total_worker_count = config.worker_count();
@@ -434,15 +546,21 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             config,
             worker_launch_stages,
             next_launch_stage: 1, // 第一批已启动，下一个是第二批（索引1）
+            timer_service,
         })
     }
     
     
     /// 等待所有 range 完成
     /// 
-    /// 动态分配任务，收集完成和失败的 range，定期发送进度更新和调整分块大小
+    /// 动态分配任务，支持失败重试，定期发送进度更新和调整分块大小
+    /// 如果有任务达到最大重试次数，将终止下载并返回错误
     async fn wait_for_completion(&mut self) -> Result<Vec<FailedRange>> {
-        let mut failed_ranges = Vec::new();
+        let _failed_ranges: Vec<FailedRange> = Vec::new(); // 保留以兼容现有代码，但不再使用
+        
+        // 获取定时器超时接收器
+        let mut timeout_rx = self.timer_service.take_receiver()
+            .ok_or_else(|| DownloadError::Other("无法获取定时器接收器".to_string()))?;
         
         // 创建定时器，用于定期更新进度和调整分块大小
         let mut progress_timer = tokio::time::interval(self.config.instant_speed_window());
@@ -553,6 +671,51 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                     }
                 }
                 
+                // 监听定时器超时事件
+                Some(timer_id) = timeout_rx.recv() => {
+                    // 根据 timer_id 获取失败任务信息
+                    if let Some(info) = self.task_allocator.pop_failed_task(timer_id) {
+                        // 从空闲队列获取 worker
+                        if let Some(worker_id) = self.task_allocator.idle_workers.pop_front() {
+                            info!(
+                                "定时器触发，重试任务 range {}..{}, 重试次数 {}",
+                                info.range.start(),
+                                info.range.end(),
+                                info.retry_count
+                            );
+                            
+                            // 重新分配任务
+                            let task = WorkerTask::Range {
+                                url: self.task_allocator.url.clone(),
+                                range: info.range,
+                                retry_count: info.retry_count,
+                            };
+                            
+                            if let Err(e) = self.pool.send_task(task, worker_id).await {
+                                error!("分配重试任务失败: {:?}", e);
+                                self.task_allocator.mark_worker_idle(worker_id);
+                            }
+                        } else {
+                            // 没有空闲 worker，需要重新注册定时器
+                            warn!("定时器触发但没有空闲 worker，延迟 100ms 后重试");
+                            // 重新注册一个短延迟定时器
+                            if let Err(e) = self.task_allocator.record_failed_task(
+                                info.range,
+                                info.retry_count,
+                                std::time::Duration::from_millis(100),
+                                &self.timer_service,
+                            ) {
+                                error!("重新注册定时器失败: {:?}", e);
+                                // 标记为永久失败
+                                self.task_allocator.record_permanent_failure(
+                                    info.range,
+                                    format!("重新注册定时器失败: {}", e)
+                                );
+                            }
+                        }
+                    }
+                }
+                
                 // 接收 worker 结果并分配新任务
                 result = self.pool.result_receiver().recv() => {
                     match result {
@@ -581,21 +744,68 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                                 debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
                             }
                         }
-                        Some(RangeResult::Failed { worker_id, range, error }) => {
-                            error!(
-                                "Worker #{} Range {}..{} 失败: {}",
+                        Some(RangeResult::Failed { worker_id, range, error, retry_count }) => {
+                            warn!(
+                                "Worker #{} Range {}..{} 失败 (重试 {}): {}",
                                 worker_id,
                                 range.start(),
                                 range.end(),
+                                retry_count,
                                 error
                             );
-                            failed_ranges.push((range, error));
-                            self.progress_reporter.record_range_complete();
                             
                             // 将失败的 worker 标记为空闲
                             self.task_allocator.mark_worker_idle(worker_id);
                             
-                            // 失败后也需要分配新任务（使用该 worker 的分块大小）
+                            // 判断是否应该重试
+                            let max_retry = self.config.max_retry_count();
+                            
+                            if retry_count < max_retry {
+                                // 还可以重试，计算延迟时间
+                                let retry_delays = self.config.retry_delays();
+                                let delay = if retry_count < retry_delays.len() {
+                                    retry_delays[retry_count]
+                                } else {
+                                    // 如果重试次数超过序列长度，使用最后一个值
+                                    *retry_delays.last().unwrap_or(&std::time::Duration::from_secs(3))
+                                };
+                                
+                                info!(
+                                    "任务 range {}..{} 将在 {:.1}s 后进行第 {} 次重试",
+                                    range.start(),
+                                    range.end(),
+                                    delay.as_secs_f64(),
+                                    retry_count + 1
+                                );
+                                
+                                // 记录失败任务以便稍后重试
+                                if let Err(e) = self.task_allocator.record_failed_task(
+                                    range,
+                                    retry_count + 1,  // 下次重试的次数
+                                    delay,
+                                    &self.timer_service,
+                                ) {
+                                    error!("注册重试定时器失败: {:?}", e);
+                                    // 失败则标记为永久失败
+                                    self.task_allocator.record_permanent_failure(
+                                        range,
+                                        format!("注册定时器失败: {}", e)
+                                    );
+                                    self.progress_reporter.record_range_complete();
+                                }
+                            } else {
+                                // 已达到最大重试次数，记录为永久失败
+                                error!(
+                                    "任务 range {}..{} 已达到最大重试次数 {}，标记为永久失败",
+                                    range.start(),
+                                    range.end(),
+                                    max_retry
+                                );
+                                self.task_allocator.record_permanent_failure(range, error);
+                                self.progress_reporter.record_range_complete();
+                            }
+                            
+                            // 尝试为空闲 worker 分配新任务
                             let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
                                 .unwrap_or(self.config.initial_chunk_size());
                             
@@ -606,11 +816,8 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                                 );
                                 if let Err(e) = self.pool.send_task(task, target_worker).await {
                                     error!("分配新任务失败: {:?}", e);
-                                    // 失败了，将 worker 放回队列
                                     self.task_allocator.mark_worker_idle(target_worker);
                                 }
-                            } else {
-                                debug!("Worker #{} 任务失败，但没有更多任务可分配", worker_id);
                             }
                         }
                         None => {
@@ -622,14 +829,45 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                 }
             }
             
-            // 检查是否所有任务完成
-            if self.task_allocator.remaining() == 0 && self.writer.is_complete() {
-                info!("所有任务已完成，总共完成 {} 个 range", self.progress_reporter.total_ranges_completed());
+            // 检查是否所有任务完成（包括新任务和重试任务）
+            if self.task_allocator.remaining() == 0 
+                && self.task_allocator.pending_retry_count() == 0 
+                && self.writer.is_complete() {
+                info!(
+                    "所有任务已完成，总共完成 {} 个 range",
+                    self.progress_reporter.total_ranges_completed()
+                );
+                break;
+            }
+            
+            // 检查是否有永久失败的任务
+            if self.task_allocator.has_permanent_failures() {
+                error!("检测到永久失败的任务，准备终止下载");
                 break;
             }
         }
         
-        Ok(failed_ranges)
+        // 检查是否有永久失败的任务
+        if self.task_allocator.has_permanent_failures() {
+            let failures = self.task_allocator.get_permanent_failures();
+            let error_details: Vec<String> = failures
+                .iter()
+                .map(|(range, error)| {
+                    format!("range {}..{}: {}", range.start(), range.end(), error)
+                })
+                .collect();
+            
+            let error_msg = format!(
+                "有 {} 个任务达到最大重试次数后失败:\n  {}",
+                failures.len(),
+                error_details.join("\n  ")
+            );
+            
+            return Err(DownloadError::Other(error_msg));
+        }
+        
+        // 返回空的失败列表（所有失败都已重试或已处理）
+        Ok(Vec::new())
     }
     
     /// 发送进度更新
@@ -703,6 +941,7 @@ async fn download_ranged_generic<C, FS>(
     save_path: PathBuf,
     config: &crate::config::DownloadConfig,
     progress_sender: Option<Sender<DownloadProgress>>,
+    timer_service: TimerService,
 ) -> Result<()>
 where
     C: HttpClient + Clone + Send + 'static,
@@ -749,6 +988,7 @@ where
         allocator,
         url.to_string(),
         content_length,
+        timer_service,
         Arc::clone(&config),
     )?;
     
@@ -807,15 +1047,19 @@ where
 /// 
 /// ```no_run
 /// # use rs_dn::{download_ranged, DownloadConfig, DownloadProgress};
+/// # use rs_dn::timer::{TimerWheel, TimerService, ServiceConfig};
 /// # use std::path::PathBuf;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), rs_dn::DownloadError> {
 /// // 使用默认配置（推荐）
 /// let config = DownloadConfig::default();
+/// let timer = TimerWheel::with_defaults();
+/// let service = timer.create_service(ServiceConfig::default());
 /// let (mut handle, save_path) = download_ranged(
 ///     "http://example.com/file.bin",
 ///     PathBuf::from("."),  // 保存到当前目录
-///     config
+///     config,
+///     service,
 /// ).await?;
 /// 
 /// println!("文件将保存到: {:?}", save_path);
@@ -847,6 +1091,7 @@ pub async fn download_ranged(
     url: &str,
     save_dir: impl AsRef<std::path::Path>,
     config: crate::config::DownloadConfig,
+    timer_service: TimerService,
 ) -> Result<(DownloadHandle, std::path::PathBuf)> {
     use crate::utils::io_traits::TokioFileSystem;
     use reqwest::Client;
@@ -888,7 +1133,8 @@ pub async fn download_ranged(
             &url, 
             save_path_clone, 
             &config,
-            Some(progress_tx)
+            Some(progress_tx),
+            timer_service,
         ).await
     });
     
@@ -908,12 +1154,17 @@ mod tests {
     use reqwest::{header::HeaderMap, StatusCode};
     use bytes::Bytes;
     use std::path::PathBuf;
+    use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
+
+    fn create_timer_service() -> (TimerWheel, TimerService) {
+        let timer = TimerWheel::with_defaults();
+        let service = timer.create_service(ServiceConfig::default());
+        (timer, service)
+    }
 
     #[tokio::test]
     async fn test_download_ranged_basic() {
-
-        use env_logger::Env;
-        env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
+        let (_timer, timer_service) = create_timer_service();
 
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
@@ -981,6 +1232,7 @@ mod tests {
             save_path.clone(),
             &config,
             None, // 测试中不需要进度更新
+            timer_service,
         )
         .await;
 
@@ -998,6 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_ranged_fallback_to_normal() {
+        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data = b"Test data without range support";
         let save_path = PathBuf::from("/tmp/test_fallback.bin");
@@ -1041,6 +1294,7 @@ mod tests {
             save_path.clone(),
             &config,
             None, // 测试中不需要进度更新
+            timer_service,
         )
         .await;
 
@@ -1055,6 +1309,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_ranged_multiple_workers() {
+        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data: Vec<u8> = (0..100).collect(); // 100 bytes
         let save_path = PathBuf::from("/tmp/test_multi_workers.bin");
@@ -1120,6 +1375,7 @@ mod tests {
             save_path.clone(),
             &config,
             None, // 测试中不需要进度更新
+            timer_service,
         )
         .await;
 
@@ -1129,6 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_chunking_small_file() {
         // 测试小文件（< 2MB）自动调整为 1 个分块
+        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/small_file.bin";
         let test_data: Vec<u8> = vec![0; 1024 * 1024]; // 1 MB 文件
         let save_path = PathBuf::from("/tmp/test_small_file.bin");
@@ -1179,6 +1436,7 @@ mod tests {
             save_path.clone(),
             &config,
             None,
+            timer_service,
         )
         .await;
 
@@ -1188,6 +1446,7 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_chunking_medium_file() {
         // 测试中等文件正确计算分块数
+        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/medium_file.bin";
         let file_size = 10 * 1024 * 1024; // 10 MB 文件
         let test_data: Vec<u8> = vec![0; file_size];
@@ -1252,6 +1511,7 @@ mod tests {
             save_path.clone(),
             &config,
             None,
+            timer_service,
         )
         .await;
 
@@ -1261,6 +1521,7 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_chunking_large_file() {
         // 测试大文件不受最小分块限制影响
+        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/large_file.bin";
         let file_size = 100 * 1024 * 1024; // 100 MB 文件
         let save_path = PathBuf::from("/tmp/test_large_file.bin");
@@ -1324,6 +1585,7 @@ mod tests {
             save_path.clone(),
             &config,
             None,
+            timer_service,
         )
         .await;
 
@@ -1333,6 +1595,7 @@ mod tests {
     #[tokio::test]
     async fn test_progressive_worker_launch() {
         // 测试渐进式启动配置
+        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data: Vec<u8> = (0..100).collect(); // 100 bytes
         let save_path = PathBuf::from("/tmp/test_progressive.bin");
@@ -1399,6 +1662,7 @@ mod tests {
             save_path.clone(),
             &config,
             None,
+            timer_service,
         )
         .await;
 
@@ -1418,6 +1682,275 @@ mod tests {
         assert_eq!(config.worker_count(), 12);
         assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
         assert_eq!(config.min_speed_threshold(), 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_retry_config() {
+        // 测试重试配置的正确性
+        let config = crate::config::DownloadConfig::builder()
+            .max_retry_count(5)
+            .retry_delays(vec![
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            ])
+            .build()
+            .unwrap();
+
+        assert_eq!(config.max_retry_count(), 5);
+        assert_eq!(config.retry_delays().len(), 3);
+        assert_eq!(config.retry_delays()[0], std::time::Duration::from_secs(1));
+        assert_eq!(config.retry_delays()[1], std::time::Duration::from_secs(2));
+        assert_eq!(config.retry_delays()[2], std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_retry_config_default() {
+        // 测试默认重试配置
+        let config = crate::config::DownloadConfig::default();
+        
+        assert_eq!(config.max_retry_count(), 3);
+        assert_eq!(config.retry_delays().len(), 3);
+        assert_eq!(config.retry_delays()[0], std::time::Duration::from_secs(1));
+        assert_eq!(config.retry_delays()[1], std::time::Duration::from_secs(2));
+        assert_eq!(config.retry_delays()[2], std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_retry_delays_empty_uses_default() {
+        // 测试空延迟序列使用默认值
+        let config = crate::config::DownloadConfig::builder()
+            .retry_delays(vec![])
+            .build()
+            .unwrap();
+
+        assert_eq!(config.retry_delays().len(), 3);
+        assert_eq!(config.retry_delays()[0], std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_success() {
+        // 测试失败任务重试成功
+        let (_timer, timer_service) = create_timer_service();
+        let test_url = "http://example.com/file.bin";
+        let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
+        let save_path = PathBuf::from("/tmp/test_retry_success.bin");
+
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+
+        // 设置 HEAD 请求响应
+        let mut head_headers = HeaderMap::new();
+        head_headers.insert("accept-ranges", "bytes".parse().unwrap());
+        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
+        client.set_head_response(
+            test_url,
+            StatusCode::OK,
+            head_headers,
+        );
+
+        // 设置 Range 请求响应
+        let chunk_size = 12;
+        let range_count = (test_data.len() + chunk_size - 1) / chunk_size;
+
+        for i in 0..range_count {
+            let start = i * chunk_size;
+            let end = if i == range_count - 1 {
+                test_data.len()
+            } else {
+                (i + 1) * chunk_size
+            };
+
+            let chunk = &test_data[start..end];
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "content-range",
+                format!("bytes {}-{}/{}", start, end - 1, test_data.len())
+                    .parse()
+                    .unwrap(),
+            );
+
+            // 第一个 range 第一次失败，第二次成功（模拟重试）
+            if i == 0 {
+                // 第一次请求失败
+                client.set_range_response(
+                    test_url,
+                    start as u64,
+                    (end - 1) as u64,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    HeaderMap::new(),
+                    Bytes::new(),
+                );
+                // 第二次请求成功（重试）
+                client.set_range_response(
+                    test_url,
+                    start as u64,
+                    (end - 1) as u64,
+                    StatusCode::PARTIAL_CONTENT,
+                    headers,
+                    Bytes::copy_from_slice(chunk),
+                );
+            } else {
+                client.set_range_response(
+                    test_url,
+                    start as u64,
+                    (end - 1) as u64,
+                    StatusCode::PARTIAL_CONTENT,
+                    headers,
+                    Bytes::copy_from_slice(chunk),
+                );
+            }
+        }
+
+        // 配置：1 个 worker，最大重试 3 次，快速重试（100ms）
+        let config = crate::config::DownloadConfig::builder()
+            .worker_count(1)
+            .initial_chunk_size(chunk_size as u64)
+            .min_chunk_size(1)
+            .max_chunk_size(chunk_size as u64)
+            .max_retry_count(3)
+            .retry_delays(vec![
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+                std::time::Duration::from_millis(300),
+            ])
+            .build()
+            .unwrap();
+
+        let result = download_ranged_generic(
+            client.clone(),
+            fs.clone(),
+            test_url,
+            save_path.clone(),
+            &config,
+            None,
+            timer_service,
+        )
+        .await;
+
+        assert!(result.is_ok(), "下载应该成功（经过重试）: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_permanent_failure() {
+        // 测试达到最大重试次数后失败
+        let (_timer, timer_service) = create_timer_service();
+        let test_url = "http://example.com/file.bin";
+        let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
+        let save_path = PathBuf::from("/tmp/test_retry_failure.bin");
+
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+
+        // 设置 HEAD 请求响应
+        let mut head_headers = HeaderMap::new();
+        head_headers.insert("accept-ranges", "bytes".parse().unwrap());
+        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
+        client.set_head_response(
+            test_url,
+            StatusCode::OK,
+            head_headers,
+        );
+
+        // 设置 Range 请求响应：第一个 range 始终失败
+        let chunk_size = 12;
+        let range_count = (test_data.len() + chunk_size - 1) / chunk_size;
+
+        for i in 0..range_count {
+            let start = i * chunk_size;
+            let end = if i == range_count - 1 {
+                test_data.len()
+            } else {
+                (i + 1) * chunk_size
+            };
+
+            if i == 0 {
+                // 第一个 range 始终失败（模拟多次重试都失败）
+                for _ in 0..5 {
+                    client.set_range_response(
+                        test_url,
+                        start as u64,
+                        (end - 1) as u64,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        HeaderMap::new(),
+                        Bytes::new(),
+                    );
+                }
+            } else {
+                let chunk = &test_data[start..end];
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "content-range",
+                    format!("bytes {}-{}/{}", start, end - 1, test_data.len())
+                        .parse()
+                        .unwrap(),
+                );
+                client.set_range_response(
+                    test_url,
+                    start as u64,
+                    (end - 1) as u64,
+                    StatusCode::PARTIAL_CONTENT,
+                    headers,
+                    Bytes::copy_from_slice(chunk),
+                );
+            }
+        }
+
+        // 配置：1 个 worker，最大重试 2 次，快速重试（50ms）
+        let config = crate::config::DownloadConfig::builder()
+            .worker_count(1)
+            .initial_chunk_size(chunk_size as u64)
+            .min_chunk_size(1)
+            .max_chunk_size(chunk_size as u64)
+            .max_retry_count(2)
+            .retry_delays(vec![
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(50),
+            ])
+            .build()
+            .unwrap();
+
+        let result = download_ranged_generic(
+            client.clone(),
+            fs.clone(),
+            test_url,
+            save_path.clone(),
+            &config,
+            None,
+            timer_service,
+        )
+        .await;
+
+        // 应该失败，因为达到最大重试次数
+        assert!(result.is_err(), "下载应该失败（达到最大重试次数）");
+        
+        let error_msg = format!("{:?}", result.unwrap_err());
+        assert!(error_msg.contains("达到最大重试次数"), "错误消息应该包含重试信息");
+    }
+
+    #[tokio::test]
+    async fn test_retry_delay_sequence() {
+        // 测试重试延迟序列正确使用
+        let config = crate::config::DownloadConfig::builder()
+            .max_retry_count(5)
+            .retry_delays(vec![
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            ])
+            .build()
+            .unwrap();
+
+        let delays = config.retry_delays();
+        
+        // 第 0 次重试使用第一个延迟
+        assert_eq!(delays[0.min(delays.len() - 1)], std::time::Duration::from_secs(1));
+        
+        // 第 1 次重试使用第二个延迟
+        assert_eq!(delays[1.min(delays.len() - 1)], std::time::Duration::from_secs(2));
+        
+        // 第 2 次及以后重试使用最后一个延迟
+        assert_eq!(delays[2.min(delays.len() - 1)], std::time::Duration::from_secs(2));
+        assert_eq!(delays[10.min(delays.len() - 1)], std::time::Duration::from_secs(2));
     }
 }
 

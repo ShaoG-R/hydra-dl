@@ -89,13 +89,14 @@ where
         context: &DownloadWorkerContext,
     ) -> RangeResult {
         match task {
-            RangeTask::Range { url, range } => {
+            RangeTask::Range { url, range, retry_count } => {
                 debug!(
-                    "Worker #{} 执行 Range 任务: {} (range {}..{})",
+                    "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
                     worker_id,
                     url,
                     range.start(),
-                    range.end()
+                    range.end(),
+                    retry_count
                 );
 
                 // 下载数据（在下载过程中会实时更新 stats）
@@ -120,6 +121,7 @@ where
                                     worker_id,
                                     range,
                                     error: error_msg,
+                                    retry_count,
                                 }
                             }
                         }
@@ -138,6 +140,7 @@ where
                             worker_id,
                             range,
                             error: error_msg,
+                            retry_count,
                         }
                     }
                 }
@@ -462,6 +465,7 @@ mod tests {
         let task = RangeTask::Range {
             url: "http://example.com/file.bin".to_string(),
             range,
+            retry_count: 0,
         };
 
         // 发送任务到 worker 0
@@ -564,6 +568,7 @@ mod tests {
         let task = RangeTask::Range {
             url: test_url.to_string(),
             range,
+            retry_count: 0,
         };
 
         let result = executor.execute(0, task, &context).await;
@@ -621,6 +626,7 @@ mod tests {
         let task = RangeTask::Range {
             url: test_url.to_string(),
             range,
+            retry_count: 0,
         };
 
         let result = executor.execute(0, task, &context).await;
