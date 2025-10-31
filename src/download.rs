@@ -5,10 +5,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
+use crate::pool::download::DownloadWorkerPool;
 use crate::tools::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::tools::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
 use crate::task::{RangeResult, WorkerTask};
-use crate::worker::WorkerPool;
 
 /// Worker 统计信息
 #[derive(Debug, Clone)]
@@ -281,7 +281,7 @@ impl ProgressReporter {
     /// 发送进度更新
     async fn send_progress_update<F: AsyncFile>(
         &self,
-        pool: &WorkerPool<F>,
+        pool: &DownloadWorkerPool<F>,
     ) {
         if let Some(ref sender) = self.progress_sender {
             let total_avg_speed = pool.get_total_speed();
@@ -296,22 +296,7 @@ impl ProgressReporter {
             };
             
             // 收集所有 worker 的统计信息（包含各自的分块大小）
-            let worker_stats: Vec<WorkerStatSnapshot> = pool.worker_channels.iter()
-                .enumerate()
-                .map(|(id, channel)| {
-                    let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
-                        channel.stats.get_full_summary();
-                    let current_chunk_size = channel.chunk_strategy.current_chunk_size();
-                    WorkerStatSnapshot {
-                        worker_id: id,
-                        bytes: worker_bytes,
-                        ranges: worker_ranges,
-                        avg_speed,
-                        instant_speed: if instant_valid { Some(instant_speed) } else { None },
-                        current_chunk_size,
-                    }
-                })
-                .collect();
+            let worker_stats = pool.get_worker_snapshots();
             
             // 发送总体进度和所有 worker 统计
             let _ = sender.send(DownloadProgress::Progress {
@@ -326,28 +311,13 @@ impl ProgressReporter {
     }
     
     /// 发送完成统计
-    async fn send_completion_stats<F: AsyncFile>(&self, pool: &WorkerPool<F>) {
+    async fn send_completion_stats<F: AsyncFile>(&self, pool: &DownloadWorkerPool<F>) {
         if let Some(ref sender) = self.progress_sender {
             let (total_bytes, total_secs, _) = pool.get_total_stats();
             let avg_speed = pool.get_total_speed();
             
             // 收集所有 worker 的最终统计信息（包含分块大小）
-            let worker_stats: Vec<WorkerStatSnapshot> = pool.worker_channels.iter()
-                .enumerate()
-                .map(|(id, channel)| {
-                    let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
-                        channel.stats.get_full_summary();
-                    let current_chunk_size = channel.chunk_strategy.current_chunk_size();
-                    WorkerStatSnapshot {
-                        worker_id: id,
-                        bytes: worker_bytes,
-                        ranges: worker_ranges,
-                        avg_speed,
-                        instant_speed: if instant_valid { Some(instant_speed) } else { None },
-                        current_chunk_size,
-                    }
-                })
-                .collect();
+            let worker_stats = pool.get_worker_snapshots();
             
             // 发送完成事件和最终 worker 统计
             let _ = sender.send(DownloadProgress::Completed {
@@ -386,7 +356,7 @@ struct DownloadTask<C: HttpClient, F: AsyncFile> {
     /// HTTP 客户端（用于动态添加 worker）
     client: C,
     /// Worker 协程池
-    pool: WorkerPool<F>,
+    pool: DownloadWorkerPool<F>,
     /// 文件写入器
     writer: Arc<RangeWriter<F>>,
     /// 任务分配器
@@ -433,8 +403,8 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         );
         info!("初始启动 {} 个 workers", initial_worker_count);
         
-        // 创建 WorkerPool（只启动第一批 worker）
-        let pool = WorkerPool::new(
+        // 创建 DownloadWorkerPool（只启动第一批 worker）
+        let pool = DownloadWorkerPool::new(
             client.clone(),
             initial_worker_count,
             Arc::clone(&writer),
@@ -502,7 +472,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                         let mut speeds = Vec::with_capacity(current_worker_count);
                         
                         for worker_id in 0..current_worker_count {
-                            let (instant_speed, valid) = self.pool.worker_channels[worker_id].stats.get_instant_speed();
+                            let (instant_speed, valid) = self.pool.get_worker_instant_speed(worker_id);
                             speeds.push(instant_speed);
                             
                             // 所有worker的速度都必须有效且达到阈值
@@ -561,7 +531,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                 }
                 
                 // 接收 worker 结果并分配新任务
-                result = self.pool.result_receiver.recv() => {
+                result = self.pool.result_receiver().recv() => {
                     match result {
                         Some(RangeResult::Complete { worker_id }) => {
                             self.progress_reporter.record_range_complete();
@@ -646,7 +616,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         self.pool.shutdown();
         
         // 等待 workers 退出
-        for (id, handle) in self.pool.worker_handles.into_iter().enumerate() {
+        for (id, handle) in self.pool.worker_handles_mut().drain(..).enumerate() {
             let _ = handle.await;
             log::debug!("Worker #{} 已退出", id);
         }
@@ -668,8 +638,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         pool.shutdown();
         
         // 提取 worker_handles 并等待
-        let handles = std::mem::take(&mut pool.worker_handles);
-        for (id, handle) in handles.into_iter().enumerate() {
+        for (id, handle) in pool.worker_handles_mut().drain(..).enumerate() {
             handle
                 .await
                 .map_err(|_| DownloadError::WorkerExit(id))?;

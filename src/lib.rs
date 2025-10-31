@@ -119,8 +119,11 @@
 mod config;
 mod download;
 mod task;
-mod worker;
 pub mod cli;
+pub(crate) mod pool {
+    pub(crate) mod common;
+    pub(crate) mod download;
+}
 pub mod tools {
     pub(crate) mod chunk_strategy;
     pub(crate) mod fetch;

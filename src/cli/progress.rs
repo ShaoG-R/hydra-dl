@@ -129,6 +129,22 @@ impl ProgressManager {
 
                 // 详细模式：更新每个 worker 的进度条
                 if self.verbose {
+                    // 动态添加新的 worker 进度条（处理渐进式启动）
+                    if let Some(ref multi) = self.multi {
+                        while self.worker_bars.len() < worker_stats.len() {
+                            let worker_id = self.worker_bars.len();
+                            let worker_bar = multi.add(ProgressBar::new(0));
+                            worker_bar.set_style(
+                                ProgressStyle::default_bar()
+                                    .template(&format!("  Worker #{}: {{msg}}", worker_id))
+                                    .expect("无效的进度条模板"),
+                            );
+                            worker_bar.set_message("新启动...");
+                            self.worker_bars.push(worker_bar);
+                        }
+                    }
+                    
+                    // 更新所有 worker 的进度条
                     for (idx, stats) in worker_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
                             let instant_str = if let Some(instant) = stats.instant_speed {
@@ -165,6 +181,21 @@ impl ProgressManager {
 
                 // 详细模式：显示每个 worker 的最终统计
                 if self.verbose {
+                    // 确保所有 worker 都有进度条（处理渐进式启动的情况）
+                    if let Some(ref multi) = self.multi {
+                        while self.worker_bars.len() < worker_stats.len() {
+                            let worker_id = self.worker_bars.len();
+                            let worker_bar = multi.add(ProgressBar::new(0));
+                            worker_bar.set_style(
+                                ProgressStyle::default_bar()
+                                    .template(&format!("  Worker #{}: {{msg}}", worker_id))
+                                    .expect("无效的进度条模板"),
+                            );
+                            self.worker_bars.push(worker_bar);
+                        }
+                    }
+                    
+                    // 显示所有 worker 的最终统计
                     for (idx, stats) in worker_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
                             worker_bar.finish_with_message(format!(

@@ -1,0 +1,605 @@
+//! 下载专用 Worker 协程池
+//!
+//! 基于通用 WorkerPool 实现的下载专用协程池，提供下载任务的并发处理能力。
+//!
+//! # 核心组件
+//!
+//! - **DownloadWorkerContext**: 下载 worker 的上下文，包含统计和分块策略
+//! - **DownloadWorkerExecutor**: 下载任务执行器，处理 Range 下载和文件写入
+//! - **DownloadWorkerPool**: 下载协程池，封装通用 WorkerPool 并提供下载特定方法
+
+use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
+use crate::task::{RangeResult, WorkerTask as RangeTask};
+use crate::tools::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
+use crate::tools::fetch::fetch_range;
+use crate::tools::io_traits::{AsyncFile, HttpClient};
+use crate::tools::range_writer::RangeWriter;
+use crate::tools::stats::{DownloadStats, DownloadStatsParent};
+use crate::Result;
+use async_trait::async_trait;
+use log::{debug, error, info};
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+// ==================== Task 和 Result 实现 ====================
+
+impl WorkerTask for RangeTask {}
+
+impl WorkerResult for RangeResult {}
+
+// ==================== 下载 Worker 上下文 ====================
+
+/// 下载 Worker 的上下文
+///
+/// 包含每个 worker 独立的统计信息和分块策略
+pub(crate) struct DownloadWorkerContext {
+    /// 该 worker 的独立下载统计
+    pub(crate) stats: Arc<DownloadStats>,
+    /// 该 worker 的独立分块策略
+    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send + Sync>,
+}
+
+impl WorkerContext for DownloadWorkerContext {}
+
+// ==================== 下载任务执行器 ====================
+
+/// 下载任务执行器
+///
+/// 实现 WorkerExecutor trait，定义了如何执行 Range 下载任务
+///
+/// # 泛型参数
+///
+/// - `C`: HTTP 客户端类型
+/// - `F`: 异步文件类型
+pub(crate) struct DownloadWorkerExecutor<C, F>
+where
+    F: AsyncFile,
+{
+    /// HTTP 客户端
+    client: C,
+    /// 共享的文件写入器
+    writer: Arc<RangeWriter<F>>,
+}
+
+impl<C, F> DownloadWorkerExecutor<C, F>
+where
+    F: AsyncFile,
+{
+    /// 创建新的下载任务执行器
+    ///
+    /// # Arguments
+    ///
+    /// - `client`: HTTP 客户端
+    /// - `writer`: 共享的文件写入器
+    pub(crate) fn new(client: C, writer: Arc<RangeWriter<F>>) -> Self {
+        Self { client, writer }
+    }
+}
+
+#[async_trait]
+impl<C, F> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext> for DownloadWorkerExecutor<C, F>
+where
+    C: HttpClient + Send + Sync,
+    F: AsyncFile,
+{
+    async fn execute(
+        &self,
+        worker_id: usize,
+        task: RangeTask,
+        context: &DownloadWorkerContext,
+    ) -> RangeResult {
+        match task {
+            RangeTask::Range { url, range } => {
+                debug!(
+                    "Worker #{} 执行 Range 任务: {} (range {}..{})",
+                    worker_id,
+                    url,
+                    range.start(),
+                    range.end()
+                );
+
+                // 下载数据（在下载过程中会实时更新 stats）
+                let fetch_result = fetch_range(&self.client, &url, range, Arc::clone(&context.stats)).await;
+
+                match fetch_result {
+                    Ok(data) => {
+                        // 直接写入文件
+                        match self.writer.write_range(range, data).await {
+                            Ok(()) => {
+                                // 记录 range 完成
+                                context.stats.record_range_complete();
+
+                                // 返回完成结果
+                                RangeResult::Complete { worker_id }
+                            }
+                            Err(e) => {
+                                // 写入失败
+                                let error_msg = format!("写入失败: {:?}", e);
+                                error!("Worker #{} {}", worker_id, error_msg);
+                                RangeResult::Failed {
+                                    worker_id,
+                                    range,
+                                    error: error_msg,
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // 下载失败
+                        let error_msg = format!("下载失败: {:?}", e);
+                        error!(
+                            "Worker #{} Range {}..{} {}",
+                            worker_id,
+                            range.start(),
+                            range.end(),
+                            error_msg
+                        );
+                        RangeResult::Failed {
+                            worker_id,
+                            range,
+                            error: error_msg,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== 下载 Worker 协程池 ====================
+
+/// 下载 Worker 协程池
+///
+/// 封装通用 WorkerPool，提供下载特定的便捷方法
+///
+/// # 泛型参数
+///
+/// - `F`: 异步文件类型
+pub(crate) struct DownloadWorkerPool<F: AsyncFile> {
+    /// 底层通用协程池
+    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext>,
+    /// 全局统计管理器（聚合所有 worker 的数据）
+    global_stats: DownloadStatsParent,
+    /// 下载配置（用于创建新 worker 的分块策略）
+    config: Arc<crate::config::DownloadConfig>,
+    /// Phantom data 用于类型参数
+    _phantom: PhantomData<F>,
+}
+
+impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
+    /// 创建新的下载协程池
+    ///
+    /// # Arguments
+    ///
+    /// - `client`: HTTP客户端（将被克隆给每个worker）
+    /// - `initial_worker_count`: 初始 worker 协程数量
+    /// - `writer`: 共享的 RangeWriter，所有 worker 将直接写入此文件
+    /// - `config`: 下载配置，用于创建分块策略和设置速度窗口
+    ///
+    /// # Returns
+    ///
+    /// 新创建的 DownloadWorkerPool
+    pub(crate) fn new<C>(
+        client: C,
+        initial_worker_count: usize,
+        writer: Arc<RangeWriter<F>>,
+        config: Arc<crate::config::DownloadConfig>,
+    ) -> Self
+    where
+        C: HttpClient + Clone + Send + Sync + 'static,
+    {
+        // 创建全局统计管理器（使用配置的时间窗口）
+        let global_stats = DownloadStatsParent::with_window(config.instant_speed_window());
+
+        // 创建执行器
+        let executor = Arc::new(DownloadWorkerExecutor::new(client, Arc::clone(&writer)));
+
+        // 为每个 worker 创建独立的上下文
+        let contexts: Vec<DownloadWorkerContext> = (0..initial_worker_count)
+            .map(|_| {
+                // 通过 parent 创建 child stats
+                let worker_stats = Arc::new(global_stats.create_child());
+                // 创建独立的分块策略
+                let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config));
+
+                DownloadWorkerContext {
+                    stats: worker_stats,
+                    chunk_strategy,
+                }
+            })
+            .collect();
+
+        // 创建通用协程池
+        let pool = WorkerPool::new(executor, contexts);
+
+        info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
+
+        Self {
+            pool,
+            global_stats,
+            config,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// 动态添加新的 worker
+    ///
+    /// # Arguments
+    ///
+    /// - `_client`: HTTP客户端（暂未使用，因为使用现有的执行器）
+    /// - `count`: 要添加的 worker 数量
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回 `Ok(())`，失败时返回错误信息
+    pub(crate) fn add_workers<C>(&mut self, client: C, count: usize) -> Result<()>
+    where
+        C: HttpClient + Clone + Send + Sync + 'static,
+    {
+        let _ = client; // 当前实现使用现有的 executor，此参数保留以备将来使用
+        // 创建新的 worker 上下文
+        let contexts: Vec<DownloadWorkerContext> = (0..count)
+            .map(|_| {
+                let worker_stats = Arc::new(self.global_stats.create_child());
+                let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&self.config));
+
+                DownloadWorkerContext {
+                    stats: worker_stats,
+                    chunk_strategy,
+                }
+            })
+            .collect();
+
+        // 添加新 workers（使用现有的执行器）
+        self.pool.add_workers(contexts)
+    }
+
+    /// 获取当前 worker 总数
+    pub(crate) fn worker_count(&self) -> usize {
+        self.pool.worker_count()
+    }
+
+    /// 提交任务给指定的 worker
+    pub(crate) async fn send_task(&self, task: RangeTask, worker_id: usize) -> Result<()> {
+        self.pool.send_task(task, worker_id).await
+    }
+
+    /// 获取结果接收器的可变引用
+    pub(crate) fn result_receiver(&mut self) -> &mut tokio::sync::mpsc::Receiver<RangeResult> {
+        self.pool.result_receiver()
+    }
+
+    /// 获取指定 worker 的统计信息
+    #[allow(dead_code)]
+    pub(crate) fn worker_stats(&self, worker_id: usize) -> Arc<DownloadStats> {
+        Arc::clone(&self.pool.worker_context(worker_id).stats)
+    }
+
+    /// 获取所有 worker 的聚合统计（O(1)，无需遍历）
+    pub(crate) fn get_total_stats(&self) -> (u64, f64, usize) {
+        self.global_stats.get_summary()
+    }
+
+    /// 获取所有 worker 的总体下载速度（平均速度，O(1)）
+    pub(crate) fn get_total_speed(&self) -> f64 {
+        self.global_stats.get_speed()
+    }
+
+    /// 获取所有 worker 的总体实时速度（O(1)，无需遍历）
+    ///
+    /// # Returns
+    ///
+    /// `(实时速度 bytes/s, 是否有效)`
+    pub(crate) fn get_total_instant_speed(&self) -> (f64, bool) {
+        self.global_stats.get_instant_speed()
+    }
+
+    /// 获取指定 worker 的当前分块大小
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: Worker ID
+    ///
+    /// # Returns
+    ///
+    /// 当前分块大小 (bytes)
+    pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
+        self.pool.worker_context(worker_id).chunk_strategy.current_chunk_size()
+    }
+
+    /// 根据 worker 的实时速度计算新的分块大小
+    ///
+    /// 使用该 worker 的独立分块策略和实时速度来计算
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: Worker ID
+    ///
+    /// # Returns
+    ///
+    /// 计算得到的分块大小 (bytes)
+    ///
+    /// # Note
+    ///
+    /// 此方法需要独占访问 worker 的上下文来修改分块策略，
+    /// 但由于上下文在 Arc 中，我们需要使用内部可变性或其他方法。
+    /// 暂时我们返回当前分块大小或基于实时速度重新计算。
+    pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> u64 {
+        // 获取当前上下文的引用
+        let context_arc = self.pool.worker_context(worker_id);
+        let (instant_speed, valid) = context_arc.stats.get_instant_speed();
+        
+        if valid && instant_speed > 0.0 {
+            // 创建临时策略来计算新的分块大小
+            let mut temp_strategy = SpeedBasedChunkStrategy::from_config(&self.config);
+            temp_strategy.calculate_chunk_size(instant_speed)
+        } else {
+            context_arc.chunk_strategy.current_chunk_size()
+        }
+    }
+
+    /// 优雅关闭所有 workers
+    ///
+    /// 发送关闭信号到所有 worker，让它们停止接收新任务并退出
+    pub(crate) fn shutdown(&mut self) {
+        self.pool.shutdown();
+    }
+
+    /// 获取 worker handles 的可变引用（用于等待 worker 退出）
+    pub(crate) fn worker_handles_mut(&mut self) -> &mut Vec<tokio::task::JoinHandle<()>> {
+        &mut self.pool.worker_handles
+    }
+
+    /// 获取所有 worker 的统计快照
+    ///
+    /// # Returns
+    ///
+    /// 所有 worker 的统计信息向量
+    pub(crate) fn get_worker_snapshots(&self) -> Vec<crate::download::WorkerStatSnapshot> {
+        (0..self.pool.worker_count())
+            .map(|id| {
+                let context = self.pool.worker_context(id);
+                let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
+                    context.stats.get_full_summary();
+                let current_chunk_size = context.chunk_strategy.current_chunk_size();
+                crate::download::WorkerStatSnapshot {
+                    worker_id: id,
+                    bytes: worker_bytes,
+                    ranges: worker_ranges,
+                    avg_speed,
+                    instant_speed: if instant_valid { Some(instant_speed) } else { None },
+                    current_chunk_size,
+                }
+            })
+            .collect()
+    }
+
+    /// 获取指定 worker 的实时速度
+    ///
+    /// # Returns
+    ///
+    /// (实时速度 bytes/s, 是否有效)
+    pub(crate) fn get_worker_instant_speed(&self, worker_id: usize) -> (f64, bool) {
+        self.pool.worker_context(worker_id).stats.get_instant_speed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::io_traits::mock::{MockFile, MockFileSystem, MockHttpClient};
+    use bytes::Bytes;
+    use reqwest::{header::HeaderMap, StatusCode};
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn test_download_worker_pool_creation() {
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+        let save_path = PathBuf::from("/tmp/test.bin");
+
+        let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
+        let writer = Arc::new(writer);
+
+        let worker_count = 4;
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config);
+
+        assert_eq!(pool.worker_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_pool_send_task() {
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+        let save_path = PathBuf::from("/tmp/test.bin");
+
+        let (writer, mut allocator) = RangeWriter::new(&fs, save_path, 100).await.unwrap();
+        let writer = Arc::new(writer);
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let pool = DownloadWorkerPool::<MockFile>::new(client, 2, writer, config);
+
+        // 分配一个 range
+        let range = allocator.allocate(10).unwrap();
+
+        let task = RangeTask::Range {
+            url: "http://example.com/file.bin".to_string(),
+            range,
+        };
+
+        // 发送任务到 worker 0
+        let result = pool.send_task(task, 0).await;
+        assert!(result.is_ok(), "发送任务应该成功");
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_pool_stats() {
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+        let save_path = PathBuf::from("/tmp/test.bin");
+
+        let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
+        let writer = Arc::new(writer);
+
+        let worker_count = 3;
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config);
+
+        // 初始统计应该都是 0
+        let (total_bytes, total_secs, ranges) = pool.get_total_stats();
+        assert_eq!(total_bytes, 0);
+        assert!(total_secs >= 0.0);
+        assert_eq!(ranges, 0);
+
+        let speed = pool.get_total_speed();
+        assert_eq!(speed, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_pool_shutdown() {
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+        let save_path = PathBuf::from("/tmp/test.bin");
+
+        let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
+        let writer = Arc::new(writer);
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let mut pool = DownloadWorkerPool::<MockFile>::new(client.clone(), 2, writer, config);
+
+        // 关闭 workers
+        pool.shutdown();
+
+        // 验证所有 shutdown_sender 都已被消费
+        for channel in &pool.pool.worker_channels {
+            assert!(channel.shutdown_sender.is_none());
+        }
+
+        // 等待所有 workers 退出
+        for handle in pool.worker_handles_mut().drain(..) {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+            assert!(result.is_ok(), "Worker 应该退出");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_executor_success() {
+        let test_url = "http://example.com/file.bin";
+        let test_data = b"0123456789ABCDEFGHIJ"; // 20 bytes
+
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+        let save_path = PathBuf::from("/tmp/test.bin");
+
+        let (writer, mut allocator) = RangeWriter::new(&fs, save_path, test_data.len() as u64)
+            .await
+            .unwrap();
+        let writer = Arc::new(writer);
+
+        let range = allocator.allocate(test_data.len() as u64).unwrap();
+
+        // 设置 Range 响应
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-range",
+            format!("bytes 0-19/20").parse().unwrap(),
+        );
+        client.set_range_response(
+            test_url,
+            0,
+            19,
+            StatusCode::PARTIAL_CONTENT,
+            headers,
+            Bytes::from_static(test_data),
+        );
+
+        // 创建执行器
+        let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
+
+        // 创建上下文
+        let stats = Arc::new(DownloadStats::default());
+        let config = crate::config::DownloadConfig::default();
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config));
+        let context = DownloadWorkerContext {
+            stats: Arc::clone(&stats),
+            chunk_strategy,
+        };
+
+        // 执行任务
+        let task = RangeTask::Range {
+            url: test_url.to_string(),
+            range,
+        };
+
+        let result = executor.execute(0, task, &context).await;
+
+        // 验证结果
+        match result {
+            RangeResult::Complete { worker_id } => {
+                assert_eq!(worker_id, 0);
+            }
+            RangeResult::Failed { error, .. } => {
+                panic!("任务不应该失败: {}", error);
+            }
+        }
+
+        // 验证统计
+        let (total_bytes, _, ranges) = stats.get_summary();
+        assert_eq!(total_bytes, test_data.len() as u64);
+        assert_eq!(ranges, 1);
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_executor_failure() {
+        let test_url = "http://example.com/file.bin";
+
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+        let save_path = PathBuf::from("/tmp/test.bin");
+
+        let (writer, mut allocator) = RangeWriter::new(&fs, save_path, 100).await.unwrap();
+        let writer = Arc::new(writer);
+
+        let range = allocator.allocate(10).unwrap();
+
+        // 设置失败的 Range 响应
+        client.set_range_response(
+            test_url,
+            0,
+            9,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+
+        let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
+
+        let stats = Arc::new(DownloadStats::default());
+        let config = crate::config::DownloadConfig::default();
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config));
+        let context = DownloadWorkerContext {
+            stats,
+            chunk_strategy,
+        };
+
+        let task = RangeTask::Range {
+            url: test_url.to_string(),
+            range,
+        };
+
+        let result = executor.execute(0, task, &context).await;
+
+        // 验证结果
+        match result {
+            RangeResult::Failed { worker_id, error, .. } => {
+                assert_eq!(worker_id, 0);
+                assert!(error.contains("下载失败"));
+            }
+            RangeResult::Complete { .. } => {
+                panic!("任务应该失败");
+            }
+        }
+    }
+}
+
