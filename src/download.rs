@@ -429,8 +429,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         
         // 尝试为所有空闲 worker 分配初始任务
         while let Some(&worker_id) = self.task_allocator.idle_workers.front() {
-            let chunk_size = self.pool.get_worker_chunk_size(worker_id)
-                .unwrap_or(self.config.initial_chunk_size());
+            let chunk_size = self.pool.get_worker_chunk_size(worker_id);
             
             if let Some((task, assigned_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
                 info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", assigned_worker, chunk_size);
@@ -452,8 +451,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
     /// 
     /// 计算该 worker 的分块大小，并尝试分配新任务
     async fn try_allocate_next_task(&mut self, worker_id: usize) {
-        let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
-            .unwrap_or(self.config.initial_chunk_size());
+        let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
         
         if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
             debug!(
@@ -693,8 +691,7 @@ where
     
     // 发送开始事件（使用第一个 worker 的初始分块大小）
     let current_worker_count = task.pool.worker_count();
-    let initial_chunk_size = task.pool.get_worker_chunk_size(0)
-        .unwrap_or(config.initial_chunk_size());    
+    let initial_chunk_size = task.pool.get_worker_chunk_size(0);
     task.progress_reporter.send_started_event(current_worker_count, initial_chunk_size).await;
 
     // 等待所有任务完成（内部会动态分配任务）

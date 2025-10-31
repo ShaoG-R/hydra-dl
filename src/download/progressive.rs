@@ -139,8 +139,7 @@ impl ProgressiveLauncher {
                         // 将新 worker 加入空闲队列
                         task_allocator.mark_worker_idle(worker_id);
                         
-                        let chunk_size = pool.get_worker_chunk_size(worker_id)
-                            .unwrap_or(config.initial_chunk_size());
+                        let chunk_size = pool.get_worker_chunk_size(worker_id);
                         
                         if let Some((task, assigned_worker)) = task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
                             info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", assigned_worker, chunk_size);

@@ -309,10 +309,10 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     ///
     /// # Returns
     ///
-    /// 当前分块大小 (bytes)，如果 worker 不存在返回 None
-    pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> Option<u64> {
-        let context = self.pool.worker_context(worker_id)?;
-        Some(context.chunk_strategy.current_chunk_size())
+    /// 当前分块大小 (bytes)，如果 worker 不存在返回默认初始分块大小
+    #[inline]
+    pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
+        self.pool.worker_context(worker_id).map(|context| context.chunk_strategy.current_chunk_size()).unwrap_or(self.config.initial_chunk_size())
     }
 
     /// 根据 worker 的实时速度和平均速度计算新的分块大小
@@ -325,23 +325,28 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     ///
     /// # Returns
     ///
-    /// 计算得到的分块大小 (bytes)，如果 worker 不存在返回 None
+    /// 计算得到的分块大小 (bytes)，如果 worker 不存在返回默认初始分块大小
     ///
     /// # Note
     ///
     /// 此方法会根据实时速度和平均速度（带权重）动态调整分块大小，策略内部使用原子操作更新状态
-    pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> Option<u64> {
-        let context_arc = self.pool.worker_context(worker_id)?;
-        let (instant_speed, valid) = context_arc.stats.get_instant_speed();
-        let avg_speed = context_arc.stats.get_speed();
-        
-        if valid && instant_speed > 0.0 {
-            // 直接调用策略计算（内部使用原子操作更新）
-            let new_chunk_size = context_arc.chunk_strategy.calculate_chunk_size(instant_speed, avg_speed);
-            Some(new_chunk_size)
-        } else {
-            // 速度无效时返回当前分块大小
-            Some(context_arc.chunk_strategy.current_chunk_size())
+    pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> u64 {
+        match self.pool.worker_context(worker_id) {
+            Some(context) => {
+                let (instant_speed, valid) = context.stats.get_instant_speed();
+                let avg_speed = context.stats.get_speed();
+                
+                if valid && instant_speed > 0.0 {
+                    // 直接调用策略计算（内部使用原子操作更新）
+                    let new_chunk_size = context.chunk_strategy.calculate_chunk_size(instant_speed, avg_speed);
+                    new_chunk_size
+                } else {
+                    // 速度无效时返回当前分块大小
+                    context.chunk_strategy.current_chunk_size()
+                }
+            }
+            // 如果 worker 不存在，返回默认初始分块大小
+            None => self.config.initial_chunk_size(),
         }
     }
 
