@@ -1,10 +1,10 @@
 [package]
-name = "rs-dn"
+name = "hydra-dl"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
-name = "rs-dn"
+name = "hydra-dl"
 path = "src/main.rs"
 
 [dependencies]

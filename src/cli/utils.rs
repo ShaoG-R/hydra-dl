@@ -5,7 +5,7 @@ use super::{CliError, Result};
 ///
 /// # Example
 /// ```
-/// # use rs_dn::cli::utils::extract_filename_from_url;
+/// # use hydra_dl::cli::utils::extract_filename_from_url;
 /// let filename = extract_filename_from_url("https://example.com/path/file.zip").unwrap();
 /// assert_eq!(filename, "file.zip");
 /// ```
@@ -61,7 +61,7 @@ pub fn validate_output_path(path: &str) -> Result<PathBuf> {
 ///
 /// # Example
 /// ```
-/// # use rs_dn::cli::utils::format_bytes;
+/// # use hydra_dl::cli::utils::format_bytes;
 /// assert_eq!(format_bytes(1024), "1.00 KB");
 /// assert_eq!(format_bytes(1048576), "1.00 MB");
 /// assert_eq!(format_bytes(1073741824), "1.00 GB");
@@ -88,7 +88,7 @@ pub fn format_bytes(bytes: u64) -> String {
 ///
 /// # Example
 /// ```
-/// # use rs_dn::cli::utils::format_speed;
+/// # use hydra_dl::cli::utils::format_speed;
 /// assert_eq!(format_speed(1024.0), "1.00 KB/s");
 /// assert_eq!(format_speed(1048576.0), "1.00 MB/s");
 /// ```
@@ -112,7 +112,7 @@ pub fn format_speed(bytes_per_sec: f64) -> String {
 ///
 /// # Example
 /// ```
-/// # use rs_dn::cli::utils::format_duration;
+/// # use hydra_dl::cli::utils::format_duration;
 /// assert_eq!(format_duration(90.5), "1m 30s");
 /// assert_eq!(format_duration(3661.0), "1h 1m");
 /// ```

@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::LevelFilter;
-use rs_dn::cli;
+use hydra_dl::cli;
 
 #[tokio::main]
 async fn main() {

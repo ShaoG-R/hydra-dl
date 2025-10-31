@@ -75,7 +75,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// use std::time::Duration;
     /// 
     /// // 使用 500ms 的时间窗口
@@ -103,7 +103,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// use std::sync::Arc;
     /// 
     /// let parent = DownloadStatsParent::default();
@@ -139,7 +139,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// 
     /// let stats = DownloadStats::default();
     /// stats.record_chunk(1024); // 记录下载了 1KB
@@ -163,7 +163,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// 
     /// let stats = DownloadStats::default();
     /// stats.record_range_complete(); // 记录完成了一个 range
@@ -188,7 +188,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// 
     /// let stats = DownloadStats::default();
     /// stats.record_chunk(1024 * 1024); // 下载 1MB
@@ -232,7 +232,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// use std::time::Duration;
     /// use std::thread;
     /// 
@@ -310,7 +310,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// 
     /// let stats = DownloadStats::default();
     /// stats.record_chunk(1024);
@@ -339,7 +339,7 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStats;
+    /// use hydra_dl::DownloadStats;
     /// 
     /// let stats = DownloadStats::default();
     /// stats.record_chunk(1024 * 1024);
@@ -391,7 +391,7 @@ impl std::fmt::Debug for DownloadStats {
 /// # Examples
 /// 
 /// ```ignore
-/// use rs_dn::DownloadStatsParent;
+/// use hydra_dl::DownloadStatsParent;
 /// 
 /// let parent = DownloadStatsParent::new();
 /// let child1 = parent.create_child();
@@ -430,7 +430,7 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStatsParent;
+    /// use hydra_dl::DownloadStatsParent;
     /// use std::time::Duration;
     /// 
     /// let parent = DownloadStatsParent::default();
@@ -460,7 +460,7 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStatsParent;
+    /// use hydra_dl::DownloadStatsParent;
     /// 
     /// let parent = DownloadStatsParent::new();
     /// let child = parent.create_child();
@@ -481,7 +481,7 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStatsParent;
+    /// use hydra_dl::DownloadStatsParent;
     /// use std::time::Duration;
     /// 
     /// let parent = DownloadStatsParent::new();
@@ -500,7 +500,7 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStatsParent;
+    /// use hydra_dl::DownloadStatsParent;
     /// 
     /// let parent = DownloadStatsParent::new();
     /// let (bytes, elapsed, ranges) = parent.get_summary();
@@ -520,7 +520,7 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStatsParent;
+    /// use hydra_dl::DownloadStatsParent;
     /// 
     /// let parent = DownloadStatsParent::new();
     /// let speed = parent.get_speed();
@@ -545,7 +545,7 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStatsParent;
+    /// use hydra_dl::DownloadStatsParent;
     /// 
     /// let parent = DownloadStatsParent::new();
     /// let (instant_speed, valid) = parent.get_instant_speed();
@@ -613,7 +613,7 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use rs_dn::DownloadStatsParent;
+    /// use hydra_dl::DownloadStatsParent;
     /// 
     /// let parent = DownloadStatsParent::new();
     /// let (bytes, elapsed, ranges, avg_speed, instant_speed, valid) = parent.get_full_summary();

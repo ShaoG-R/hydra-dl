@@ -24,8 +24,8 @@
 //! # 使用示例
 //! 
 //! ```no_run
-//! # use rs_dn::utils::range_writer::RangeWriter;
-//! # use rs_dn::utils::io_traits::TokioFileSystem;
+//! # use hydra_dl::utils::range_writer::RangeWriter;
+//! # use hydra_dl::utils::io_traits::TokioFileSystem;
 //! # use bytes::Bytes;
 //! # use std::path::PathBuf;
 //! # #[tokio::main]
@@ -151,7 +151,7 @@ impl From<AllocatedRange> for Range<u64> {
 /// # Example
 /// 
 /// ```
-/// # use rs_dn::utils::range_writer::RangeAllocator;
+/// # use hydra_dl::utils::range_writer::RangeAllocator;
 /// let mut allocator = RangeAllocator::new(1000);
 ///
 /// // 分配 100 字节
@@ -239,8 +239,8 @@ impl RangeAllocator {
 /// # Example
 /// 
 /// ```no_run
-/// # use rs_dn::utils::range_writer::RangeWriter;
-/// # use rs_dn::utils::io_traits::TokioFileSystem;
+/// # use hydra_dl::utils::range_writer::RangeWriter;
+/// # use hydra_dl::utils::io_traits::TokioFileSystem;
 /// # use std::path::PathBuf;
 /// # use bytes::Bytes;
 /// # #[tokio::main]

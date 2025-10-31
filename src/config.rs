@@ -159,7 +159,7 @@ impl DownloadConfig {
     /// # Example
     ///
     /// ```
-    /// # use rs_dn::DownloadConfig;
+    /// # use hydra_dl::DownloadConfig;
     /// let config = DownloadConfig::builder()
     ///     .worker_count(4)
     ///     .initial_chunk_size(5 * 1024 * 1024)
@@ -292,7 +292,7 @@ impl DownloadConfig {
 /// # Example
 ///
 /// ```
-/// # use rs_dn::DownloadConfig;
+/// # use hydra_dl::DownloadConfig;
 /// let config = DownloadConfig::builder()
 ///     .worker_count(8)
 ///     .initial_chunk_size(10 * 1024 * 1024)  // 10 MB
@@ -480,7 +480,7 @@ impl DownloadConfigBuilder {
     /// # Example
     ///
     /// ```
-    /// # use rs_dn::DownloadConfig;
+    /// # use hydra_dl::DownloadConfig;
     /// let config = DownloadConfig::builder()
     ///     .worker_count(12)
     ///     .progressive_worker_ratios(vec![0.25, 0.5, 0.75, 1.0])  // 3, 6, 9, 12 个 worker
@@ -518,8 +518,8 @@ impl DownloadConfigBuilder {
     /// # Example
     ///
     /// ```
-    /// # use rs_dn::DownloadConfig;
-    /// # use rs_dn::constants::*;
+    /// # use hydra_dl::DownloadConfig;
+    /// # use hydra_dl::constants::*;
     /// let config = DownloadConfig::builder()
     ///     .min_speed_threshold(5 * MB)  // 5 MB/s
     ///     .build();
@@ -540,7 +540,7 @@ impl DownloadConfigBuilder {
     /// # Example
     ///
     /// ```
-    /// # use rs_dn::DownloadConfig;
+    /// # use hydra_dl::DownloadConfig;
     /// let config = DownloadConfig::builder()
     ///     .max_retry_count(5)
     ///     .build();
@@ -562,7 +562,7 @@ impl DownloadConfigBuilder {
     /// # Example
     ///
     /// ```
-    /// # use rs_dn::DownloadConfig;
+    /// # use hydra_dl::DownloadConfig;
     /// # use std::time::Duration;
     /// let config = DownloadConfig::builder()
     ///     .retry_delays(vec![

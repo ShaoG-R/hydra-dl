@@ -91,7 +91,7 @@ impl log::Log for IndicatifLogger {
 /// # Example
 /// ```
 /// use log::LevelFilter;
-/// use rs_dn::cli::init_logger;
+/// use hydra_dl::cli::init_logger;
 /// init_logger(LevelFilter::Info);
 /// ```
 #[inline]

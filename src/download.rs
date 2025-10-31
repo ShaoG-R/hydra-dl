@@ -121,7 +121,7 @@ impl DownloadHandle {
     /// # Example
     /// 
     /// ```no_run
-    /// # use rs_dn::{download_ranged, DownloadProgress, DownloadConfig};
+    /// # use hydra_dl::{download_ranged, DownloadProgress, DownloadConfig};
     /// # use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
     /// # use std::path::PathBuf;
     /// # #[tokio::main]
@@ -742,11 +742,11 @@ where
 /// # Example
 /// 
 /// ```no_run
-/// # use rs_dn::{download_ranged, DownloadConfig, DownloadProgress};
-/// # use rs_dn::timer::{TimerWheel, TimerService, ServiceConfig};
+/// # use hydra_dl::{download_ranged, DownloadConfig, DownloadProgress};
+/// # use hydra_dl::timer::{TimerWheel, TimerService, ServiceConfig};
 /// # use std::path::PathBuf;
 /// # #[tokio::main]
-/// # async fn main() -> Result<(), rs_dn::DownloadError> {
+/// # async fn main() -> Result<(), hydra_dl::DownloadError> {
 /// // 使用默认配置（推荐）
 /// let config = DownloadConfig::default();
 /// let timer = TimerWheel::with_defaults();

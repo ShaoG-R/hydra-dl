@@ -1,4 +1,4 @@
-//! # rs-dn: Rust 高性能多线程下载器
+//! # hydra-dl: Rust 高性能多线程下载器
 //!
 //! 基于 tokio 和 channel 的异步多线程下载库
 //!
@@ -20,9 +20,9 @@
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), rs_dn::DownloadError> {
+//! async fn main() -> Result<(), hydra_dl::DownloadError> {
 //!     // 简单下载单个文件（自动检测文件名）
-//!     let save_path = rs_dn::download_file("https://example.com/file.zip", ".").await?;
+//!     let save_path = hydra_dl::download_file("https://example.com/file.zip", ".").await?;
 //!     println!("文件已保存到: {:?}", save_path);
 //!     Ok(())
 //! }
@@ -32,16 +32,16 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use rs_dn::{DownloadConfig, DownloadProgress};
+//! use hydra_dl::{DownloadConfig, DownloadProgress};
 //! use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), rs_dn::DownloadError> {
+//! async fn main() -> Result<(), hydra_dl::DownloadError> {
 //!     // 使用默认配置：4个worker，动态分块（2-50 MB）
 //!     let config = DownloadConfig::default();
 //!     let timer = TimerWheel::with_defaults();
 //!     let timer_service = timer.create_service(ServiceConfig::default());
-//!     let (mut handle, save_path) = rs_dn::download_ranged(
+//!     let (mut handle, save_path) = hydra_dl::download_ranged(
 //!         "https://example.com/large_file.zip",
 //!         PathBuf::from("."),  // 保存到当前目录
 //!         config,
@@ -86,11 +86,11 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use rs_dn::{DownloadConfig, DownloadProgress};
+//! use hydra_dl::{DownloadConfig, DownloadProgress};
 //! use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), rs_dn::DownloadError> {
+//! async fn main() -> Result<(), hydra_dl::DownloadError> {
 //!     // 自定义配置：更多 worker，更大的分块范围
 //!     let config = DownloadConfig::builder()
 //!         .worker_count(8)                         // 8 个并发 worker
@@ -101,7 +101,7 @@
 //!     
 //!     let timer = TimerWheel::with_defaults();
 //!     let timer_service = timer.create_service(ServiceConfig::default());
-//!     let (handle, save_path) = rs_dn::download_ranged(
+//!     let (handle, save_path) = hydra_dl::download_ranged(
 //!         "https://example.com/large_file.zip",
 //!         PathBuf::from("."),
 //!         config,
@@ -148,8 +148,8 @@ pub mod utils {
 /// # Example
 /// 
 /// ```
-/// use rs_dn::constants::*;
-/// use rs_dn::DownloadConfig;
+/// use hydra_dl::constants::*;
+/// use hydra_dl::DownloadConfig;
 /// 
 /// let config = DownloadConfig::builder()
 ///     .initial_chunk_size(10 * MB)  // 10 MB
@@ -253,10 +253,10 @@ pub type Result<T> = std::result::Result<T, DownloadError>;
 /// # Example
 ///
 /// ```no_run
-/// # use rs_dn::download_file;
+/// # use hydra_dl::download_file;
 /// # use std::path::PathBuf;
 /// # #[tokio::main]
-/// # async fn main() -> Result<(), rs_dn::DownloadError> {
+/// # async fn main() -> Result<(), hydra_dl::DownloadError> {
 /// let save_path = download_file("https://example.com/file.txt", ".").await?;
 /// println!("文件已保存到: {:?}", save_path);
 /// # Ok(())

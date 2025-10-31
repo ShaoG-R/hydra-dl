@@ -44,7 +44,7 @@ pub type Result<T> = std::result::Result<T, CliError>;
 
 /// 高性能 Rust 下载器
 #[derive(Parser, Debug)]
-#[command(name = "rs-dn")]
+#[command(name = "hydra-dl")]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
     /// 下载 URL
