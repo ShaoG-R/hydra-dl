@@ -147,7 +147,7 @@ pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext>: Send
 ///
 /// 每个 worker 持有一个独立的 channel receiver，循环等待任务
 /// 通过 executor 处理任务，并将结果发送到统一的 result channel
-/// 当 task channel 关闭时自动退出
+/// 当 task channel 关闭或收到关闭信号时自动退出
 ///
 /// # 泛型参数
 ///
@@ -161,6 +161,7 @@ pub(crate) async fn run_worker<T, R, C, E>(
     mut task_receiver: Receiver<T>,
     result_sender: Sender<R>,
     context: Arc<C>,
+    mut shutdown_receiver: tokio::sync::oneshot::Receiver<()>,
 )
 where
     T: WorkerTask,
@@ -170,10 +171,14 @@ where
 {
     info!("Worker #{} 启动", id);
 
-    // 循环接收并处理任务
+    // 使用 select! 同时监听任务通道和关闭通道
     loop {
-        match task_receiver.recv().await {
-            Some(task) => {
+        tokio::select! {
+            _ = &mut shutdown_receiver => {
+                info!("Worker #{} 收到关闭信号，立即退出", id);
+                break;
+            }
+            Some(task) = task_receiver.recv() => {
                 debug!("Worker #{} 接收到任务: {:?}", id, task);
 
                 // 执行任务
@@ -184,7 +189,8 @@ where
                     error!("Worker #{} 发送结果失败: {:?}", id, e);
                 }
             }
-            None => {
+            
+            else => {
                 // task channel 关闭，正常退出
                 info!("Worker #{} 任务通道关闭，退出", id);
                 break;
@@ -203,6 +209,8 @@ pub struct WorkerSlot<T: WorkerTask, C: WorkerContext> {
     pub(crate) task_sender: Sender<T>,
     /// 该 worker 的独立上下文（Arc 包装以便在 worker 协程中共享）
     pub(crate) context: Arc<C>,
+    /// 关闭通道的发送端（用于向 worker 发送关闭信号）
+    pub(crate) shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Worker 自动清理器
@@ -336,6 +344,9 @@ where
         for (id, context) in contexts.into_iter().enumerate() {
             let (task_sender, task_receiver) = mpsc::channel::<T>(100);
             
+            // 创建关闭通道
+            let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+            
             // 将上下文包装在 Arc 中
             let context_arc = Arc::new(context);
             
@@ -348,6 +359,7 @@ where
             let slot = WorkerSlot {
                 task_sender,
                 context: context_arc,
+                shutdown_sender: Some(shutdown_sender),
             };
             workers[id].store(Arc::new(Some(slot)));
             
@@ -363,7 +375,7 @@ where
             // 启动 worker 协程（包含自动清理逻辑）
             tokio::spawn(async move {
                 // 执行 worker 主循环
-                run_worker(id, executor_clone, task_receiver, result_sender_clone, context_for_worker).await;
+                run_worker(id, executor_clone, task_receiver, result_sender_clone, context_for_worker, shutdown_receiver).await;
                 
                 // worker 退出后自动清理
                 cleanup.cleanup();
@@ -412,6 +424,9 @@ where
             
             let (task_sender, task_receiver) = mpsc::channel::<T>(100);
             
+            // 创建关闭通道
+            let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+            
             // 将上下文包装在 Arc 中
             let context_arc = Arc::new(context);
             
@@ -424,6 +439,7 @@ where
             let new_slot = Some(WorkerSlot {
                 task_sender,
                 context: context_arc,
+                shutdown_sender: Some(shutdown_sender),
             });
             self.workers[worker_id].store(Arc::new(new_slot));
             
@@ -439,7 +455,7 @@ where
             // 启动 worker 协程（包含自动清理逻辑）
             tokio::spawn(async move {
                 // 执行 worker 主循环
-                run_worker(worker_id, executor_clone, task_receiver, result_sender_clone, context_for_worker).await;
+                run_worker(worker_id, executor_clone, task_receiver, result_sender_clone, context_for_worker, shutdown_receiver).await;
                 
                 // worker 退出后自动清理
                 cleanup.cleanup();
@@ -455,7 +471,7 @@ where
     
     /// 关闭指定的 worker
     ///
-    /// 清空 worker slot，导致 task_sender 被 drop，worker 会检测到 channel 关闭并自动退出清理
+    /// 通过 oneshot channel 向 worker 发送关闭信号，worker 收到信号后立即退出并自动清理
     ///
     /// # Arguments
     ///
@@ -468,12 +484,12 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// pool.shutdown_worker(0).await?;
+    /// pool.shutdown_worker(0)?;
     /// ```
     ///
     /// # Note
     ///
-    /// 此方法不会等待 worker 退出，worker 会在检测到 channel 关闭后异步自动清理
+    /// 此方法不会等待 worker 退出，worker 会在收到关闭信号后异步自动清理
     #[allow(dead_code)]
     pub fn shutdown_worker(&self, worker_id: usize) -> Result<()> {
         info!("开始关闭 Worker #{}", worker_id);
@@ -484,15 +500,22 @@ where
         }
         
         // 原子性地取出 worker slot（swap 为 None）
-        // 这会导致 task_sender 被 drop，worker 会检测到 channel 关闭
         let old_slot_arc = self.workers[worker_id].swap(Arc::new(None));
         
-        // 检查 worker 是否存在
-        if old_slot_arc.is_none() {
+        // 检查 worker 是否存在并发送关闭信号
+        if let Some(mut slot) = Arc::try_unwrap(old_slot_arc).ok().and_then(|s| s) {
+            // 取出 shutdown_sender 并发送关闭信号
+            if let Some(sender) = slot.shutdown_sender.take() {
+                // 忽略发送错误（worker 可能已经退出）
+                let _ = sender.send(());
+                info!("Worker #{} 关闭信号已发送", worker_id);
+            } else {
+                info!("Worker #{} 的关闭信号已被消费", worker_id);
+            }
+        } else {
             return Err(crate::DownloadError::WorkerNotFound(worker_id));
         }
         
-        info!("Worker #{} 关闭信号已发送（task_sender 已 drop），worker 将自动退出并清理", worker_id);
         Ok(())
     }
     
@@ -566,8 +589,8 @@ where
 
     /// 优雅关闭所有 workers
     ///
-    /// 清空所有 worker slots，导致所有 task_sender 被 drop
-    /// Workers 会检测到 channel 关闭并自动退出清理
+    /// 通过 oneshot channel 向所有活跃的 workers 发送关闭信号
+    /// Workers 收到信号后立即退出并自动清理
     /// 
     /// # Note
     ///
@@ -578,14 +601,19 @@ where
         
         let mut closed_count = 0;
         
-        for (id, _worker) in self.workers.iter().enumerate() {
-            // 直接 swap 取出 worker slot（这会导致 task_sender 被 drop）
+        for id in 0..MAX_WORKER_COUNT {
+            // 原子性地取出 worker slot（swap 为 None）
             let old_slot_arc = self.workers[id].swap(Arc::new(None));
             
-            // 检查是否为 Some
-            if old_slot_arc.is_some() {
-                debug!("Worker #{} 关闭信号已发送（task_sender 已 drop）", id);
-                closed_count += 1;
+            // 检查 worker 是否存在并发送关闭信号
+            if let Some(mut slot) = Arc::try_unwrap(old_slot_arc).ok().and_then(|s| s) {
+                // 取出 shutdown_sender 并发送关闭信号
+                if let Some(sender) = slot.shutdown_sender.take() {
+                    // 忽略发送错误（worker 可能已经退出）
+                    let _ = sender.send(());
+                    debug!("Worker #{} 关闭信号已发送", id);
+                    closed_count += 1;
+                }
             }
         }
         
