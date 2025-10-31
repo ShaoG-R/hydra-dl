@@ -1,8 +1,11 @@
 use clap::Parser;
 
+mod logger;
 mod progress;
 mod runner;
 pub mod utils;
+
+pub use logger::{init_logger, set_progress_bar, clear_progress_bar};
 
 /// CLI 错误类型
 #[derive(thiserror::Error, Debug)]

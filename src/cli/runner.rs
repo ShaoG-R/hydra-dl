@@ -42,6 +42,9 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
         // 进度条模式
         let mut progress_manager = ProgressManager::new(cli.verbose);
 
+        // 将进度条引用传给 logger，使日志输出不破坏进度条
+        super::set_progress_bar(progress_manager.main_bar());
+
         // 循环接收进度更新
         while let Some(progress) = handle.progress_receiver().recv().await {
             progress_manager.handle_progress(progress);
@@ -52,6 +55,9 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
 
         // 确保进度条完成
         progress_manager.finish();
+        
+        // 清除进度条引用
+        super::clear_progress_bar();
         
         println!("文件已保存到: {:?}", save_path);
     }

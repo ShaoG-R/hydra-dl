@@ -197,6 +197,11 @@ impl ProgressManager {
             self.main_bar.finish();
         }
     }
+
+    /// 获取主进度条的引用（用于 logger 集成）
+    pub fn main_bar(&self) -> ProgressBar {
+        self.main_bar.clone()
+    }
 }
 
 /// 创建简单的进度条（用于静默模式的替代）
