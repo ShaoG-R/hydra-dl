@@ -781,9 +781,9 @@ dependencies = [
 
 [[package]]
 name = "kestrel-timer"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e672d801a9c4d21ce44599c5f2962aeccef9af44bbcd84287bff17e190a6ecce"
+checksum = "7246e72a988fe771313f656f345f8a348935a9804ebafea5967d578b2174ae2b"
 dependencies = [
  "futures",
  "parking_lot",
