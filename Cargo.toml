@@ -22,6 +22,7 @@ url = "2.5"
 urlencoding = "2.1"
 arc-swap = "1.7.1"
 kestrel-protocol-timer = "0.1.11"
+rustc-hash = "2.1.1"
 
 
 [dev-dependencies]

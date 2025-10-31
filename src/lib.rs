@@ -159,10 +159,10 @@ pub mod utils {
 pub mod constants {
     /// 1 KB = 1024 bytes
     pub const KB: u64 = 1024;
-    /// 1 MB = 1024 * 1024 bytes
-    pub const MB: u64 = 1024 * 1024;
-    /// 1 GB = 1024 * 1024 * 1024 bytes
-    pub const GB: u64 = 1024 * 1024 * 1024;
+    /// 1 MB = 1024 KB
+    pub const MB: u64 = 1024 * KB;
+    /// 1 GB = 1024 MB
+    pub const GB: u64 = 1024 * MB;
 }
 
 // 重新导出核心类型和函数

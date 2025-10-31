@@ -10,6 +10,7 @@ use crate::pool::download::DownloadWorkerPool;
 use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::utils::range_writer::{AllocatedRange, RangeAllocator, RangeWriter};
 use crate::task::{RangeResult, WorkerTask};
+use rustc_hash::FxHashMap;
 
 /// Worker 统计信息
 #[derive(Debug, Clone)]
@@ -198,7 +199,7 @@ struct TaskAllocator {
     /// 空闲 worker ID 队列
     idle_workers: VecDeque<usize>,
     /// 待重试的失败任务映射（定时器 TaskId -> 失败任务信息）
-    failed_tasks: std::collections::HashMap<TaskId, FailedTaskInfo>,
+    failed_tasks: FxHashMap<TaskId, FailedTaskInfo>,
     /// 永久失败的任务（达到最大重试次数）
     permanently_failed: Vec<(AllocatedRange, String)>,
 }
@@ -213,7 +214,7 @@ impl TaskAllocator {
             allocator,
             url,
             idle_workers: VecDeque::new(),
-            failed_tasks: std::collections::HashMap::new(),
+            failed_tasks: FxHashMap::default(),
             permanently_failed: Vec::new(),
         }
     }
