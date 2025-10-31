@@ -83,6 +83,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::MAX_WORKER_COUNT;
 use crate::{DownloadError, Result};
+use super::worker_mask::WorkerMask;
 
 /// Worker 任务 trait
 ///
@@ -252,6 +253,9 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext> {
     result_sender: Sender<R>,
     /// 执行器（所有 worker 共享）
     pub(crate) executor: Arc<dyn WorkerExecutor<T, R, C>>,
+    /// Worker 槽位空闲位掩码（1 表示已占用，0 表示空闲）
+    /// 用于快速查找空闲槽位
+    free_mask: Arc<WorkerMask>,
 }
 
 impl<T, R, C> WorkerPool<T, R, C>
@@ -333,6 +337,9 @@ where
             }
         });
 
+        // 初始化空闲位掩码
+        let free_mask = Arc::new(WorkerMask::new(worker_count)?);
+        
         info!("创建协程池，{} 个初始 workers", worker_count);
 
         Ok(Self {
@@ -340,6 +347,7 @@ where
             result_receiver,
             result_sender,
             executor: executor_trait_obj,
+            free_mask,
         })
     }
 
@@ -368,12 +376,8 @@ where
         info!("动态添加 {} 个新 workers (当前活跃 {} 个)", count, current_active);
         
         for context in contexts.into_iter() {
-            // 查找第一个空位
-            let worker_id = (0..MAX_WORKER_COUNT)
-                .find(|&i| self.workers[i].load().is_none())
-                .ok_or_else(|| {
-                    DownloadError::WorkerPoolFull(MAX_WORKER_COUNT)
-                })?;
+            // 使用位掩码快速查找第一个空位
+            let worker_id = self.free_mask.allocate()?;
             
             let (task_sender, task_receiver) = mpsc::channel::<T>(100);
             let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
@@ -455,18 +459,23 @@ where
         // 等待 worker 退出
         if let Err(e) = slot.handle.await {
             error!("Worker #{} 退出失败: {:?}", worker_id, e);
+            // 即使退出失败，也要释放位掩码
+            let _ = self.free_mask.free(worker_id);
             return Err(crate::DownloadError::WorkerExit(worker_id));
         }
+        
+        // 释放位掩码中的槽位
+        self.free_mask.free(worker_id)?;
         
         info!("Worker #{} 已成功关闭并移除", worker_id);
         Ok(())
     }
     
     /// 获取当前活跃 worker 总数
+    /// 
+    /// 使用位掩码快速计算，O(1) 时间复杂度
     pub fn worker_count(&self) -> usize {
-        self.workers.iter()
-            .filter(|w| w.load().is_some())
-            .count()
+        self.free_mask.count()
     }
 
     /// 提交任务给指定的 worker
@@ -587,8 +596,18 @@ where
         for (id, handle) in handles {
             debug!("等待 Worker #{} 退出...", id);
             match handle.await {
-                Ok(_) => debug!("Worker #{} 已退出", id),
-                Err(e) => error!("Worker #{} 退出时出错: {:?}", id, e),
+                Ok(_) => {
+                    debug!("Worker #{} 已退出", id);
+                    // 释放位掩码中的槽位
+                    if let Err(e) = self.free_mask.free(id) {
+                        error!("释放 Worker #{} 位掩码失败: {:?}", id, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Worker #{} 退出时出错: {:?}", id, e);
+                    // 即使退出失败也要尝试释放位掩码
+                    let _ = self.free_mask.free(id);
+                }
             }
         }
         info!("所有 workers 已退出")

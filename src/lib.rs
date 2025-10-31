@@ -123,6 +123,7 @@ pub mod cli;
 pub(crate) mod pool {
     pub(crate) mod common;
     pub(crate) mod download;
+    pub(crate) mod worker_mask;
 }
 pub mod tools {
     pub(crate) mod chunk_strategy;
@@ -206,6 +207,10 @@ pub enum DownloadError {
     /// Worker 池已满
     #[error("Worker 池已满，无法添加更多 worker（最大 {0} 个）")]
     WorkerPoolFull(usize),
+    
+    /// Worker ID 无效（超出范围）
+    #[error("Worker ID {0} 无效，必须在范围 [0, {1}) 内")]
+    InvalidWorkerId(usize, usize),
     
     /// 通用错误
     #[error("{0}")]
