@@ -199,6 +199,10 @@ pub enum DownloadError {
     #[error("Worker #{0} 不存在或已被移除")]
     WorkerNotFound(usize),
 
+    /// Worker 数量超过最大限制
+    #[error("Worker 数量 {0} 超过最大限制 {1}")]
+    WorkerCountExceeded(usize, usize),
+
     /// Worker 池已满
     #[error("Worker 池已满，无法添加更多 worker（最大 {0} 个）")]
     WorkerPoolFull(usize),

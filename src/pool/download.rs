@@ -79,7 +79,7 @@ where
 #[async_trait]
 impl<C, F> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext> for DownloadWorkerExecutor<C, F>
 where
-    C: HttpClient + Send + Sync,
+    C: HttpClient,
     F: AsyncFile,
 {
     async fn execute(
@@ -184,7 +184,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         initial_worker_count: usize,
         writer: Arc<RangeWriter<F>>,
         config: Arc<crate::config::DownloadConfig>,
-    ) -> Self
+    ) -> Result<Self>
     where
         C: HttpClient + Clone + Send + Sync + 'static,
     {
@@ -210,16 +210,16 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
             .collect();
 
         // 创建通用协程池
-        let pool = WorkerPool::new(executor, contexts);
+        let pool = WorkerPool::new(executor, contexts)?;
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
-        Self {
+        Ok(Self {
             pool,
             global_stats,
             config,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// 动态添加新的 worker
@@ -421,7 +421,7 @@ mod tests {
 
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config);
+        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config).unwrap();
 
         assert_eq!(pool.worker_count(), 4);
     }
@@ -436,7 +436,7 @@ mod tests {
         let writer = Arc::new(writer);
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::<MockFile>::new(client, 2, writer, config);
+        let pool = DownloadWorkerPool::<MockFile>::new(client, 2, writer, config).unwrap();
 
         // 分配一个 range
         let range = allocator.allocate(10).unwrap();
@@ -462,7 +462,7 @@ mod tests {
 
         let worker_count = 3;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config);
+        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config).unwrap();
 
         // 初始统计应该都是 0
         let (total_bytes, total_secs, ranges) = pool.get_total_stats();
@@ -484,7 +484,7 @@ mod tests {
         let writer = Arc::new(writer);
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let mut pool = DownloadWorkerPool::<MockFile>::new(client.clone(), 2, writer, config);
+        let mut pool = DownloadWorkerPool::<MockFile>::new(client.clone(), 2, writer, config).unwrap();
 
         // 关闭 workers
         pool.shutdown().await;

@@ -93,7 +93,7 @@ use crate::{DownloadError, Result};
 /// - `Send`: 任务可以在线程间传递
 /// - `Clone`: 任务可以被克隆（用于重试等场景）
 /// - `Debug`: 任务可以被调试输出
-pub trait WorkerTask: Send + Clone + Debug {}
+pub trait WorkerTask: Send + Clone + Debug + 'static {}
 
 /// Worker 结果 trait
 ///
@@ -103,7 +103,7 @@ pub trait WorkerTask: Send + Clone + Debug {}
 ///
 /// - `Send`: 结果可以在线程间传递
 /// - `Debug`: 结果可以被调试输出
-pub trait WorkerResult: Send + Debug {}
+pub trait WorkerResult: Send + Debug + 'static {}
 
 /// Worker 上下文 trait
 ///
@@ -112,7 +112,7 @@ pub trait WorkerResult: Send + Debug {}
 /// # 要求
 ///
 /// - `Send + Sync`: 上下文可以在线程间安全共享
-pub trait WorkerContext: Send + Sync {}
+pub trait WorkerContext: Send + Sync + 'static {}
 
 /// Worker 执行器 trait
 ///
@@ -128,7 +128,7 @@ pub trait WorkerContext: Send + Sync {}
 ///
 /// - `Send + Sync`: 执行器可以在多个 worker 间共享
 #[async_trait]
-pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext>: Send + Sync {
+pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext>: Send + Sync + 'static {
     /// 执行任务
     ///
     /// # Arguments
@@ -256,9 +256,9 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext> {
 
 impl<T, R, C> WorkerPool<T, R, C>
 where
-    T: WorkerTask + 'static,
-    R: WorkerResult + 'static,
-    C: WorkerContext + 'static,
+    T: WorkerTask,
+    R: WorkerResult,
+    C: WorkerContext,
 {
     /// 创建新的协程池
     ///
@@ -278,19 +278,15 @@ where
     /// let contexts = vec![MyContext::new(); 4];
     /// let pool = WorkerPool::new(executor, contexts);
     /// ```
-    pub fn new<E>(executor: Arc<E>, contexts: Vec<C>) -> Self
+    pub fn new<E>(executor: Arc<E>, contexts: Vec<C>) -> Result<Self>
     where
-        E: WorkerExecutor<T, R, C> + 'static,
+        E: WorkerExecutor<T, R, C>,
     {
         let worker_count = contexts.len();
         
         // 验证 worker 数量不超过最大限制
         if worker_count > MAX_WORKER_COUNT {
-            panic!(
-                "Worker 数量 {} 超过最大限制 {}",
-                worker_count,
-                MAX_WORKER_COUNT
-            );
+            return Err(crate::DownloadError::WorkerCountExceeded(worker_count, MAX_WORKER_COUNT));
         }
         
         // 创建统一的 result channel（所有 worker 共享同一个 sender）
@@ -339,12 +335,12 @@ where
 
         info!("创建协程池，{} 个初始 workers", worker_count);
 
-        Self {
+        Ok(Self {
             workers,
             result_receiver,
             result_sender,
             executor: executor_trait_obj,
-        }
+        })
     }
 
     /// 动态添加新的 worker
@@ -653,7 +649,7 @@ mod tests {
             TestContext { processed_count: AtomicUsize::new(0) },
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let pool = WorkerPool::new(executor, contexts);
+        let pool = WorkerPool::new(executor, contexts).unwrap();
 
         assert_eq!(pool.worker_count(), 2);
     }
@@ -664,7 +660,7 @@ mod tests {
         let contexts = vec![
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let mut pool = WorkerPool::new(executor, contexts);
+        let mut pool = WorkerPool::new(executor, contexts).unwrap();
 
         let task = TestTask {
             id: 1,
@@ -693,7 +689,7 @@ mod tests {
         let contexts = vec![
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let mut pool = WorkerPool::new(executor, contexts);
+        let mut pool = WorkerPool::new(executor, contexts).unwrap();
 
         assert_eq!(pool.worker_count(), 1);
 
@@ -714,7 +710,7 @@ mod tests {
             TestContext { processed_count: AtomicUsize::new(0) },
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let mut pool = WorkerPool::new(executor, contexts);
+        let mut pool = WorkerPool::new(executor, contexts).unwrap();
 
         // 关闭 workers
         pool.shutdown().await;
@@ -732,7 +728,7 @@ mod tests {
             TestContext { processed_count: AtomicUsize::new(0) },
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let mut pool = WorkerPool::new(executor, contexts);
+        let mut pool = WorkerPool::new(executor, contexts).unwrap();
 
         // 发送任务
         let task = TestTask { id: 1, data: "test".to_string() };
@@ -754,7 +750,7 @@ mod tests {
             TestContext { processed_count: AtomicUsize::new(0) },
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let pool = WorkerPool::new(executor, contexts);
+        let pool = WorkerPool::new(executor, contexts).unwrap();
 
         // 验证初始 worker 数量
         assert_eq!(pool.worker_count(), 3);
@@ -787,7 +783,7 @@ mod tests {
             TestContext { processed_count: AtomicUsize::new(0) },
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let mut pool = WorkerPool::new(executor.clone(), contexts);
+        let mut pool = WorkerPool::new(executor.clone(), contexts).unwrap();
 
         // 验证初始状态
         assert_eq!(pool.worker_count(), 3);
@@ -825,7 +821,7 @@ mod tests {
         let contexts = vec![
             TestContext { processed_count: AtomicUsize::new(0) },
         ];
-        let pool = WorkerPool::new(executor, contexts);
+        let pool = WorkerPool::new(executor, contexts).unwrap();
 
         // 尝试关闭不存在的 worker
         let result = pool.shutdown_worker(5).await;

@@ -381,7 +381,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         url: String,
         total_size: u64,
         config: Arc<crate::config::DownloadConfig>,
-    ) -> Self {
+    ) -> Result<Self> {
         let total_worker_count = config.worker_count();
         
         // 根据配置的比例序列计算渐进式启动阶段
@@ -409,12 +409,12 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             initial_worker_count,
             Arc::clone(&writer),
             Arc::clone(&config),
-        );
+        )?;
         
         let task_allocator = TaskAllocator::new(allocator, url);
         let progress_reporter = ProgressReporter::new(progress_sender, total_size);
         
-        Self {
+        Ok(Self {
             client,
             pool,
             writer,
@@ -423,7 +423,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             config,
             worker_launch_stages,
             next_launch_stage: 1, // 第一批已启动，下一个是第二批（索引1）
-        }
+        })
     }
     
     
@@ -717,7 +717,7 @@ where
         url.to_string(),
         content_length,
         Arc::clone(&config),
-    );
+    )?;
     
     // 发送开始事件（使用第一个 worker 的初始分块大小）
     let current_worker_count = task.pool.worker_count();

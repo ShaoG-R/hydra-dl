@@ -62,7 +62,7 @@ pub type Result<T> = std::result::Result<T, IoError>;
 ///
 /// 抽象HTTP客户端的核心操作，支持GET和HEAD请求
 #[async_trait]
-pub trait HttpClient: Send + Sync {
+pub trait HttpClient: Send + Sync + 'static {
     /// HTTP响应类型
     type Response: HttpResponse;
 
