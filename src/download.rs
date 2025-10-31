@@ -617,8 +617,11 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             self.progress_reporter.send_error(msg).await;
         }
         
-        // 关闭 workers（发送关闭信号并等待所有 worker 退出）
-        self.pool.shutdown().await;
+        // 关闭 workers（发送关闭信号，workers 会异步自动清理）
+        self.pool.shutdown();
+        
+        // 等待所有 workers 完成自动清理
+        self.pool.wait_for_shutdown().await;
         
         if let Some(msg) = error_msg {
             return Err(DownloadError::Other(msg));
@@ -632,12 +635,13 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         // 发送完成统计
         self.progress_reporter.send_completion_stats(&self.pool).await;
         
-        // 优雅关闭所有 workers 并等待它们完全退出
+        // 优雅关闭所有 workers（发送关闭信号，workers 会异步自动清理）
         let mut pool = self.pool;
-        pool.shutdown().await;
+        pool.shutdown();
         
-        // shutdown() 会等待所有 worker 的 JoinHandle 完成，
-        // 确保所有对 executor（含 writer）的引用都已释放
+        // 等待所有 workers 完成自动清理
+        // 这确保所有对 executor（含 writer）的引用都已释放
+        pool.wait_for_shutdown().await;
         
         // 释放 pool（它持有 writer 的引用）
         drop(pool);

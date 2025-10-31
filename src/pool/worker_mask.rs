@@ -227,7 +227,6 @@ impl WorkerMask {
     
     /// 检查是否为空（所有槽位都空闲）
     #[inline]
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.mask.load(Ordering::Acquire) == 0
     }

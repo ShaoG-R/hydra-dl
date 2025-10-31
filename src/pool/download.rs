@@ -342,14 +342,26 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
 
     /// 优雅关闭所有 workers
     ///
-    /// 发送关闭信号到所有活跃的 worker，让它们停止接收新任务并退出
-    pub(crate) async fn shutdown(&mut self) {
-        self.pool.shutdown().await;
+    /// 发送关闭信号到所有活跃的 worker，让它们停止接收新任务并自动退出清理
+    /// 
+    /// # Note
+    ///
+    /// 此方法不会等待 workers 退出，workers 会异步自动清理
+    /// 使用 `wait_for_shutdown()` 方法等待所有 workers 完成清理
+    pub(crate) fn shutdown(&mut self) {
+        self.pool.shutdown();
+    }
+    
+    /// 等待所有 workers 完成清理
+    ///
+    /// 此方法会阻塞直到所有运行中的 workers 都完成了自动清理
+    pub(crate) async fn wait_for_shutdown(&self) {
+        self.pool.wait_for_shutdown().await;
     }
 
     /// 关闭指定的 worker
     ///
-    /// 发送关闭信号并等待 worker 完全退出后移除其资源
+    /// 清空 worker slot，导致 task_sender 被 drop，worker 会检测到 channel 关闭并自动退出清理
     ///
     /// # Arguments
     ///
@@ -358,9 +370,13 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     /// # Returns
     ///
     /// 成功时返回 `Ok(())`，如果 worker 不存在则返回 `Err(DownloadError::WorkerNotFound)`
+    ///
+    /// # Note
+    ///
+    /// 此方法不会等待 worker 退出，worker 会在检测到 channel 关闭后异步自动清理
     #[allow(dead_code)]
-    pub(crate) async fn shutdown_worker(&self, worker_id: usize) -> Result<()> {
-        self.pool.shutdown_worker(worker_id).await
+    pub(crate) fn shutdown_worker(&self, worker_id: usize) -> Result<()> {
+        self.pool.shutdown_worker(worker_id)
     }
 
     /// 获取所有活跃 worker 的统计快照
@@ -487,7 +503,10 @@ mod tests {
         let mut pool = DownloadWorkerPool::<MockFile>::new(client.clone(), 2, writer, config).unwrap();
 
         // 关闭 workers
-        pool.shutdown().await;
+        pool.shutdown();
+
+        // 等待 workers 完成清理（使用事件通知，非轮询）
+        pool.wait_for_shutdown().await;
 
         // 验证所有 worker 都已被移除（slot 为 None）
         for worker_slot in pool.pool.workers.iter() {

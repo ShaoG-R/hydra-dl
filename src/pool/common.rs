@@ -74,12 +74,11 @@
 
 use async_trait::async_trait;
 use arc_swap::ArcSwap;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::sync::Notify;
 
 use crate::config::MAX_WORKER_COUNT;
 use crate::{DownloadError, Result};
@@ -148,8 +147,7 @@ pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext>: Send
 ///
 /// 每个 worker 持有一个独立的 channel receiver，循环等待任务
 /// 通过 executor 处理任务，并将结果发送到统一的 result channel
-/// 支持通过 oneshot channel 接收高优先级关闭信号
-/// 当 channel 关闭或收到关闭信号时退出
+/// 当 task channel 关闭时自动退出
 ///
 /// # 泛型参数
 ///
@@ -162,7 +160,6 @@ pub(crate) async fn run_worker<T, R, C, E>(
     executor: Arc<E>,
     mut task_receiver: Receiver<T>,
     result_sender: Sender<R>,
-    mut shutdown_receiver: oneshot::Receiver<()>,
     context: Arc<C>,
 )
 where
@@ -173,35 +170,24 @@ where
 {
     info!("Worker #{} 启动", id);
 
-    // 循环接收并处理任务，同时监听关闭信号
+    // 循环接收并处理任务
     loop {
-        tokio::select! {
-            // 高优先级：关闭信号（使用 biased 确保优先处理）
-            _ = &mut shutdown_receiver => {
-                info!("Worker #{} 收到关闭信号，准备退出", id);
-                break;
-            }
+        match task_receiver.recv().await {
+            Some(task) => {
+                debug!("Worker #{} 接收到任务: {:?}", id, task);
 
-            // 正常任务处理
-            task = task_receiver.recv() => {
-                match task {
-                    Some(task) => {
-                        debug!("Worker #{} 接收到任务: {:?}", id, task);
+                // 执行任务
+                let result = executor.execute(id, task, &context).await;
 
-                        // 执行任务
-                        let result = executor.execute(id, task, &context).await;
-
-                        // 发送结果
-                        if let Err(e) = result_sender.send(result).await {
-                            error!("Worker #{} 发送结果失败: {:?}", id, e);
-                        }
-                    }
-                    None => {
-                        // task channel 关闭，正常退出
-                        info!("Worker #{} 任务通道关闭，退出", id);
-                        break;
-                    }
+                // 发送结果
+                if let Err(e) = result_sender.send(result).await {
+                    error!("Worker #{} 发送结果失败: {:?}", id, e);
                 }
+            }
+            None => {
+                // task channel 关闭，正常退出
+                info!("Worker #{} 任务通道关闭，退出", id);
+                break;
             }
         }
     }
@@ -215,12 +201,47 @@ where
 pub struct WorkerSlot<T: WorkerTask, C: WorkerContext> {
     /// 向 worker 发送任务的通道
     pub(crate) task_sender: Sender<T>,
-    /// 向 worker 发送关闭信号的 oneshot channel
-    pub(crate) shutdown_sender: Option<oneshot::Sender<()>>,
     /// 该 worker 的独立上下文（Arc 包装以便在 worker 协程中共享）
     pub(crate) context: Arc<C>,
-    /// Worker 协程的句柄
-    pub(crate) handle: JoinHandle<()>,
+}
+
+/// Worker 自动清理器
+/// 
+/// 封装 worker 退出时的资源清理逻辑
+pub(crate) struct WorkerCleanup<T: WorkerTask, C: WorkerContext> {
+    /// Worker ID
+    worker_id: usize,
+    /// 该 worker 的 slot 引用（而非整个 workers 数组）
+    slot: Arc<ArcSwap<Option<WorkerSlot<T, C>>>>,
+    /// Worker 槽位空闲位掩码
+    free_mask: Arc<WorkerMask>,
+    /// Worker 全部退出通知器
+    shutdown_notify: Arc<Notify>,
+}
+
+impl<T: WorkerTask, C: WorkerContext> WorkerCleanup<T, C> {
+    /// 执行清理逻辑
+    pub(crate) fn cleanup(self) {
+        let worker_id = self.worker_id;
+        info!("Worker #{} 开始自动清理资源", worker_id);
+        
+        // 清空自己的 slot
+        self.slot.swap(Arc::new(None));
+        
+        // 释放位掩码
+        if let Err(e) = self.free_mask.free(worker_id) {
+            error!("Worker #{} 释放位掩码失败: {:?}", worker_id, e);
+        } else {
+            // 检查是否所有 worker 都已退出
+            if self.free_mask.is_empty() {
+                info!("所有 workers 已完成清理");
+                self.shutdown_notify.notify_waiters();
+            } else {
+                debug!("Worker #{} 资源清理完成，剩余 {} 个运行中的 workers", 
+                    worker_id, self.free_mask.count());
+            }
+        }
+    }
 }
 
 /// 通用 Worker 协程池
@@ -239,14 +260,14 @@ pub struct WorkerSlot<T: WorkerTask, C: WorkerContext> {
 /// - 发送任务到指定 worker
 /// - 接收结果（统一 result channel）
 /// - 动态添加 worker
-/// - 优雅关闭（oneshot channel）
 /// - 访问 worker 上下文
-/// - 关闭单个 worker
+/// - Worker 自动清理（退出时自动释放资源）
 pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext> {
     /// Worker 槽位数组（索引即为 worker_id，None 表示该位置空闲）
     /// 使用固定大小数组和 ArcSwap 实现无锁并发访问
     /// ArcSwap<T> = ArcSwapAny<Arc<T>>，所以这里是 Arc<Option<WorkerSlot>>
-    pub(crate) workers: [ArcSwap<Option<WorkerSlot<T, C>>>; MAX_WORKER_COUNT],
+    /// 外层 Arc 允许在 tokio::spawn 闭包中访问（worker 自动清理需要）
+    pub(crate) workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; MAX_WORKER_COUNT],
     /// 统一的结果接收器（所有 worker 共享）
     result_receiver: Receiver<R>,
     /// 结果发送器的克隆（用于创建新 worker）
@@ -254,8 +275,10 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext> {
     /// 执行器（所有 worker 共享）
     pub(crate) executor: Arc<dyn WorkerExecutor<T, R, C>>,
     /// Worker 槽位空闲位掩码（1 表示已占用，0 表示空闲）
-    /// 用于快速查找空闲槽位
+    /// 用于快速查找空闲槽位和判断是否所有 worker 都已退出
     free_mask: Arc<WorkerMask>,
+    /// Worker 全部退出通知器
+    shutdown_notify: Arc<Notify>,
 }
 
 impl<T, R, C> WorkerPool<T, R, C>
@@ -299,13 +322,19 @@ where
         // 将具体类型的 executor 转换为 trait object
         let executor_trait_obj: Arc<dyn WorkerExecutor<T, R, C>> = executor;
         
-        // 预先创建所有 worker slots
-        let mut worker_slots: Vec<Option<WorkerSlot<T, C>>> = Vec::with_capacity(worker_count);
+        // 初始化空闲位掩码
+        let free_mask = Arc::new(WorkerMask::new(worker_count)?);
         
-        // 为每个 worker 创建独立的 task channel、shutdown channel 和上下文
+        // 初始化通知器
+        let shutdown_notify = Arc::new(Notify::new());
+        
+        // 使用 array::from_fn 初始化固定大小数组（暂时全部为 None）
+        let workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; MAX_WORKER_COUNT] = 
+            std::array::from_fn(|_| Arc::new(ArcSwap::new(Arc::new(None))));
+        
+        // 为每个 worker 创建独立的 task channel 和上下文，并启动协程
         for (id, context) in contexts.into_iter().enumerate() {
             let (task_sender, task_receiver) = mpsc::channel::<T>(100);
-            let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
             
             // 将上下文包装在 Arc 中
             let context_arc = Arc::new(context);
@@ -315,30 +344,31 @@ where
             let result_sender_clone = result_sender.clone();
             let context_for_worker = Arc::clone(&context_arc);
             
-            // 启动 worker 协程
-            let handle = tokio::spawn(async move {
-                run_worker(id, executor_clone, task_receiver, result_sender_clone, shutdown_receiver, context_for_worker).await;
-            });
-
-            worker_slots.push(Some(WorkerSlot {
+            // 先创建 WorkerSlot 并存入 workers 数组
+            let slot = WorkerSlot {
                 task_sender,
-                shutdown_sender: Some(shutdown_sender),
                 context: context_arc,
-                handle,
-            }));
+            };
+            workers[id].store(Arc::new(Some(slot)));
+            
+            // 创建清理器（只持有单个 slot 的引用）
+            let slot_ref = Arc::clone(&workers[id]);
+            let cleanup = WorkerCleanup {
+                worker_id: id,
+                slot: slot_ref,
+                free_mask: Arc::clone(&free_mask),
+                shutdown_notify: Arc::clone(&shutdown_notify),
+            };
+            
+            // 启动 worker 协程（包含自动清理逻辑）
+            tokio::spawn(async move {
+                // 执行 worker 主循环
+                run_worker(id, executor_clone, task_receiver, result_sender_clone, context_for_worker).await;
+                
+                // worker 退出后自动清理
+                cleanup.cleanup();
+            });
         }
-
-        // 使用 array::from_fn 初始化固定大小数组
-        let workers = std::array::from_fn(|i| {
-            if i < worker_count {
-                ArcSwap::new(Arc::new(worker_slots[i].take()))
-            } else {
-                ArcSwap::new(Arc::new(None))
-            }
-        });
-
-        // 初始化空闲位掩码
-        let free_mask = Arc::new(WorkerMask::new(worker_count)?);
         
         info!("创建协程池，{} 个初始 workers", worker_count);
 
@@ -348,6 +378,7 @@ where
             result_sender,
             executor: executor_trait_obj,
             free_mask,
+            shutdown_notify,
         })
     }
 
@@ -380,7 +411,6 @@ where
             let worker_id = self.free_mask.allocate()?;
             
             let (task_sender, task_receiver) = mpsc::channel::<T>(100);
-            let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
             
             // 将上下文包装在 Arc 中
             let context_arc = Arc::new(context);
@@ -390,21 +420,30 @@ where
             let result_sender_clone = self.result_sender.clone();
             let context_for_worker = Arc::clone(&context_arc);
             
-            // 启动 worker 协程
-            let handle = tokio::spawn(async move {
-                run_worker(worker_id, executor_clone, task_receiver, result_sender_clone, shutdown_receiver, context_for_worker).await;
-            });
-            
-            // 将新 worker 放入找到的位置
-            // ArcSwap::store 会自动包装成 Arc
+            // 创建 WorkerSlot 并存入 workers 数组
             let new_slot = Some(WorkerSlot {
                 task_sender,
-                shutdown_sender: Some(shutdown_sender),
                 context: context_arc,
-                handle,
             });
-            
             self.workers[worker_id].store(Arc::new(new_slot));
+            
+            // 创建清理器（只持有单个 slot 的引用）
+            let slot_ref = Arc::clone(&self.workers[worker_id]);
+            let cleanup = WorkerCleanup {
+                worker_id,
+                slot: slot_ref,
+                free_mask: Arc::clone(&self.free_mask),
+                shutdown_notify: Arc::clone(&self.shutdown_notify),
+            };
+            
+            // 启动 worker 协程（包含自动清理逻辑）
+            tokio::spawn(async move {
+                // 执行 worker 主循环
+                run_worker(worker_id, executor_clone, task_receiver, result_sender_clone, context_for_worker).await;
+                
+                // worker 退出后自动清理
+                cleanup.cleanup();
+            });
             
             debug!("新 worker 添加到位置 #{}", worker_id);
         }
@@ -416,7 +455,7 @@ where
     
     /// 关闭指定的 worker
     ///
-    /// 发送关闭信号并等待 worker 完全退出后移除其资源
+    /// 清空 worker slot，导致 task_sender 被 drop，worker 会检测到 channel 关闭并自动退出清理
     ///
     /// # Arguments
     ///
@@ -431,8 +470,12 @@ where
     /// ```ignore
     /// pool.shutdown_worker(0).await?;
     /// ```
+    ///
+    /// # Note
+    ///
+    /// 此方法不会等待 worker 退出，worker 会在检测到 channel 关闭后异步自动清理
     #[allow(dead_code)]
-    pub async fn shutdown_worker(&self, worker_id: usize) -> Result<()> {
+    pub fn shutdown_worker(&self, worker_id: usize) -> Result<()> {
         info!("开始关闭 Worker #{}", worker_id);
         
         // 检查 worker_id 是否在范围内
@@ -441,33 +484,15 @@ where
         }
         
         // 原子性地取出 worker slot（swap 为 None）
+        // 这会导致 task_sender 被 drop，worker 会检测到 channel 关闭
         let old_slot_arc = self.workers[worker_id].swap(Arc::new(None));
         
-        // 拆包 Arc: Arc<Option<WorkerSlot>> -> Option<WorkerSlot>
-        let slot_option = Arc::try_unwrap(old_slot_arc)
-            .map_err(|_| crate::DownloadError::WorkerNotFound(worker_id))?;
-        
-        let mut slot = slot_option
-            .ok_or(crate::DownloadError::WorkerNotFound(worker_id))?;
-        
-        // 发送关闭信号
-        if let Some(shutdown_sender) = slot.shutdown_sender.take() {
-            let _ = shutdown_sender.send(());
-            debug!("已发送关闭信号到 Worker #{}", worker_id);
+        // 检查 worker 是否存在
+        if old_slot_arc.is_none() {
+            return Err(crate::DownloadError::WorkerNotFound(worker_id));
         }
         
-        // 等待 worker 退出
-        if let Err(e) = slot.handle.await {
-            error!("Worker #{} 退出失败: {:?}", worker_id, e);
-            // 即使退出失败，也要释放位掩码
-            let _ = self.free_mask.free(worker_id);
-            return Err(crate::DownloadError::WorkerExit(worker_id));
-        }
-        
-        // 释放位掩码中的槽位
-        self.free_mask.free(worker_id)?;
-        
-        info!("Worker #{} 已成功关闭并移除", worker_id);
+        info!("Worker #{} 关闭信号已发送（task_sender 已 drop），worker 将自动退出并清理", worker_id);
         Ok(())
     }
     
@@ -541,76 +566,52 @@ where
 
     /// 优雅关闭所有 workers
     ///
-    /// 发送关闭信号到所有活跃的 worker，让它们停止接收新任务并退出
+    /// 清空所有 worker slots，导致所有 task_sender 被 drop
+    /// Workers 会检测到 channel 关闭并自动退出清理
     /// 
-    /// 注意：由于 WorkerSlot 在 Arc 中，我们通过 swap 来取出所有权
-    /// 这会清空所有 worker 槽位
-    /// 优雅关闭所有 workers
+    /// # Note
     ///
-    /// 发送关闭信号到所有活跃的 worker，让它们停止接收新任务并退出
-    /// 
-    /// 注意：由于 WorkerSlot 在 Arc 中，我们通过 swap 来取出所有权
-    /// 这会清空所有 worker 槽位
-    pub async fn shutdown(&mut self) {
+    /// 此方法不会等待 workers 退出，workers 会异步自动清理
+    /// 使用 `wait_for_shutdown()` 方法等待所有 workers 完成清理
+    pub fn shutdown(&mut self) {
         info!("发送关闭信号到所有活跃 workers");
         
-        // 收集所有需要等待的 JoinHandle
-        let mut handles = Vec::new();
+        let mut closed_count = 0;
         
         for (id, _worker) in self.workers.iter().enumerate() {
-            // 直接 swap 取出 worker slot，不要提前 load（避免增加引用计数）
+            // 直接 swap 取出 worker slot（这会导致 task_sender 被 drop）
             let old_slot_arc = self.workers[id].swap(Arc::new(None));
             
             // 检查是否为 Some
             if old_slot_arc.is_some() {
-                debug!("Worker #{} 存在，准备关闭", id);
-                
-                // 检查 Arc 引用计数
-                let ref_count = Arc::strong_count(&old_slot_arc);
-                debug!("Worker #{} slot Arc 引用计数: {}", id, ref_count);
-                
-                // 尝试拆包 Arc<Option<WorkerSlot>>
-                match Arc::try_unwrap(old_slot_arc) {
-                    Ok(slot_option) => {
-                        debug!("Worker #{} Arc unwrap 成功", id);
-                        if let Some(mut worker_slot) = slot_option {
-                            if let Some(shutdown_sender) = worker_slot.shutdown_sender.take() {
-                                // 忽略发送失败（worker 可能已经退出）
-                                let _ = shutdown_sender.send(());
-                                debug!("已发送关闭信号到 Worker #{}", id);
-                            }
-                            // 收集 JoinHandle 以便后续等待
-                            handles.push((id, worker_slot.handle));
-                        }
-                    }
-                    Err(arc) => {
-                        let remaining_refs = Arc::strong_count(&arc);
-                        warn!("Worker #{} Arc unwrap 失败，剩余引用计数: {}", id, remaining_refs);
-                    }
-                }
+                debug!("Worker #{} 关闭信号已发送（task_sender 已 drop）", id);
+                closed_count += 1;
             }
         }
         
-        // 等待所有 worker 协程退出
-        info!("等待 {} 个 workers 退出", handles.len());
-        for (id, handle) in handles {
-            debug!("等待 Worker #{} 退出...", id);
-            match handle.await {
-                Ok(_) => {
-                    debug!("Worker #{} 已退出", id);
-                    // 释放位掩码中的槽位
-                    if let Err(e) = self.free_mask.free(id) {
-                        error!("释放 Worker #{} 位掩码失败: {:?}", id, e);
-                    }
-                }
-                Err(e) => {
-                    error!("Worker #{} 退出时出错: {:?}", id, e);
-                    // 即使退出失败也要尝试释放位掩码
-                    let _ = self.free_mask.free(id);
-                }
-            }
+        info!("已向 {} 个 workers 发送关闭信号，它们将自动退出并清理", closed_count);
+    }
+    
+    /// 等待所有 workers 完成清理
+    ///
+    /// 此方法会阻塞直到所有运行中的 workers 都完成了自动清理
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// pool.shutdown();
+    /// pool.wait_for_shutdown().await;
+    /// ```
+    pub async fn wait_for_shutdown(&self) {
+        // 如果已经没有运行中的 worker，直接返回
+        if self.free_mask.is_empty() {
+            debug!("没有运行中的 workers，无需等待");
+            return;
         }
-        info!("所有 workers 已退出")
+        
+        info!("等待所有 workers 完成清理...");
+        self.shutdown_notify.notified().await;
+        info!("所有 workers 已完成清理");
     }
 }
 
@@ -732,7 +733,10 @@ mod tests {
         let mut pool = WorkerPool::new(executor, contexts).unwrap();
 
         // 关闭 workers
-        pool.shutdown().await;
+        pool.shutdown();
+
+        // 等待 workers 完成清理（使用事件通知，非轮询）
+        pool.wait_for_shutdown().await;
 
         // 验证所有 worker 都已被移除（slot 为 None）
         for worker_slot in pool.workers.iter() {
@@ -775,7 +779,10 @@ mod tests {
         assert_eq!(pool.worker_count(), 3);
 
         // 关闭 worker #1
-        pool.shutdown_worker(1).await.unwrap();
+        pool.shutdown_worker(1).unwrap();
+
+        // 等待 worker 异步清理完成（使用小的 sleep 因为单个 worker 很快）
+        sleep(Duration::from_millis(50)).await;
 
         // 验证 worker 数量减少
         assert_eq!(pool.worker_count(), 2);
@@ -808,11 +815,15 @@ mod tests {
         assert_eq!(pool.worker_count(), 3);
 
         // 关闭 worker #1
-        pool.shutdown_worker(1).await.unwrap();
+        pool.shutdown_worker(1).unwrap();
+        // 等待异步清理（单个 worker 快速清理）
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(pool.worker_count(), 2);
 
         // 关闭 worker #0
-        pool.shutdown_worker(0).await.unwrap();
+        pool.shutdown_worker(0).unwrap();
+        // 等待异步清理
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(pool.worker_count(), 1);
 
         // 添加 2 个新 worker，应该填充到 #0 和 #1
@@ -842,8 +853,8 @@ mod tests {
         ];
         let pool = WorkerPool::new(executor, contexts).unwrap();
 
-        // 尝试关闭不存在的 worker
-        let result = pool.shutdown_worker(5).await;
+        // 尝试关闭不存在的 worker（不再是 async）
+        let result = pool.shutdown_worker(5);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), crate::DownloadError::WorkerNotFound(5)));
     }
