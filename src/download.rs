@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use kestrel_protocol_timer::{TimerService, TaskId};
+use kestrel_timer::{TimerService, TaskId};
 use crate::pool::download::DownloadWorkerPool;
 use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::utils::range_writer::{RangeAllocator, RangeWriter, AllocatedRange};
@@ -122,7 +122,7 @@ impl DownloadHandle {
     /// 
     /// ```no_run
     /// # use hydra_dl::{download_ranged, DownloadProgress, DownloadConfig};
-    /// # use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
+    /// # use kestrel_timer::{TimerWheel, ServiceConfig};
     /// # use std::path::PathBuf;
     /// # #[tokio::main]
     /// # async fn main() {
@@ -850,7 +850,7 @@ mod tests {
     use reqwest::{header::HeaderMap, StatusCode};
     use bytes::Bytes;
     use std::path::PathBuf;
-    use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
+    use kestrel_timer::{TimerWheel, ServiceConfig};
 
     fn create_timer_service() -> (TimerWheel, TimerService) {
         let timer = TimerWheel::with_defaults();

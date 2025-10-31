@@ -4,7 +4,7 @@ use crate::{download_ranged, DownloadConfig};
 use super::{Cli, Result};
 use super::progress::ProgressManager;
 use super::utils::format_bytes;
-use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
+use kestrel_timer::{TimerWheel, ServiceConfig};
 
 /// 执行下载任务
 ///

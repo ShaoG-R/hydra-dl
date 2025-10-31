@@ -500,7 +500,7 @@ dependencies = [
  "env_logger",
  "futures",
  "indicatif",
- "kestrel-protocol-timer",
+ "kestrel-timer",
  "log",
  "parking_lot",
  "reqwest",
@@ -780,15 +780,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "kestrel-protocol-timer"
-version = "0.1.11"
+name = "kestrel-timer"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e07de9a46bdd9e0afe7cbaf8df4a3fe52a2865b1d23c7ec4a26d5caa57e62991"
+checksum = "e672d801a9c4d21ce44599c5f2962aeccef9af44bbcd84287bff17e190a6ecce"
 dependencies = [
  "futures",
  "parking_lot",
  "rustc-hash",
- "smallvec",
  "tokio",
 ]
 
@@ -1418,6 +1417,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "socket2",
  "tokio-macros",

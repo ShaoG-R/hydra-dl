@@ -5,7 +5,7 @@
 use crate::{Result, DownloadError};
 use crate::utils::range_writer::{AllocatedRange, RangeAllocator};
 use crate::task::WorkerTask;
-use kestrel_protocol_timer::{TimerService, TaskId};
+use kestrel_timer::{TimerService, TaskId};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use log::{debug, error};
@@ -247,7 +247,7 @@ impl TaskAllocator {
 mod tests {
     use super::*;
     use crate::utils::range_writer::RangeAllocator;
-    use kestrel_protocol_timer::{TimerWheel, ServiceConfig};
+    use kestrel_timer::{TimerWheel, ServiceConfig};
 
     #[test]
     fn test_task_allocator_basic() {
