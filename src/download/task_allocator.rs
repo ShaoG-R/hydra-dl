@@ -247,7 +247,7 @@ impl TaskAllocator {
 mod tests {
     use super::*;
     use crate::utils::range_writer::RangeAllocator;
-    use kestrel_timer::{TimerWheel, ServiceConfig};
+    use kestrel_timer::{TimerWheel, config::ServiceConfig};
 
     #[test]
     fn test_task_allocator_basic() {

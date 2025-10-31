@@ -33,7 +33,7 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use hydra_dl::{DownloadConfig, DownloadProgress};
-//! use kestrel_timer::{TimerWheel, ServiceConfig};
+//! use kestrel_timer::{TimerWheel, config::ServiceConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), hydra_dl::DownloadError> {
@@ -87,7 +87,7 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use hydra_dl::{DownloadConfig, DownloadProgress};
-//! use kestrel_timer::{TimerWheel, ServiceConfig};
+//! use kestrel_timer::{TimerWheel, config::ServiceConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), hydra_dl::DownloadError> {
@@ -171,7 +171,7 @@ pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStat
 pub use task::FileTask;
 pub use utils::fetch::{fetch_file_metadata, FileMetadata};
 pub mod timer {
-    pub use kestrel_timer::{TimerWheel, TimerService, ServiceConfig};
+    pub use kestrel_timer::{TimerWheel, TimerService, config::ServiceConfig};
 }
 
 use std::path::Path;

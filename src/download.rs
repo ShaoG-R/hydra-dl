@@ -122,7 +122,7 @@ impl DownloadHandle {
     /// 
     /// ```no_run
     /// # use hydra_dl::{download_ranged, DownloadProgress, DownloadConfig};
-    /// # use kestrel_timer::{TimerWheel, ServiceConfig};
+    /// # use kestrel_timer::{TimerWheel, config::ServiceConfig};
     /// # use std::path::PathBuf;
     /// # #[tokio::main]
     /// # async fn main() {
@@ -850,7 +850,7 @@ mod tests {
     use reqwest::{header::HeaderMap, StatusCode};
     use bytes::Bytes;
     use std::path::PathBuf;
-    use kestrel_timer::{TimerWheel, ServiceConfig};
+    use kestrel_timer::{TimerWheel, config::ServiceConfig};
 
     fn create_timer_service() -> (TimerWheel, TimerService) {
         let timer = TimerWheel::with_defaults();
