@@ -1,5 +1,6 @@
 use crate::{DownloadError, Result};
 use log::{debug, error, info, warn};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -174,14 +175,14 @@ type FailedRange = (AllocatedRange, String);
 
 /// 任务分配器
 /// 
-/// 负责管理任务分配和 worker 轮询选择
+/// 负责管理任务分配和空闲 worker 队列
 struct TaskAllocator {
     /// Range 分配器
     allocator: RangeAllocator,
     /// 下载 URL
     url: String,
-    /// 下一个要分配任务的 worker ID（轮询）
-    next_worker_id: usize,
+    /// 空闲 worker ID 队列
+    idle_workers: VecDeque<usize>,
 }
 
 impl TaskAllocator {
@@ -193,27 +194,27 @@ impl TaskAllocator {
         Self {
             allocator,
             url,
-            next_worker_id: 0,
+            idle_workers: VecDeque::new(),
         }
     }
     
-    /// 尝试分配下一个任务
+    /// 尝试为空闲 worker 分配任务
     /// 
     /// # Arguments
     /// 
     /// * `chunk_size` - 要分配的分块大小
-    /// * `current_worker_count` - 当前实际的 worker 数量
     /// 
     /// # Returns
     /// 
-    /// 返回 (任务, worker_id)，如果没有剩余空间则返回 None
-    fn try_allocate_next_task(&mut self, chunk_size: u64, current_worker_count: usize) -> Option<(WorkerTask, usize)> {
-        if current_worker_count == 0 {
-            return None;
-        }
+    /// 返回 (任务, worker_id)，如果没有空闲 worker 或没有剩余空间则返回 None
+    fn try_allocate_task_to_idle_worker(&mut self, chunk_size: u64) -> Option<(WorkerTask, usize)> {
+        // 从队列中获取空闲 worker
+        let worker_id = self.idle_workers.pop_front()?;
         
         let remaining = self.allocator.remaining();
         if remaining == 0 {
+            // 没有剩余任务，将 worker 放回队列
+            self.idle_workers.push_back(worker_id);
             return None;
         }
         
@@ -229,16 +230,21 @@ impl TaskAllocator {
             range,
         };
         
-        // 轮询选择 worker（使用当前实际的 worker 数量）
-        let worker_id = self.next_worker_id;
-        self.next_worker_id = (self.next_worker_id + 1) % current_worker_count;
-        
         Some((task, worker_id))
     }
     
     /// 获取剩余待分配的字节数
     fn remaining(&self) -> u64 {
         self.allocator.remaining()
+    }
+    
+    /// 标记 worker 为空闲状态
+    /// 
+    /// # Arguments
+    /// 
+    /// * `worker_id` - 要标记为空闲的 worker ID
+    fn mark_worker_idle(&mut self, worker_id: usize) {
+        self.idle_workers.push_back(worker_id);
     }
 }
 
@@ -411,8 +417,13 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             Arc::clone(&config),
         )?;
         
-        let task_allocator = TaskAllocator::new(allocator, url);
+        let mut task_allocator = TaskAllocator::new(allocator, url);
         let progress_reporter = ProgressReporter::new(progress_sender, total_size);
+        
+        // 将第一批 workers 加入空闲队列
+        for worker_id in 0..initial_worker_count {
+            task_allocator.mark_worker_idle(worker_id);
+        }
         
         Ok(Self {
             client,
@@ -437,23 +448,27 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         let mut progress_timer = tokio::time::interval(self.config.instant_speed_window());
         progress_timer.tick().await; // 跳过首次立即触发
         
-        // 初始任务分配：为第一批 worker 分配任务
+        // 初始任务分配：从空闲队列中取出 worker 并分配任务
         let current_worker_count = self.pool.worker_count();
         info!(
             "渐进式启动 - 第1批: 已启动 {} 个 workers",
             current_worker_count
         );
         
-        for worker_id in 0..current_worker_count {
+        // 尝试为所有空闲 worker 分配初始任务
+        while let Some(&worker_id) = self.task_allocator.idle_workers.front() {
             let chunk_size = self.pool.get_worker_chunk_size(worker_id)
                 .unwrap_or(self.config.initial_chunk_size());
-            if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
-                info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
-                if let Err(e) = self.pool.send_task(task, worker_id).await {
+            
+            if let Some((task, assigned_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+                info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", assigned_worker, chunk_size);
+                if let Err(e) = self.pool.send_task(task, assigned_worker).await {
                     error!("初始任务分配失败: {:?}", e);
+                    // 失败了，将 worker 放回队列
+                    self.task_allocator.mark_worker_idle(assigned_worker);
                 }
             } else {
-                info!("没有足够的数据为第一批 worker 分配初始任务");
+                info!("没有足够的数据为空闲 workers 分配更多任务");
                 break;
             }
         }
@@ -503,15 +518,20 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                                     error!("添加新 workers 失败: {:?}", e);
                                     // 继续执行，不影响已启动的 worker
                                 } else {
-                                    // 为新启动的worker分配任务
-                                    let updated_worker_count = self.pool.worker_count();
+                                    // 为新启动的worker加入队列并分配任务
                                     for worker_id in current_worker_count..next_target {
+                                        // 将新 worker 加入空闲队列
+                                        self.task_allocator.mark_worker_idle(worker_id);
+                                        
                                         let chunk_size = self.pool.get_worker_chunk_size(worker_id)
                                             .unwrap_or(self.config.initial_chunk_size());
-                                        if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size, updated_worker_count) {
-                                            info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", worker_id, chunk_size);
-                                            if let Err(e) = self.pool.send_task(task, worker_id).await {
+                                        
+                                        if let Some((task, assigned_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+                                            info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", assigned_worker, chunk_size);
+                                            if let Err(e) = self.pool.send_task(task, assigned_worker).await {
                                                 error!("为新 worker 分配任务失败: {:?}", e);
+                                                // 失败了，将 worker 放回队列
+                                                self.task_allocator.mark_worker_idle(assigned_worker);
                                             }
                                         } else {
                                             debug!("没有足够的数据为新 worker #{} 分配任务", worker_id);
@@ -539,19 +559,23 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                         Some(RangeResult::Complete { worker_id }) => {
                             self.progress_reporter.record_range_complete();
                             
+                            // 将完成的 worker 标记为空闲
+                            self.task_allocator.mark_worker_idle(worker_id);
+                            
                             // 根据该 worker 的实时速度计算新的分块大小
                             let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
                                 .unwrap_or(self.config.initial_chunk_size());
                             
-                            // 为该 worker 分配新任务（使用计算得到的分块大小）
-                            let current_worker_count = self.pool.worker_count();
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
+                            // 尝试为空闲 worker 分配新任务
+                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
                                 debug!(
-                                    "Worker #{} 完成任务，分配新任务到 Worker #{}，分块大小 {} bytes",
+                                    "Worker #{} 完成任务，分配新任务到空闲 Worker #{}，分块大小 {} bytes",
                                     worker_id, target_worker, chunk_size
                                 );
                                 if let Err(e) = self.pool.send_task(task, target_worker).await {
                                     error!("分配新任务失败: {:?}", e);
+                                    // 失败了，将 worker 放回队列
+                                    self.task_allocator.mark_worker_idle(target_worker);
                                 }
                             } else {
                                 debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
@@ -568,17 +592,22 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                             failed_ranges.push((range, error));
                             self.progress_reporter.record_range_complete();
                             
+                            // 将失败的 worker 标记为空闲
+                            self.task_allocator.mark_worker_idle(worker_id);
+                            
                             // 失败后也需要分配新任务（使用该 worker 的分块大小）
                             let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
                                 .unwrap_or(self.config.initial_chunk_size());
-                            let current_worker_count = self.pool.worker_count();
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
+                            
+                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
                                 debug!(
-                                    "Worker #{} 任务失败，分配新任务到 Worker #{}，分块大小 {} bytes",
+                                    "Worker #{} 任务失败，分配新任务到空闲 Worker #{}，分块大小 {} bytes",
                                     worker_id, target_worker, chunk_size
                                 );
                                 if let Err(e) = self.pool.send_task(task, target_worker).await {
                                     error!("分配新任务失败: {:?}", e);
+                                    // 失败了，将 worker 放回队列
+                                    self.task_allocator.mark_worker_idle(target_worker);
                                 }
                             } else {
                                 debug!("Worker #{} 任务失败，但没有更多任务可分配", worker_id);
