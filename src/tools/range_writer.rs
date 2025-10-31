@@ -236,36 +236,36 @@ impl RangeAllocator {
 /// 
 /// 通过已写入字节数与文件总大小比较来判断完成状态
 /// 
-    /// # Example
-    /// 
-    /// ```no_run
-    /// # use rs_dn::tools::range_writer::RangeWriter;
-    /// # use rs_dn::tools::io_traits::TokioFileSystem;
-    /// # use std::path::PathBuf;
-    /// # use bytes::Bytes;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let fs = TokioFileSystem::default();
-    /// let (writer, mut allocator) = RangeWriter::new(
-    ///     &fs,
-    ///     PathBuf::from("output.dat"),
-    ///     1000  // 总大小 1000 bytes
-    /// ).await?;
-    ///
-    /// // 使用 allocator 分配 Range（保证不重叠且有效）
-    /// let range1 = allocator.allocate(100).unwrap();
-    /// writer.write_range(range1, Bytes::from(vec![1; 100])).await?;
-    ///
-    /// let range2 = allocator.allocate(100).unwrap();
-    /// writer.write_range(range2, Bytes::from(vec![2; 100])).await?;
-    ///
-    /// // 当所有字节都写入后，自动判断完成
-    /// if writer.is_complete() {
-    ///     writer.finalize().await?;
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+/// # Example
+/// 
+/// ```no_run
+/// # use rs_dn::tools::range_writer::RangeWriter;
+/// # use rs_dn::tools::io_traits::TokioFileSystem;
+/// # use std::path::PathBuf;
+/// # use bytes::Bytes;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let fs = TokioFileSystem::default();
+/// let (writer, mut allocator) = RangeWriter::new(
+///     &fs,
+///     PathBuf::from("output.dat"),
+///     1000  // 总大小 1000 bytes
+/// ).await?;
+///
+/// // 使用 allocator 分配 Range（保证不重叠且有效）
+/// let range1 = allocator.allocate(100).unwrap();
+/// writer.write_range(range1, Bytes::from(vec![1; 100])).await?;
+///
+/// let range2 = allocator.allocate(100).unwrap();
+/// writer.write_range(range2, Bytes::from(vec![2; 100])).await?;
+///
+/// // 当所有字节都写入后，自动判断完成
+/// if writer.is_complete() {
+///     writer.finalize().await?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct RangeWriter<F: AsyncFile> {
     file: Arc<Mutex<F>>,

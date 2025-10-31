@@ -3,15 +3,16 @@
 //! 提供下载任务的配置选项，包括分块策略和并发控制
 
 use std::time::Duration;
+use crate::constants::MB;
 
 /// 默认最小分块大小：2 MB
-pub const DEFAULT_MIN_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
+pub const DEFAULT_MIN_CHUNK_SIZE: u64 = 2 * MB;
 
 /// 默认初始分块大小：5 MB
-pub const DEFAULT_INITIAL_CHUNK_SIZE: u64 = 5 * 1024 * 1024;
+pub const DEFAULT_INITIAL_CHUNK_SIZE: u64 = 5 * MB;
 
 /// 默认最大分块大小：50 MB
-pub const DEFAULT_MAX_CHUNK_SIZE: u64 = 50 * 1024 * 1024;
+pub const DEFAULT_MAX_CHUNK_SIZE: u64 = 50 * MB;
 
 /// 默认 Worker 并发数
 pub const DEFAULT_WORKER_COUNT: usize = 4;
@@ -30,6 +31,16 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// 默认连接超时时间：10 秒
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// 默认渐进式启动比例序列：[0.25, 0.5, 0.75, 1.0]
+/// 
+/// 表示按 25%, 50%, 75%, 100% 的比例逐步启动worker
+pub const DEFAULT_PROGRESSIVE_WORKER_RATIOS: &[f64] = &[0.25, 0.5, 0.75, 1.0];
+
+/// 默认最小速度阈值：1 MB/s
+/// 
+/// 当所有已启动的worker速度都达到此阈值时，才启动下一批worker
+pub const DEFAULT_MIN_SPEED_THRESHOLD: u64 = 1 * MB;
 
 /// 下载配置
 ///
@@ -79,6 +90,17 @@ pub struct DownloadConfig {
     ///
     /// 只计算 TCP 连接建立的时长
     pub(crate) connect_timeout: Duration,
+    
+    /// 渐进式启动比例序列
+    ///
+    /// 定义分阶段启动worker的比例，如 [0.25, 0.5, 0.75, 1.0] 表示
+    /// 按 25%, 50%, 75%, 100% 的比例逐步启动worker
+    pub(crate) progressive_worker_ratios: Vec<f64>,
+    
+    /// 最小速度阈值（bytes/s）
+    ///
+    /// 当所有已启动的worker的瞬时速度都达到此阈值时，才启动下一批worker
+    pub(crate) min_speed_threshold: u64,
 }
 
 impl DownloadConfig {
@@ -108,6 +130,8 @@ impl DownloadConfig {
     /// - 平滑系数: 0.7
     /// - 请求超时: 30 秒
     /// - 连接超时: 10 秒
+    /// - 渐进启动比例: [0.25, 0.5, 0.75, 1.0]
+    /// - 最小速度阈值: 1 MB/s
     pub fn default() -> Self {
         Self {
             worker_count: DEFAULT_WORKER_COUNT,
@@ -119,6 +143,8 @@ impl DownloadConfig {
             smoothing_factor: DEFAULT_SMOOTHING_FACTOR,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+            progressive_worker_ratios: DEFAULT_PROGRESSIVE_WORKER_RATIOS.to_vec(),
+            min_speed_threshold: DEFAULT_MIN_SPEED_THRESHOLD,
         }
     }
     
@@ -166,6 +192,16 @@ impl DownloadConfig {
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
+    
+    /// 获取渐进式启动比例序列
+    pub fn progressive_worker_ratios(&self) -> &[f64] {
+        &self.progressive_worker_ratios
+    }
+    
+    /// 获取最小速度阈值
+    pub fn min_speed_threshold(&self) -> u64 {
+        self.min_speed_threshold
+    }
 }
 
 /// 下载配置构建器
@@ -193,6 +229,8 @@ pub struct DownloadConfigBuilder {
     smoothing_factor: f64,
     timeout: Duration,
     connect_timeout: Duration,
+    progressive_worker_ratios: Vec<f64>,
+    min_speed_threshold: u64,
 }
 
 impl DownloadConfigBuilder {
@@ -208,6 +246,8 @@ impl DownloadConfigBuilder {
             smoothing_factor: DEFAULT_SMOOTHING_FACTOR,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+            progressive_worker_ratios: DEFAULT_PROGRESSIVE_WORKER_RATIOS.to_vec(),
+            min_speed_threshold: DEFAULT_MIN_SPEED_THRESHOLD,
         }
     }
     
@@ -313,6 +353,66 @@ impl DownloadConfigBuilder {
         self
     }
     
+    /// 设置渐进式启动比例序列
+    ///
+    /// 定义分阶段启动worker的比例。比例会自动排序并限制在 (0.0, 1.0] 范围内。
+    ///
+    /// # Arguments
+    ///
+    /// * `ratios` - 比例序列，如 `vec![0.25, 0.5, 0.75, 1.0]` 表示按 25%, 50%, 75%, 100% 逐步启动
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use rs_dn::DownloadConfig;
+    /// let config = DownloadConfig::builder()
+    ///     .worker_count(12)
+    ///     .progressive_worker_ratios(vec![0.25, 0.5, 0.75, 1.0])  // 3, 6, 9, 12 个 worker
+    ///     .build();
+    /// ```
+    pub fn progressive_worker_ratios(mut self, ratios: Vec<f64>) -> Self {
+        // 过滤掉无效的比例值（必须在 0.0 < ratio <= 1.0 范围内）
+        let mut valid_ratios: Vec<f64> = ratios
+            .into_iter()
+            .filter(|&r| r > 0.0 && r <= 1.0)
+            .collect();
+        
+        // 排序并去重
+        valid_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        valid_ratios.dedup();
+        
+        // 如果没有有效比例，使用默认值
+        if valid_ratios.is_empty() {
+            self.progressive_worker_ratios = DEFAULT_PROGRESSIVE_WORKER_RATIOS.to_vec();
+        } else {
+            self.progressive_worker_ratios = valid_ratios;
+        }
+        
+        self
+    }
+    
+    /// 设置最小速度阈值（bytes/s）
+    ///
+    /// 当所有已启动的worker的瞬时速度都达到此阈值时，才启动下一批worker
+    ///
+    /// # Arguments
+    ///
+    /// * `threshold` - 速度阈值（bytes/s）
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use rs_dn::DownloadConfig;
+    /// # use rs_dn::constants::*;
+    /// let config = DownloadConfig::builder()
+    ///     .min_speed_threshold(5 * MB)  // 5 MB/s
+    ///     .build();
+    /// ```
+    pub fn min_speed_threshold(mut self, threshold: u64) -> Self {
+        self.min_speed_threshold = threshold;
+        self
+    }
+    
     /// 构建配置对象
     pub fn build(self) -> DownloadConfig {
         // 确保配置的合理性：min <= initial <= max
@@ -330,6 +430,8 @@ impl DownloadConfigBuilder {
             smoothing_factor: self.smoothing_factor,
             timeout: self.timeout,
             connect_timeout: self.connect_timeout,
+            progressive_worker_ratios: self.progressive_worker_ratios,
+            min_speed_threshold: self.min_speed_threshold,
         }
     }
 }
@@ -404,6 +506,78 @@ mod tests {
         assert_eq!(config.min_chunk_size(), 10 * 1024 * 1024);
         assert_eq!(config.initial_chunk_size(), 10 * 1024 * 1024);  // 调整为 min
         assert_eq!(config.max_chunk_size(), 10 * 1024 * 1024);      // 调整为 initial
+    }
+
+    #[test]
+    fn test_progressive_worker_ratios_default() {
+        let config = DownloadConfig::default();
+        assert_eq!(config.progressive_worker_ratios(), DEFAULT_PROGRESSIVE_WORKER_RATIOS);
+        assert_eq!(config.min_speed_threshold(), DEFAULT_MIN_SPEED_THRESHOLD);
+    }
+
+    #[test]
+    fn test_progressive_worker_ratios_custom() {
+        let config = DownloadConfig::builder()
+            .progressive_worker_ratios(vec![0.5, 1.0])
+            .build();
+        
+        assert_eq!(config.progressive_worker_ratios(), &[0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_progressive_worker_ratios_sorting() {
+        // 测试自动排序
+        let config = DownloadConfig::builder()
+            .progressive_worker_ratios(vec![1.0, 0.25, 0.75, 0.5])
+            .build();
+        
+        assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn test_progressive_worker_ratios_filtering() {
+        // 测试过滤无效值（<= 0 或 > 1.0）
+        let config = DownloadConfig::builder()
+            .progressive_worker_ratios(vec![0.0, 0.5, 1.0, 1.5, -0.1])
+            .build();
+        
+        // 0.0, 1.5, -0.1 应该被过滤掉
+        assert_eq!(config.progressive_worker_ratios(), &[0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_progressive_worker_ratios_dedup() {
+        // 测试去重
+        let config = DownloadConfig::builder()
+            .progressive_worker_ratios(vec![0.5, 0.5, 1.0, 1.0, 0.25])
+            .build();
+        
+        assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_progressive_worker_ratios_empty_uses_default() {
+        // 测试空序列或全部无效值时使用默认值
+        let config = DownloadConfig::builder()
+            .progressive_worker_ratios(vec![])
+            .build();
+        
+        assert_eq!(config.progressive_worker_ratios(), DEFAULT_PROGRESSIVE_WORKER_RATIOS);
+        
+        let config2 = DownloadConfig::builder()
+            .progressive_worker_ratios(vec![0.0, -1.0, 2.0])
+            .build();
+        
+        assert_eq!(config2.progressive_worker_ratios(), DEFAULT_PROGRESSIVE_WORKER_RATIOS);
+    }
+
+    #[test]
+    fn test_min_speed_threshold() {
+        let config = DownloadConfig::builder()
+            .min_speed_threshold(5 * 1024 * 1024)  // 5 MB/s
+            .build();
+        
+        assert_eq!(config.min_speed_threshold(), 5 * 1024 * 1024);
     }
 }
 

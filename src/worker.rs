@@ -129,6 +129,7 @@ pub(crate) struct WorkerChannel {
 /// 
 /// 为单个下载任务创建的临时协程池
 /// 任务完成后自动销毁
+/// 支持动态添加 worker
 pub(crate) struct WorkerPool<F: AsyncFile> {
     /// 每个 worker 的通道和统计信息
     pub(crate) worker_channels: Vec<WorkerChannel>,
@@ -138,6 +139,12 @@ pub(crate) struct WorkerPool<F: AsyncFile> {
     pub(crate) result_receiver: mpsc::Receiver<RangeResult>,
     /// 全局统计管理器（聚合所有 worker 的数据）
     global_stats: DownloadStatsParent,
+    /// 结果发送器的克隆（用于创建新 worker）
+    result_sender: mpsc::Sender<RangeResult>,
+    /// 共享的文件写入器
+    writer: Arc<RangeWriter<F>>,
+    /// 下载配置（用于创建新 worker 的分块策略）
+    config: Arc<crate::config::DownloadConfig>,
     _phantom: PhantomData<F>,
 }
 
@@ -146,7 +153,7 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
     /// 
     /// # Arguments
     /// * `client` - HTTP客户端（将被克隆给每个worker）
-    /// * `worker_count` - worker 协程数量
+    /// * `initial_worker_count` - 初始 worker 协程数量
     /// * `writer` - 共享的 RangeWriter，所有 worker 将直接写入此文件
     /// * `config` - 下载配置，用于创建分块策略和设置速度窗口
     /// 
@@ -154,9 +161,9 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
     /// 所有 worker 的统计会自动聚合到 global_stats，实现 O(1) 获取
     pub(crate) fn new<C>(
         client: C, 
-        worker_count: usize, 
+        initial_worker_count: usize, 
         writer: Arc<RangeWriter<F>>,
-        config: &crate::config::DownloadConfig,
+        config: Arc<crate::config::DownloadConfig>,
     ) -> Self
     where
         C: HttpClient + Clone + Send + 'static,
@@ -171,7 +178,7 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
         let mut worker_handles = Vec::new();
 
         // 为每个 worker 创建独立的 task channel、shutdown channel 和统计信息
-        for id in 0..worker_count {
+        for id in 0..initial_worker_count {
             let (task_sender, task_receiver) = mpsc::channel::<WorkerTask>(100);
             let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
             
@@ -190,7 +197,7 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
             });
 
             // 为每个 worker 创建独立的分块策略
-            let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(config));
+            let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config));
             
             worker_channels.push(WorkerChannel {
                 task_sender,
@@ -200,19 +207,77 @@ impl<F: AsyncFile + 'static> WorkerPool<F> {
             });
             worker_handles.push(handle);
         }
-        
-        // 释放原始的 result_sender，只保留 worker 持有的克隆
-        drop(result_sender);
 
-        info!("创建协程池，{} 个 workers", worker_count);
+        info!("创建协程池，{} 个初始 workers", initial_worker_count);
 
         Self {
             worker_channels,
             worker_handles,
             result_receiver,
             global_stats,
+            result_sender,
+            writer,
+            config,
             _phantom: PhantomData,
         }
+    }
+
+    /// 动态添加新的 worker
+    /// 
+    /// # Arguments
+    /// * `client` - HTTP客户端（将被克隆给新worker）
+    /// * `count` - 要添加的 worker 数量
+    /// 
+    /// # Returns
+    /// 
+    /// 成功时返回 `Ok(())`，失败时返回错误信息
+    pub(crate) fn add_workers<C>(&mut self, client: C, count: usize) -> Result<()>
+    where
+        C: HttpClient + Clone + Send + 'static,
+    {
+        let current_count = self.worker_channels.len();
+        
+        info!("动态添加 {} 个新 workers (当前 {} 个)", count, current_count);
+        
+        for offset in 0..count {
+            let id = current_count + offset;
+            
+            let (task_sender, task_receiver) = mpsc::channel::<WorkerTask>(100);
+            let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+            
+            // 通过 parent 创建 child stats 并包装为 Arc
+            let worker_stats = Arc::new(self.global_stats.create_child());
+            
+            // 克隆共享资源给新 worker
+            let client_clone = client.clone();
+            let writer_clone = Arc::clone(&self.writer);
+            let stats_clone = Arc::clone(&worker_stats);
+            let result_sender_clone = self.result_sender.clone();
+            
+            // 启动 worker 协程
+            let handle = tokio::spawn(async move {
+                run_worker(id, client_clone, task_receiver, result_sender_clone, shutdown_receiver, writer_clone, stats_clone).await;
+            });
+            
+            // 为新 worker 创建独立的分块策略
+            let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&self.config));
+            
+            self.worker_channels.push(WorkerChannel {
+                task_sender,
+                shutdown_sender: Some(shutdown_sender),
+                stats: worker_stats,
+                chunk_strategy,
+            });
+            self.worker_handles.push(handle);
+        }
+        
+        info!("成功添加 {} 个新 workers，当前总计 {} 个", count, self.worker_channels.len());
+        Ok(())
+    }
+    
+    /// 获取当前 worker 总数
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_channels.len()
     }
 
     /// 提交任务给指定的 worker
@@ -449,12 +514,12 @@ mod tests {
         let writer = Arc::new(writer);
 
         let worker_count = 4;
-        let config = crate::config::DownloadConfig::default();
+        let config = Arc::new(crate::config::DownloadConfig::default());
         let pool = WorkerPool::<MockFile>::new(
             client, 
             worker_count, 
             writer,
-            &config,
+            config,
         );
 
         assert_eq!(pool.worker_channels.len(), worker_count);
@@ -470,12 +535,12 @@ mod tests {
         let (writer, mut allocator) = RangeWriter::new(&fs, save_path, 100).await.unwrap();
         let writer = Arc::new(writer);
 
-        let config = crate::config::DownloadConfig::default();
+        let config = Arc::new(crate::config::DownloadConfig::default());
         let pool = WorkerPool::<MockFile>::new(
             client, 
             2, 
             writer,
-            &config,
+            config,
         );
 
         // 分配一个 range
@@ -501,12 +566,12 @@ mod tests {
         let writer = Arc::new(writer);
 
         let worker_count = 3;
-        let config = crate::config::DownloadConfig::default();
+        let config = Arc::new(crate::config::DownloadConfig::default());
         let pool = WorkerPool::<MockFile>::new(
             client, 
             worker_count, 
             writer,
-            &config,
+            config,
         );
 
         // 初始统计应该都是 0
@@ -528,12 +593,12 @@ mod tests {
         let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
         let writer = Arc::new(writer);
 
-        let config = crate::config::DownloadConfig::default();
+        let config = Arc::new(crate::config::DownloadConfig::default());
         let mut pool = WorkerPool::<MockFile>::new(
             client.clone(), 
             2, 
             writer,
-            &config,
+            config,
         );
 
         // 关闭 workers

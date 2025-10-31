@@ -111,18 +111,18 @@ impl DownloadHandle {
     /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config).await.unwrap();
     /// 
     /// while let Some(progress) = handle.progress_receiver().recv().await {
-///     match progress {
-///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
-///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
-///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers", 
-///                 percentage, avg_speed / 1024.0 / 1024.0, worker_stats.len());
-///         }
-///         DownloadProgress::Completed { .. } => {
-///             println!("下载完成！");
-///         }
-///         _ => {}
-///     }
-/// }
+    ///     match progress {
+    ///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
+    ///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+    ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers", 
+    ///                 percentage, avg_speed / 1024.0 / 1024.0, worker_stats.len());
+    ///         }
+    ///         DownloadProgress::Completed { .. } => {
+    ///             println!("下载完成！");
+    ///         }
+    ///         _ => {}
+    ///     }
+    /// }
     /// 
     /// handle.wait().await.unwrap();
     /// # }
@@ -182,8 +182,6 @@ struct TaskAllocator {
     url: String,
     /// 下一个要分配任务的 worker ID（轮询）
     next_worker_id: usize,
-    /// Worker 总数
-    worker_count: usize,
 }
 
 impl TaskAllocator {
@@ -191,13 +189,11 @@ impl TaskAllocator {
     fn new(
         allocator: RangeAllocator,
         url: String,
-        worker_count: usize,
     ) -> Self {
         Self {
             allocator,
             url,
             next_worker_id: 0,
-            worker_count,
         }
     }
     
@@ -206,11 +202,16 @@ impl TaskAllocator {
     /// # Arguments
     /// 
     /// * `chunk_size` - 要分配的分块大小
+    /// * `current_worker_count` - 当前实际的 worker 数量
     /// 
     /// # Returns
     /// 
     /// 返回 (任务, worker_id)，如果没有剩余空间则返回 None
-    fn try_allocate_next_task(&mut self, chunk_size: u64) -> Option<(WorkerTask, usize)> {
+    fn try_allocate_next_task(&mut self, chunk_size: u64, current_worker_count: usize) -> Option<(WorkerTask, usize)> {
+        if current_worker_count == 0 {
+            return None;
+        }
+        
         let remaining = self.allocator.remaining();
         if remaining == 0 {
             return None;
@@ -228,9 +229,9 @@ impl TaskAllocator {
             range,
         };
         
-        // 轮询选择 worker
+        // 轮询选择 worker（使用当前实际的 worker 数量）
         let worker_id = self.next_worker_id;
-        self.next_worker_id = (self.next_worker_id + 1) % self.worker_count;
+        self.next_worker_id = (self.next_worker_id + 1) % current_worker_count;
         
         Some((task, worker_id))
     }
@@ -381,7 +382,9 @@ impl ProgressReporter {
 /// 下载任务执行器
 /// 
 /// 封装了下载任务的执行逻辑，使用辅助结构体管理任务分配和进度报告
-struct DownloadTask<F: AsyncFile> {
+struct DownloadTask<C: HttpClient, F: AsyncFile> {
+    /// HTTP 客户端（用于动态添加 worker）
+    client: C,
     /// Worker 协程池
     pool: WorkerPool<F>,
     /// 文件写入器
@@ -392,12 +395,16 @@ struct DownloadTask<F: AsyncFile> {
     progress_reporter: ProgressReporter,
     /// 下载配置
     config: Arc<crate::config::DownloadConfig>,
+    /// 渐进式启动阶段序列（预计算的目标worker数量序列，如 [3, 6, 9, 12]）
+    worker_launch_stages: Vec<usize>,
+    /// 下一个启动阶段的索引（0 表示已完成第一批，1 表示准备启动第二批）
+    next_launch_stage: usize,
 }
 
-impl<F: AsyncFile + 'static> DownloadTask<F> {
+impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTask<C, F> {
     /// 创建新的下载任务
     fn new(
-        pool: WorkerPool<F>,
+        client: C,
         progress_sender: Option<Sender<DownloadProgress>>,
         writer: Arc<RangeWriter<F>>,
         allocator: RangeAllocator,
@@ -405,16 +412,47 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         total_size: u64,
         config: Arc<crate::config::DownloadConfig>,
     ) -> Self {
-        let worker_count = pool.worker_channels.len();
-        let task_allocator = TaskAllocator::new(allocator, url, worker_count);
+        let total_worker_count = config.worker_count();
+        
+        // 根据配置的比例序列计算渐进式启动阶段
+        let worker_launch_stages: Vec<usize> = config.progressive_worker_ratios()
+            .iter()
+            .map(|&ratio| {
+                let stage_count = ((total_worker_count as f64 * ratio).ceil() as usize).min(total_worker_count);
+                // 确保至少启动1个worker
+                stage_count.max(1)
+            })
+            .collect();
+        
+        // 第一批 worker 数量
+        let initial_worker_count = worker_launch_stages[0];
+        
+        info!(
+            "渐进式启动配置: 目标 {} workers, 阶段: {:?}",
+            total_worker_count, worker_launch_stages
+        );
+        info!("初始启动 {} 个 workers", initial_worker_count);
+        
+        // 创建 WorkerPool（只启动第一批 worker）
+        let pool = WorkerPool::new(
+            client.clone(),
+            initial_worker_count,
+            Arc::clone(&writer),
+            Arc::clone(&config),
+        );
+        
+        let task_allocator = TaskAllocator::new(allocator, url);
         let progress_reporter = ProgressReporter::new(progress_sender, total_size);
         
         Self {
+            client,
             pool,
             writer,
             task_allocator,
             progress_reporter,
             config,
+            worker_launch_stages,
+            next_launch_stage: 1, // 第一批已启动，下一个是第二批（索引1）
         }
     }
     
@@ -429,26 +467,97 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
         let mut progress_timer = tokio::time::interval(self.config.instant_speed_window());
         progress_timer.tick().await; // 跳过首次立即触发
         
-        // 初始任务分配：为每个 worker 分配一个任务（使用各自的初始分块大小）
-        info!("开始初始任务分配");
-        for worker_id in 0..self.pool.worker_channels.len() {
+        // 初始任务分配：为第一批 worker 分配任务
+        let current_worker_count = self.pool.worker_count();
+        info!(
+            "渐进式启动 - 第1批: 已启动 {} 个 workers",
+            current_worker_count
+        );
+        
+        for worker_id in 0..current_worker_count {
             let chunk_size = self.pool.get_worker_chunk_size(worker_id);
-            if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size) {
+            if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
                 info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
                 if let Err(e) = self.pool.send_task(task, worker_id).await {
                     error!("初始任务分配失败: {:?}", e);
                 }
             } else {
-                info!("没有足够的数据为所有 worker 分配初始任务");
+                info!("没有足够的数据为第一批 worker 分配初始任务");
                 break;
             }
         }
         
         loop {
             tokio::select! {
-                // 定时器触发：发送进度更新
+                // 定时器触发：发送进度更新和检查是否启动下一批worker
                 _ = progress_timer.tick() => {
                     self.send_progress().await;
+                    
+                    // 检查是否可以启动下一批worker（渐进式启动）
+                    if self.next_launch_stage < self.worker_launch_stages.len() {
+                        let current_worker_count = self.pool.worker_count();
+                        
+                        // 检查所有已启动 worker 的速度是否达到阈值
+                        let mut all_ready = true;
+                        let mut speeds = Vec::with_capacity(current_worker_count);
+                        
+                        for worker_id in 0..current_worker_count {
+                            let (instant_speed, valid) = self.pool.worker_channels[worker_id].stats.get_instant_speed();
+                            speeds.push(instant_speed);
+                            
+                            // 所有worker的速度都必须有效且达到阈值
+                            if !valid || instant_speed < self.config.min_speed_threshold() as f64 {
+                                all_ready = false;
+                            }
+                        }
+                        
+                        if all_ready {
+                            // 启动下一批worker
+                            let next_target = self.worker_launch_stages[self.next_launch_stage];
+                            let workers_to_add = next_target - current_worker_count;
+                            
+                            if workers_to_add > 0 {
+                                info!(
+                                    "渐进式启动 - 第{}批: 所有已启动worker速度达标 ({:?} bytes/s >= {} bytes/s)，启动 {} 个新 workers (总计 {} 个)",
+                                    self.next_launch_stage + 1,
+                                    speeds,
+                                    self.config.min_speed_threshold(),
+                                    workers_to_add,
+                                    next_target
+                                );
+                                
+                                // 动态添加新 worker
+                                if let Err(e) = self.pool.add_workers(self.client.clone(), workers_to_add) {
+                                    error!("添加新 workers 失败: {:?}", e);
+                                    // 继续执行，不影响已启动的 worker
+                                } else {
+                                    // 为新启动的worker分配任务
+                                    let updated_worker_count = self.pool.worker_count();
+                                    for worker_id in current_worker_count..next_target {
+                                        let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+                                        if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size, updated_worker_count) {
+                                            info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", worker_id, chunk_size);
+                                            if let Err(e) = self.pool.send_task(task, worker_id).await {
+                                                error!("为新 worker 分配任务失败: {:?}", e);
+                                            }
+                                        } else {
+                                            debug!("没有足够的数据为新 worker #{} 分配任务", worker_id);
+                                            break;
+                                        }
+                                    }
+                                    
+                                    self.next_launch_stage += 1;
+                                }
+                            }
+                        } else {
+                            debug!(
+                                "渐进式启动 - 等待第{}批worker速度达标 (当前速度: {:?} bytes/s, 阈值: {} bytes/s)",
+                                self.next_launch_stage + 1,
+                                speeds,
+                                self.config.min_speed_threshold()
+                            );
+                        }
+                    }
                 }
                 
                 // 接收 worker 结果并分配新任务
@@ -461,7 +570,8 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
                             let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
                             
                             // 为该 worker 分配新任务（使用计算得到的分块大小）
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size) {
+                            let current_worker_count = self.pool.worker_count();
+                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
                                 debug!(
                                     "Worker #{} 完成任务，分配新任务到 Worker #{}，分块大小 {} bytes",
                                     worker_id, target_worker, chunk_size
@@ -486,7 +596,8 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
                             
                             // 失败后也需要分配新任务（使用该 worker 的分块大小）
                             let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
-                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size) {
+                            let current_worker_count = self.pool.worker_count();
+                            if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
                                 debug!(
                                     "Worker #{} 任务失败，分配新任务到 Worker #{}，分块大小 {} bytes",
                                     worker_id, target_worker, chunk_size
@@ -548,19 +659,24 @@ impl<F: AsyncFile + 'static> DownloadTask<F> {
     }
     
     /// 完成并清理资源
-    async fn finalize_and_cleanup(mut self, save_path: PathBuf) -> Result<()> {
+    async fn finalize_and_cleanup(self, save_path: PathBuf) -> Result<()> {
         // 发送完成统计
         self.progress_reporter.send_completion_stats(&self.pool).await;
         
-        // 优雅关闭所有 workers
-        self.pool.shutdown();
+        // 优雅关闭所有 workers 并等待退出
+        let mut pool = self.pool;
+        pool.shutdown();
         
-        // 等待 workers 退出
-        for (id, handle) in self.pool.worker_handles.into_iter().enumerate() {
+        // 提取 worker_handles 并等待
+        let handles = std::mem::take(&mut pool.worker_handles);
+        for (id, handle) in handles.into_iter().enumerate() {
             handle
                 .await
                 .map_err(|_| DownloadError::WorkerExit(id))?;
         }
+        
+        // 释放 pool（它持有 writer 的引用）
+        drop(pool);
         
         // 完成写入（从 Arc 中提取 writer）
         let writer = Arc::try_unwrap(self.writer)
@@ -624,30 +740,25 @@ where
     // 创建 RangeWriter 和 RangeAllocator（会预分配文件）
     let (writer, allocator) = RangeWriter::new(&fs, save_path.clone(), content_length).await?;
 
-    // 将 writer 包装在 Arc 中，创建协程池
+    // 将 writer 包装在 Arc 中
     let writer = Arc::new(writer);
-    let pool = WorkerPool::new(
-        client, 
-        worker_count, 
-        Arc::clone(&writer),
-        config,
-    );
+    let config = Arc::new(config.clone());
 
-    // 创建下载任务（使用动态分块）
+    // 创建下载任务（内部会创建 WorkerPool 并启动第一批 worker）
     let mut task = DownloadTask::new(
-        pool,
+        client,
         progress_sender,
         writer,
         allocator,
         url.to_string(),
         content_length,
-        Arc::new(config.clone()),
+        config,
     );
     
     // 发送开始事件（使用第一个 worker 的初始分块大小）
-    let worker_count = task.pool.worker_channels.len();
+    let current_worker_count = task.pool.worker_count();
     let initial_chunk_size = task.pool.get_worker_chunk_size(0);
-    task.progress_reporter.send_started_event(worker_count, initial_chunk_size).await;
+    task.progress_reporter.send_started_event(current_worker_count, initial_chunk_size).await;
 
     // 等待所有任务完成（内部会动态分配任务）
     let failed_ranges = task.wait_for_completion().await?;
@@ -1209,6 +1320,94 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "大文件下载应该成功: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_progressive_worker_launch() {
+        // 测试渐进式启动配置
+        let test_url = "http://example.com/file.bin";
+        let test_data: Vec<u8> = (0..100).collect(); // 100 bytes
+        let save_path = PathBuf::from("/tmp/test_progressive.bin");
+
+        let client = MockHttpClient::new();
+        let fs = MockFileSystem::new();
+
+        // 设置 HEAD 请求响应
+        let mut head_headers = HeaderMap::new();
+        head_headers.insert("accept-ranges", "bytes".parse().unwrap());
+        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
+        client.set_head_response(
+            test_url,
+            StatusCode::OK,
+            head_headers,
+        );
+
+        // 设置足够多的 Range 请求响应
+        let chunk_size = 10;
+        let range_count = (test_data.len() + chunk_size - 1) / chunk_size;
+
+        for i in 0..range_count {
+            let start = i * chunk_size;
+            let end = if i == range_count - 1 {
+                test_data.len()
+            } else {
+                (i + 1) * chunk_size
+            };
+
+            let chunk = &test_data[start..end];
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "content-range",
+                format!("bytes {}-{}/{}", start, end - 1, test_data.len())
+                    .parse()
+                    .unwrap(),
+            );
+
+            client.set_range_response(
+                test_url,
+                start as u64,
+                (end - 1) as u64,
+                StatusCode::PARTIAL_CONTENT,
+                headers,
+                Bytes::from(chunk.to_vec()),
+            );
+        }
+
+        // 配置渐进式启动：[0.5, 1.0] 表示先启动2个worker，再启动剩余2个
+        let config = crate::config::DownloadConfig::builder()
+            .worker_count(4)
+            .initial_chunk_size(chunk_size as u64)
+            .min_chunk_size(chunk_size as u64)
+            .max_chunk_size(chunk_size as u64)
+            .progressive_worker_ratios(vec![0.5, 1.0])
+            .min_speed_threshold(0)  // 设置为0以便立即启动下一批
+            .build();
+
+        let result = download_ranged_generic(
+            client.clone(),
+            fs.clone(),
+            test_url,
+            save_path.clone(),
+            &config,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "渐进式启动下载应该成功: {:?}", result);
+    }
+
+    #[test]
+    fn test_progressive_config() {
+        // 测试渐进式启动配置的正确性
+        let config = crate::config::DownloadConfig::builder()
+            .worker_count(12)
+            .progressive_worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
+            .min_speed_threshold(5 * 1024 * 1024)  // 5 MB/s
+            .build();
+
+        assert_eq!(config.worker_count(), 12);
+        assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(config.min_speed_threshold(), 5 * 1024 * 1024);
     }
 }
 

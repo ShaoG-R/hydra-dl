@@ -129,6 +129,30 @@ pub mod tools {
     pub mod range_writer;
 }
 
+/// 常用单位常量
+/// 
+/// 提供方便的字节单位常量，用于配置下载参数
+/// 
+/// # Example
+/// 
+/// ```
+/// use rs_dn::constants::*;
+/// use rs_dn::DownloadConfig;
+/// 
+/// let config = DownloadConfig::builder()
+///     .initial_chunk_size(10 * MB)  // 10 MB
+///     .min_speed_threshold(5 * MB)  // 5 MB/s
+///     .build();
+/// ```
+pub mod constants {
+    /// 1 KB = 1024 bytes
+    pub const KB: u64 = 1024;
+    /// 1 MB = 1024 * 1024 bytes
+    pub const MB: u64 = 1024 * 1024;
+    /// 1 GB = 1024 * 1024 * 1024 bytes
+    pub const GB: u64 = 1024 * 1024 * 1024;
+}
+
 // 重新导出核心类型和函数
 pub use config::{DownloadConfig, DownloadConfigBuilder};
 pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
