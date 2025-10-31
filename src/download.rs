@@ -445,7 +445,8 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         );
         
         for worker_id in 0..current_worker_count {
-            let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+            let chunk_size = self.pool.get_worker_chunk_size(worker_id)
+                .unwrap_or(self.config.initial_chunk_size());
             if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
                 info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
                 if let Err(e) = self.pool.send_task(task, worker_id).await {
@@ -472,7 +473,8 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                         let mut speeds = Vec::with_capacity(current_worker_count);
                         
                         for worker_id in 0..current_worker_count {
-                            let (instant_speed, valid) = self.pool.get_worker_instant_speed(worker_id);
+                            let (instant_speed, valid) = self.pool.get_worker_instant_speed(worker_id)
+                                .unwrap_or((0.0, false));
                             speeds.push(instant_speed);
                             
                             // 所有worker的速度都必须有效且达到阈值
@@ -497,14 +499,15 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                                 );
                                 
                                 // 动态添加新 worker
-                                if let Err(e) = self.pool.add_workers(self.client.clone(), workers_to_add) {
+                                if let Err(e) = self.pool.add_workers(self.client.clone(), workers_to_add).await {
                                     error!("添加新 workers 失败: {:?}", e);
                                     // 继续执行，不影响已启动的 worker
                                 } else {
                                     // 为新启动的worker分配任务
                                     let updated_worker_count = self.pool.worker_count();
                                     for worker_id in current_worker_count..next_target {
-                                        let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+                                        let chunk_size = self.pool.get_worker_chunk_size(worker_id)
+                                            .unwrap_or(self.config.initial_chunk_size());
                                         if let Some((task, _)) = self.task_allocator.try_allocate_next_task(chunk_size, updated_worker_count) {
                                             info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", worker_id, chunk_size);
                                             if let Err(e) = self.pool.send_task(task, worker_id).await {
@@ -537,7 +540,8 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                             self.progress_reporter.record_range_complete();
                             
                             // 根据该 worker 的实时速度计算新的分块大小
-                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
+                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
+                                .unwrap_or(self.config.initial_chunk_size());
                             
                             // 为该 worker 分配新任务（使用计算得到的分块大小）
                             let current_worker_count = self.pool.worker_count();
@@ -565,7 +569,8 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
                             self.progress_reporter.record_range_complete();
                             
                             // 失败后也需要分配新任务（使用该 worker 的分块大小）
-                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
+                            let chunk_size = self.pool.calculate_worker_chunk_size(worker_id)
+                                .unwrap_or(self.config.initial_chunk_size());
                             let current_worker_count = self.pool.worker_count();
                             if let Some((task, target_worker)) = self.task_allocator.try_allocate_next_task(chunk_size, current_worker_count) {
                                 debug!(
@@ -612,14 +617,8 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             self.progress_reporter.send_error(msg).await;
         }
         
-        // 关闭 workers
-        self.pool.shutdown();
-        
-        // 等待 workers 退出
-        for (id, handle) in self.pool.worker_handles_mut().drain(..).enumerate() {
-            let _ = handle.await;
-            log::debug!("Worker #{} 已退出", id);
-        }
+        // 关闭 workers（发送关闭信号并等待所有 worker 退出）
+        self.pool.shutdown().await;
         
         if let Some(msg) = error_msg {
             return Err(DownloadError::Other(msg));
@@ -633,16 +632,12 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         // 发送完成统计
         self.progress_reporter.send_completion_stats(&self.pool).await;
         
-        // 优雅关闭所有 workers 并等待退出
+        // 优雅关闭所有 workers 并等待它们完全退出
         let mut pool = self.pool;
-        pool.shutdown();
+        pool.shutdown().await;
         
-        // 提取 worker_handles 并等待
-        for (id, handle) in pool.worker_handles_mut().drain(..).enumerate() {
-            handle
-                .await
-                .map_err(|_| DownloadError::WorkerExit(id))?;
-        }
+        // shutdown() 会等待所有 worker 的 JoinHandle 完成，
+        // 确保所有对 executor（含 writer）的引用都已释放
         
         // 释放 pool（它持有 writer 的引用）
         drop(pool);
@@ -721,12 +716,13 @@ where
         allocator,
         url.to_string(),
         content_length,
-        config,
+        Arc::clone(&config),
     );
     
     // 发送开始事件（使用第一个 worker 的初始分块大小）
     let current_worker_count = task.pool.worker_count();
-    let initial_chunk_size = task.pool.get_worker_chunk_size(0);
+    let initial_chunk_size = task.pool.get_worker_chunk_size(0)
+        .unwrap_or(config.initial_chunk_size());    
     task.progress_reporter.send_started_event(current_worker_count, initial_chunk_size).await;
 
     // 等待所有任务完成（内部会动态分配任务）
@@ -882,6 +878,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_ranged_basic() {
+
+        use env_logger::Env;
+        env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
+
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
         let save_path = PathBuf::from("/tmp/test_download.bin");
@@ -938,7 +938,8 @@ mod tests {
             .initial_chunk_size(chunk_size)
             .min_chunk_size(1)  // 设置为 1 以允许小文件测试
             .max_chunk_size(chunk_size)  // 固定分块大小以便测试
-            .build();
+            .build()
+            .unwrap();
         
         let result = download_ranged_generic(
             client.clone(),
@@ -997,7 +998,8 @@ mod tests {
             .initial_chunk_size(test_data.len() as u64)  // 单次分块完成
             .min_chunk_size(1)
             .max_chunk_size(test_data.len() as u64)
-            .build();
+            .build()
+            .unwrap();
         
         let result = download_ranged_generic(
             client.clone(),
@@ -1075,7 +1077,8 @@ mod tests {
             .initial_chunk_size(chunk_size)
             .min_chunk_size(1)
             .max_chunk_size(chunk_size)  // 固定分块大小以便测试
-            .build();
+            .build()
+            .unwrap();
         
         let result = download_ranged_generic(
             client.clone(),
@@ -1133,7 +1136,8 @@ mod tests {
             .initial_chunk_size(1 * 1024 * 1024)  // 1 MB
             .min_chunk_size(512 * 1024)  // 512 KB
             .max_chunk_size(2 * 1024 * 1024)  // 2 MB
-            .build();
+            .build()
+            .unwrap();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -1205,7 +1209,8 @@ mod tests {
             .initial_chunk_size(chunk_size as u64)
             .min_chunk_size(chunk_size as u64)
             .max_chunk_size(chunk_size as u64)  // 固定 2 MB 分块
-            .build();
+            .build()
+            .unwrap();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -1276,7 +1281,8 @@ mod tests {
             .initial_chunk_size(chunk_size as u64)
             .min_chunk_size(chunk_size as u64)
             .max_chunk_size(chunk_size as u64)  // 固定 10 MB 分块
-            .build();
+            .build()
+            .unwrap();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -1350,7 +1356,8 @@ mod tests {
             .max_chunk_size(chunk_size as u64)
             .progressive_worker_ratios(vec![0.5, 1.0])
             .min_speed_threshold(0)  // 设置为0以便立即启动下一批
-            .build();
+            .build()
+            .unwrap();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -1372,7 +1379,8 @@ mod tests {
             .worker_count(12)
             .progressive_worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
             .min_speed_threshold(5 * 1024 * 1024)  // 5 MB/s
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.worker_count(), 12);
         assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);

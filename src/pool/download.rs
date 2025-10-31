@@ -232,7 +232,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     /// # Returns
     ///
     /// 成功时返回 `Ok(())`，失败时返回错误信息
-    pub(crate) fn add_workers<C>(&mut self, client: C, count: usize) -> Result<()>
+    pub(crate) async fn add_workers<C>(&mut self, client: C, count: usize) -> Result<()>
     where
         C: HttpClient + Clone + Send + Sync + 'static,
     {
@@ -251,10 +251,10 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
             .collect();
 
         // 添加新 workers（使用现有的执行器）
-        self.pool.add_workers(contexts)
+        self.pool.add_workers(contexts).await
     }
 
-    /// 获取当前 worker 总数
+    /// 获取当前活跃 worker 总数
     pub(crate) fn worker_count(&self) -> usize {
         self.pool.worker_count()
     }
@@ -271,8 +271,9 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
 
     /// 获取指定 worker 的统计信息
     #[allow(dead_code)]
-    pub(crate) fn worker_stats(&self, worker_id: usize) -> Arc<DownloadStats> {
-        Arc::clone(&self.pool.worker_context(worker_id).stats)
+    pub(crate) fn worker_stats(&self, worker_id: usize) -> Option<Arc<DownloadStats>> {
+        let context = self.pool.worker_context(worker_id)?;
+        Some(Arc::clone(&context.stats))
     }
 
     /// 获取所有 worker 的聚合统计（O(1)，无需遍历）
@@ -302,9 +303,10 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     ///
     /// # Returns
     ///
-    /// 当前分块大小 (bytes)
-    pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
-        self.pool.worker_context(worker_id).chunk_strategy.current_chunk_size()
+    /// 当前分块大小 (bytes)，如果 worker 不存在返回 None
+    pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> Option<u64> {
+        let context = self.pool.worker_context(worker_id)?;
+        Some(context.chunk_strategy.current_chunk_size())
     }
 
     /// 根据 worker 的实时速度计算新的分块大小
@@ -317,59 +319,74 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     ///
     /// # Returns
     ///
-    /// 计算得到的分块大小 (bytes)
+    /// 计算得到的分块大小 (bytes)，如果 worker 不存在返回 None
     ///
     /// # Note
     ///
     /// 此方法需要独占访问 worker 的上下文来修改分块策略，
     /// 但由于上下文在 Arc 中，我们需要使用内部可变性或其他方法。
     /// 暂时我们返回当前分块大小或基于实时速度重新计算。
-    pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> u64 {
+    pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> Option<u64> {
         // 获取当前上下文的引用
-        let context_arc = self.pool.worker_context(worker_id);
+        let context_arc = self.pool.worker_context(worker_id)?;
         let (instant_speed, valid) = context_arc.stats.get_instant_speed();
         
         if valid && instant_speed > 0.0 {
             // 创建临时策略来计算新的分块大小
             let mut temp_strategy = SpeedBasedChunkStrategy::from_config(&self.config);
-            temp_strategy.calculate_chunk_size(instant_speed)
+            Some(temp_strategy.calculate_chunk_size(instant_speed))
         } else {
-            context_arc.chunk_strategy.current_chunk_size()
+            Some(context_arc.chunk_strategy.current_chunk_size())
         }
     }
 
     /// 优雅关闭所有 workers
     ///
-    /// 发送关闭信号到所有 worker，让它们停止接收新任务并退出
-    pub(crate) fn shutdown(&mut self) {
-        self.pool.shutdown();
+    /// 发送关闭信号到所有活跃的 worker，让它们停止接收新任务并退出
+    pub(crate) async fn shutdown(&mut self) {
+        self.pool.shutdown().await;
     }
 
-    /// 获取 worker handles 的可变引用（用于等待 worker 退出）
-    pub(crate) fn worker_handles_mut(&mut self) -> &mut Vec<tokio::task::JoinHandle<()>> {
-        &mut self.pool.worker_handles
-    }
-
-    /// 获取所有 worker 的统计快照
+    /// 关闭指定的 worker
+    ///
+    /// 发送关闭信号并等待 worker 完全退出后移除其资源
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: 要关闭的 worker ID
     ///
     /// # Returns
     ///
-    /// 所有 worker 的统计信息向量
+    /// 成功时返回 `Ok(())`，如果 worker 不存在则返回 `Err(DownloadError::WorkerNotFound)`
+    #[allow(dead_code)]
+    pub(crate) async fn shutdown_worker(&self, worker_id: usize) -> Result<()> {
+        self.pool.shutdown_worker(worker_id).await
+    }
+
+    /// 获取所有活跃 worker 的统计快照
+    ///
+    /// # Returns
+    ///
+    /// 所有活跃 worker 的统计信息向量
     pub(crate) fn get_worker_snapshots(&self) -> Vec<crate::download::WorkerStatSnapshot> {
-        (0..self.pool.worker_count())
-            .map(|id| {
-                let context = self.pool.worker_context(id);
-                let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
-                    context.stats.get_full_summary();
-                let current_chunk_size = context.chunk_strategy.current_chunk_size();
-                crate::download::WorkerStatSnapshot {
-                    worker_id: id,
-                    bytes: worker_bytes,
-                    ranges: worker_ranges,
-                    avg_speed,
-                    instant_speed: if instant_valid { Some(instant_speed) } else { None },
-                    current_chunk_size,
-                }
+        self.pool.workers.iter()
+            .enumerate()
+            .filter_map(|(id, worker_slot)| {
+                // load() 返回 Arc<Option<WorkerSlot>>
+                let slot_arc = worker_slot.load();
+                slot_arc.as_ref().as_ref().map(|worker| {
+                    let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
+                        worker.context.stats.get_full_summary();
+                    let current_chunk_size = worker.context.chunk_strategy.current_chunk_size();
+                    crate::download::WorkerStatSnapshot {
+                        worker_id: id,
+                        bytes: worker_bytes,
+                        ranges: worker_ranges,
+                        avg_speed,
+                        instant_speed: if instant_valid { Some(instant_speed) } else { None },
+                        current_chunk_size,
+                    }
+                })
             })
             .collect()
     }
@@ -378,9 +395,10 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     ///
     /// # Returns
     ///
-    /// (实时速度 bytes/s, 是否有效)
-    pub(crate) fn get_worker_instant_speed(&self, worker_id: usize) -> (f64, bool) {
-        self.pool.worker_context(worker_id).stats.get_instant_speed()
+    /// Some((实时速度 bytes/s, 是否有效)) 或 None（如果 worker 不存在）
+    pub(crate) fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
+        let context = self.pool.worker_context(worker_id)?;
+        Some(context.stats.get_instant_speed())
     }
 }
 
@@ -469,17 +487,11 @@ mod tests {
         let mut pool = DownloadWorkerPool::<MockFile>::new(client.clone(), 2, writer, config);
 
         // 关闭 workers
-        pool.shutdown();
+        pool.shutdown().await;
 
-        // 验证所有 shutdown_sender 都已被消费
-        for channel in &pool.pool.worker_channels {
-            assert!(channel.shutdown_sender.is_none());
-        }
-
-        // 等待所有 workers 退出
-        for handle in pool.worker_handles_mut().drain(..) {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
-            assert!(result.is_ok(), "Worker 应该退出");
+        // 验证所有 worker 都已被移除（slot 为 None）
+        for worker_slot in pool.pool.workers.iter() {
+            assert!(worker_slot.load().is_none());
         }
     }
 

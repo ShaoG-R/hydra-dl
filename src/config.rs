@@ -5,6 +5,9 @@
 use std::time::Duration;
 use crate::constants::MB;
 
+/// 最大 Worker 并发数量（硬编码限制）
+pub const MAX_WORKER_COUNT: usize = 32;
+
 /// 默认最小分块大小：2 MB
 pub const DEFAULT_MIN_CHUNK_SIZE: u64 = 2 * MB;
 
@@ -41,6 +44,13 @@ pub const DEFAULT_PROGRESSIVE_WORKER_RATIOS: &[f64] = &[0.25, 0.5, 0.75, 1.0];
 /// 
 /// 当所有已启动的worker速度都达到此阈值时，才启动下一批worker
 pub const DEFAULT_MIN_SPEED_THRESHOLD: u64 = 1 * MB;
+
+/// 构建配置错误
+#[derive(thiserror::Error, Debug)]
+pub enum BuildError {
+    #[error("Worker 数量 {0} 超过最大限制 {1}")]
+    WorkerCountExceeded(usize, usize),
+}
 
 /// 下载配置
 ///
@@ -414,13 +424,18 @@ impl DownloadConfigBuilder {
     }
     
     /// 构建配置对象
-    pub fn build(self) -> DownloadConfig {
+    pub fn build(self) -> Result<DownloadConfig, BuildError> {
+        // 验证 worker_count 不超过最大限制
+        if self.worker_count > MAX_WORKER_COUNT {
+            return Err(BuildError::WorkerCountExceeded(self.worker_count, MAX_WORKER_COUNT));
+        }
+        
         // 确保配置的合理性：min <= initial <= max
         let min_chunk_size = self.min_chunk_size;
         let initial_chunk_size = self.initial_chunk_size.max(min_chunk_size);
         let max_chunk_size = self.max_chunk_size.max(initial_chunk_size);
         
-        DownloadConfig {
+        Ok(DownloadConfig {
             worker_count: self.worker_count,
             min_chunk_size,
             initial_chunk_size,
@@ -432,7 +447,7 @@ impl DownloadConfigBuilder {
             connect_timeout: self.connect_timeout,
             progressive_worker_ratios: self.progressive_worker_ratios,
             min_speed_threshold: self.min_speed_threshold,
-        }
+        })
     }
 }
 
@@ -457,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_builder_default() {
-        let config = DownloadConfig::builder().build();
+        let config = DownloadConfig::builder().build().unwrap();
         assert_eq!(config.worker_count(), DEFAULT_WORKER_COUNT);
         assert_eq!(config.min_chunk_size(), DEFAULT_MIN_CHUNK_SIZE);
         assert_eq!(config.initial_chunk_size(), DEFAULT_INITIAL_CHUNK_SIZE);
@@ -471,7 +486,7 @@ mod tests {
             .min_chunk_size(1 * 1024 * 1024)
             .initial_chunk_size(10 * 1024 * 1024)
             .max_chunk_size(100 * 1024 * 1024)
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.worker_count(), 8);
         assert_eq!(config.min_chunk_size(), 1 * 1024 * 1024);
@@ -486,7 +501,7 @@ mod tests {
             .min_chunk_size(0)  // 应该被限制为 1
             .initial_chunk_size(0)  // 应该被限制为 1
             .max_chunk_size(0)  // 应该被限制为 1
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.worker_count(), 1);
         assert_eq!(config.min_chunk_size(), 1);
@@ -501,7 +516,7 @@ mod tests {
             .min_chunk_size(10 * 1024 * 1024)
             .initial_chunk_size(5 * 1024 * 1024)  // 小于 min
             .max_chunk_size(3 * 1024 * 1024)      // 小于 initial
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.min_chunk_size(), 10 * 1024 * 1024);
         assert_eq!(config.initial_chunk_size(), 10 * 1024 * 1024);  // 调整为 min
@@ -519,7 +534,7 @@ mod tests {
     fn test_progressive_worker_ratios_custom() {
         let config = DownloadConfig::builder()
             .progressive_worker_ratios(vec![0.5, 1.0])
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.progressive_worker_ratios(), &[0.5, 1.0]);
     }
@@ -529,7 +544,7 @@ mod tests {
         // 测试自动排序
         let config = DownloadConfig::builder()
             .progressive_worker_ratios(vec![1.0, 0.25, 0.75, 0.5])
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
     }
@@ -539,7 +554,7 @@ mod tests {
         // 测试过滤无效值（<= 0 或 > 1.0）
         let config = DownloadConfig::builder()
             .progressive_worker_ratios(vec![0.0, 0.5, 1.0, 1.5, -0.1])
-            .build();
+            .build().unwrap();
         
         // 0.0, 1.5, -0.1 应该被过滤掉
         assert_eq!(config.progressive_worker_ratios(), &[0.5, 1.0]);
@@ -550,7 +565,7 @@ mod tests {
         // 测试去重
         let config = DownloadConfig::builder()
             .progressive_worker_ratios(vec![0.5, 0.5, 1.0, 1.0, 0.25])
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 1.0]);
     }
@@ -560,13 +575,13 @@ mod tests {
         // 测试空序列或全部无效值时使用默认值
         let config = DownloadConfig::builder()
             .progressive_worker_ratios(vec![])
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.progressive_worker_ratios(), DEFAULT_PROGRESSIVE_WORKER_RATIOS);
         
         let config2 = DownloadConfig::builder()
             .progressive_worker_ratios(vec![0.0, -1.0, 2.0])
-            .build();
+            .build().unwrap();
         
         assert_eq!(config2.progressive_worker_ratios(), DEFAULT_PROGRESSIVE_WORKER_RATIOS);
     }
@@ -575,7 +590,7 @@ mod tests {
     fn test_min_speed_threshold() {
         let config = DownloadConfig::builder()
             .min_speed_threshold(5 * 1024 * 1024)  // 5 MB/s
-            .build();
+            .build().unwrap();
         
         assert_eq!(config.min_speed_threshold(), 5 * 1024 * 1024);
     }

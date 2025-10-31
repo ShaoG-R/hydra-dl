@@ -15,7 +15,7 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
         .initial_chunk_size(cli.chunk_size * 1024 * 1024)
         .min_chunk_size(cli.min_chunk * 1024 * 1024)
         .max_chunk_size(cli.max_chunk * 1024 * 1024)
-        .build();
+        .build()?;
 
     info!(
         "开始下载: {}",

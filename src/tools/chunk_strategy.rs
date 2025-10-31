@@ -139,7 +139,7 @@ mod tests {
             .max_chunk_size(100 * 1024 * 1024)
             .expected_chunk_duration(Duration::from_secs(3))
             .smoothing_factor(0.5)
-            .build();
+            .build().unwrap();
 
         let strategy = SpeedBasedChunkStrategy::from_config(&config);
 

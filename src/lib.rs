@@ -92,7 +92,7 @@
 //!         .initial_chunk_size(10 * 1024 * 1024)    // 初始 10 MB 分块
 //!         .min_chunk_size(5 * 1024 * 1024)         // 最小 5 MB（慢速时）
 //!         .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB（高速时）
-//!         .build();
+//!         .build().unwrap();
 //!     
 //!     let (handle, save_path) = rs_dn::download_ranged(
 //!         "https://example.com/large_file.zip",
@@ -194,6 +194,14 @@ pub enum DownloadError {
     /// Range Writer 所有权错误
     #[error("无法获取 RangeWriter 的所有权（仍有其他引用）")]
     WriterOwnership,
+    
+    /// Worker 不存在或已被移除
+    #[error("Worker #{0} 不存在或已被移除")]
+    WorkerNotFound(usize),
+
+    /// Worker 池已满
+    #[error("Worker 池已满，无法添加更多 worker（最大 {0} 个）")]
+    WorkerPoolFull(usize),
     
     /// 通用错误
     #[error("{0}")]
