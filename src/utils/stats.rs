@@ -1,21 +1,25 @@
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// 采样点数据：记录某一时刻的下载状态
-#[derive(Debug, Clone, Copy)]
-struct SamplePoint {
-    /// 采样时刻
-    timestamp: Instant,
-    /// 该时刻的总下载字节数
-    bytes: u64,
+/// 统计聚合器
+/// 
+/// 轻量级的聚合器，用于父级统计，只包含原子计数器
+/// 多个子统计可以共享同一个聚合器，实时更新父级数据
+#[derive(Debug)]
+pub(crate) struct StatsAggregator {
+    /// 总下载字节数（原子操作，无锁）
+    total_bytes: AtomicU64,
+    /// 完成的 range 数量（原子操作，无锁）
+    completed_ranges: AtomicUsize,
+    /// 下载开始时间（只初始化一次）
+    start_time: OnceLock<Instant>,
 }
 
 /// 下载速度统计
 /// 
 /// 线程安全的统计结构，在下载过程中被所有 worker 共享并实时更新
-/// 使用细粒度锁（原子操作 + OnceLock + parking_lot::Mutex）以提升并发性能
+/// 使用完全无锁的原子操作，实现高性能并发
 /// 
 /// # 支持两种速度计算
 /// 
@@ -30,10 +34,10 @@ struct SamplePoint {
 /// 
 /// # 性能优化
 /// 
-/// - `total_bytes` 和 `completed_ranges` 使用原子操作，无锁并发
+/// - 所有字段使用原子操作，完全无锁并发
 /// - `start_time` 使用 OnceLock，只初始化一次
-/// - `last_sample` 使用 OnceLock<Mutex<>>，只初始化一次 Mutex，减少开销
-/// - Mutex 使用 parking_lot 实现，性能优于标准库 Mutex
+/// - `last_sample_*` 使用原子操作存储采样点，无需 Mutex
+/// - 支持父子统计聚合，子统计自动更新父级
 /// 
 /// # 线程安全
 /// 
@@ -45,19 +49,14 @@ pub(crate) struct DownloadStats {
     pub(crate) start_time: OnceLock<Instant>,
     /// 完成的 range 数量（原子操作，无锁）
     completed_ranges: AtomicUsize,
-    /// 上一次采样点（用于计算实时速度，只初始化一次，之后用 parking_lot::Mutex 保护）
-    last_sample: OnceLock<Mutex<SamplePoint>>,
+    /// 上一次采样点的时间戳（纳秒，相对于 start_time）
+    last_sample_timestamp_ns: AtomicU64,
+    /// 上一次采样点的字节数
+    last_sample_bytes: AtomicU64,
     /// 实时速度的时间窗口（默认 1 秒）
     instant_speed_window: Duration,
-    /// 记录 chunk 时的回调（用于聚合或自定义逻辑）
-    /// 
-    /// 回调接收下载的字节数，在 record_chunk 时触发
-    /// 使用 Arc 以便多个 stats 可以共享同一个回调（如多个 child 更新同一个 parent）
-    on_chunk: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
-    /// 记录 range 完成时的回调
-    /// 
-    /// 在 record_range_complete 时触发
-    on_range_complete: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// 父级聚合器（子统计通过此字段自动更新父级）
+    parent_aggregator: Option<Arc<StatsAggregator>>,
 }
 
 impl Default for DownloadStats {
@@ -87,55 +86,45 @@ impl DownloadStats {
             total_bytes: AtomicU64::new(0),
             start_time: OnceLock::new(),
             completed_ranges: AtomicUsize::new(0),
-            last_sample: OnceLock::new(),
+            last_sample_timestamp_ns: AtomicU64::new(0),
+            last_sample_bytes: AtomicU64::new(0),
             instant_speed_window,
-            on_chunk: None,
-            on_range_complete: None,
+            parent_aggregator: None,
         }
     }
 
-    /// 创建带回调的统计实例
+    /// 创建带父级聚合器的统计实例
     /// 
     /// # Arguments
     /// 
     /// * `instant_speed_window` - 实时速度的时间窗口
-    /// * `on_chunk` - 记录 chunk 时的回调，接收下载的字节数
-    /// * `on_range_complete` - 记录 range 完成时的回调
+    /// * `parent_aggregator` - 父级聚合器，子统计会自动更新父级
     /// 
     /// # Examples
     /// 
     /// ```ignore
     /// use rs_dn::DownloadStats;
     /// use std::sync::Arc;
-    /// use std::sync::atomic::{AtomicU64, Ordering};
     /// 
-    /// let total = Arc::new(AtomicU64::new(0));
-    /// let total_clone = Arc::clone(&total);
+    /// let parent = DownloadStatsParent::default();
+    /// let child = parent.create_child();
     /// 
-    /// let stats = DownloadStats::with_callbacks(
-    ///     Duration::from_secs(1),
-    ///     Some(Arc::new(move |bytes| {
-    ///         total_clone.fetch_add(bytes, Ordering::Relaxed);
-    ///     })),
-    ///     None,
-    /// );
-    /// 
-    /// stats.record_chunk(1024);
-    /// assert_eq!(total.load(Ordering::Relaxed), 1024);
+    /// child.record_chunk(1024);
+    /// let (bytes, _, _) = parent.get_summary();
+    /// assert_eq!(bytes, 1024);
     /// ```
-    pub(crate) fn with_callbacks(
+    pub(crate) fn with_parent(
         instant_speed_window: Duration,
-        on_chunk: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
-        on_range_complete: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        parent_aggregator: Arc<StatsAggregator>,
     ) -> Self {
         Self {
             total_bytes: AtomicU64::new(0),
             start_time: OnceLock::new(),
             completed_ranges: AtomicUsize::new(0),
-            last_sample: OnceLock::new(),
+            last_sample_timestamp_ns: AtomicU64::new(0),
+            last_sample_bytes: AtomicU64::new(0),
             instant_speed_window,
-            on_chunk,
-            on_range_complete,
+            parent_aggregator: Some(parent_aggregator),
         }
     }
 
@@ -162,9 +151,10 @@ impl DownloadStats {
         // 原子增加字节数（使用 Relaxed 顺序，性能最佳）
         self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         
-        // 触发回调（用于聚合或自定义逻辑）
-        if let Some(callback) = &self.on_chunk {
-            callback(bytes);
+        // 同步到父级聚合器（如果存在）
+        if let Some(parent) = &self.parent_aggregator {
+            parent.start_time.get_or_init(|| Instant::now());
+            parent.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
@@ -181,9 +171,9 @@ impl DownloadStats {
     pub(crate) fn record_range_complete(&self) {
         self.completed_ranges.fetch_add(1, Ordering::Relaxed);
         
-        // 触发回调（用于聚合或自定义逻辑）
-        if let Some(callback) = &self.on_range_complete {
-            callback();
+        // 同步到父级聚合器（如果存在）
+        if let Some(parent) = &self.parent_aggregator {
+            parent.completed_ranges.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -261,22 +251,29 @@ impl DownloadStats {
         let now = Instant::now();
         let current_bytes = self.total_bytes.load(Ordering::Relaxed);
         
-        // 首次调用时初始化采样点（只初始化一次）
-        let sample_mutex = self.last_sample.get_or_init(|| {
-            Mutex::new(SamplePoint {
-                timestamp: now,
-                bytes: current_bytes,
-            })
-        });
+        // 获取采样点（原子读取）
+        let last_timestamp_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
+        let last_bytes = self.last_sample_bytes.load(Ordering::Relaxed);
         
-        // 获取锁并更新采样点
-        let mut sample = sample_mutex.lock();
+        // 获取开始时间，如果还未初始化则使用当前时间
+        let start_time = self.start_time.get().copied().unwrap_or(now);
         
-        let elapsed = now.duration_since(sample.timestamp);
+        // 首次调用：初始化采样点
+        if last_timestamp_ns == 0 {
+            let elapsed_ns = start_time.elapsed().as_nanos() as u64;
+            self.last_sample_timestamp_ns.store(elapsed_ns, Ordering::Relaxed);
+            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
+            return (0.0, false);
+        }
         
-        // 如果距离上次采样时间超过时间窗口，计算实时速度并更新采样点
+        // 计算距离上次采样的时间
+        let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
+        let elapsed_ns = current_elapsed_ns.saturating_sub(last_timestamp_ns);
+        let elapsed = Duration::from_nanos(elapsed_ns);
+        
+        // 如果超过时间窗口，更新采样点并计算速度
         if elapsed >= self.instant_speed_window {
-            let bytes_diff = current_bytes.saturating_sub(sample.bytes);
+            let bytes_diff = current_bytes.saturating_sub(last_bytes);
             let elapsed_secs = elapsed.as_secs_f64();
             let instant_speed = if elapsed_secs > 0.0 {
                 bytes_diff as f64 / elapsed_secs
@@ -284,14 +281,14 @@ impl DownloadStats {
                 0.0
             };
             
-            // 更新采样点
-            sample.timestamp = now;
-            sample.bytes = current_bytes;
+            // 原子更新采样点（无锁，可能有多个线程同时更新，但不影响正确性）
+            self.last_sample_timestamp_ns.store(current_elapsed_ns, Ordering::Relaxed);
+            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
             
             (instant_speed, true)
         } else {
-            // 时间窗口未到，返回当前计算的速度（估算）
-            let bytes_diff = current_bytes.saturating_sub(sample.bytes);
+            // 时间窗口未到，返回估算速度
+            let bytes_diff = current_bytes.saturating_sub(last_bytes);
             let elapsed_secs = elapsed.as_secs_f64();
             let instant_speed = if elapsed_secs > 0.0 {
                 bytes_diff as f64 / elapsed_secs
@@ -322,6 +319,7 @@ impl DownloadStats {
     /// let (bytes, elapsed, ranges) = stats.get_summary();
     /// println!("下载了 {} bytes，耗时 {:.2}s，完成 {} 个 ranges", bytes, elapsed, ranges);
     /// ```
+    #[allow(dead_code)]
     pub(crate) fn get_summary(&self) -> (u64, f64, usize) {
         let bytes = self.total_bytes.load(Ordering::Relaxed);
         let ranges = self.completed_ranges.load(Ordering::Relaxed);
@@ -372,9 +370,10 @@ impl std::fmt::Debug for DownloadStats {
             .field("total_bytes", &self.total_bytes)
             .field("start_time", &self.start_time)
             .field("completed_ranges", &self.completed_ranges)
+            .field("last_sample_timestamp_ns", &self.last_sample_timestamp_ns)
+            .field("last_sample_bytes", &self.last_sample_bytes)
             .field("instant_speed_window", &self.instant_speed_window)
-            .field("on_chunk", &self.on_chunk.as_ref().map(|_| "<callback>"))
-            .field("on_range_complete", &self.on_range_complete.as_ref().map(|_| "<callback>"))
+            .field("has_parent", &self.parent_aggregator.is_some())
             .finish()
     }
 }
@@ -406,8 +405,13 @@ impl std::fmt::Debug for DownloadStats {
 /// ```
 #[derive(Debug)]
 pub(crate) struct DownloadStatsParent {
-    /// 内部聚合统计
-    inner: std::sync::Arc<DownloadStats>,
+    /// 聚合器，存储所有子统计的累加结果
+    aggregator: Arc<StatsAggregator>,
+    /// 实时速度的时间窗口
+    instant_speed_window: Duration,
+    /// 父级自己的采样点（用于计算聚合的实时速度）
+    last_sample_timestamp_ns: AtomicU64,
+    last_sample_bytes: AtomicU64,
 }
 
 impl Default for DownloadStatsParent {
@@ -433,7 +437,14 @@ impl DownloadStatsParent {
     /// ```
     pub(crate) fn with_window(instant_speed_window: Duration) -> Self {
         Self {
-            inner: std::sync::Arc::new(DownloadStats::with_window(instant_speed_window)),
+            aggregator: Arc::new(StatsAggregator {
+                total_bytes: AtomicU64::new(0),
+                completed_ranges: AtomicUsize::new(0),
+                start_time: OnceLock::new(),
+            }),
+            instant_speed_window,
+            last_sample_timestamp_ns: AtomicU64::new(0),
+            last_sample_bytes: AtomicU64::new(0),
         }
     }
 
@@ -458,7 +469,7 @@ impl DownloadStatsParent {
     /// // parent 的统计会自动更新
     /// ```
     pub(crate) fn create_child(&self) -> DownloadStats {
-        self.create_child_with_window(self.inner.instant_speed_window)
+        self.create_child_with_window(self.instant_speed_window)
     }
 
     /// 创建子统计并指定时间窗口
@@ -477,19 +488,7 @@ impl DownloadStatsParent {
     /// let child = parent.create_child_with_window(Duration::from_millis(200));
     /// ```
     pub(crate) fn create_child_with_window(&self, instant_speed_window: Duration) -> DownloadStats {
-        // 创建闭包来更新 parent 的统计
-        let parent_inner = std::sync::Arc::clone(&self.inner);
-        let on_chunk = std::sync::Arc::new(move |bytes: u64| {
-            parent_inner.start_time.get_or_init(|| Instant::now());
-            parent_inner.total_bytes.fetch_add(bytes, Ordering::Relaxed);
-        });
-        
-        let parent_inner = std::sync::Arc::clone(&self.inner);
-        let on_range_complete = std::sync::Arc::new(move || {
-            parent_inner.completed_ranges.fetch_add(1, Ordering::Relaxed);
-        });
-        
-        DownloadStats::with_callbacks(instant_speed_window, Some(on_chunk), Some(on_range_complete))
+        DownloadStats::with_parent(instant_speed_window, Arc::clone(&self.aggregator))
     }
 
     /// 获取聚合统计摘要
@@ -507,7 +506,13 @@ impl DownloadStatsParent {
     /// let (bytes, elapsed, ranges) = parent.get_summary();
     /// ```
     pub(crate) fn get_summary(&self) -> (u64, f64, usize) {
-        self.inner.get_summary()
+        let bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
+        let ranges = self.aggregator.completed_ranges.load(Ordering::Relaxed);
+        let elapsed_secs = self.aggregator.start_time
+            .get()
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        (bytes, elapsed_secs, ranges)
     }
 
     /// 获取聚合平均速度（bytes/s）
@@ -521,7 +526,14 @@ impl DownloadStatsParent {
     /// let speed = parent.get_speed();
     /// ```
     pub(crate) fn get_speed(&self) -> f64 {
-        self.inner.get_speed()
+        if let Some(start_time) = self.aggregator.start_time.get() {
+            let elapsed_secs = start_time.elapsed().as_secs_f64();
+            if elapsed_secs > 0.0 {
+                let bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
+                return bytes as f64 / elapsed_secs;
+            }
+        }
+        0.0
     }
 
     /// 获取聚合实时速度（bytes/s）
@@ -539,7 +551,57 @@ impl DownloadStatsParent {
     /// let (instant_speed, valid) = parent.get_instant_speed();
     /// ```
     pub(crate) fn get_instant_speed(&self) -> (f64, bool) {
-        self.inner.get_instant_speed()
+        let now = Instant::now();
+        let current_bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
+        
+        // 获取采样点（原子读取）
+        let last_timestamp_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
+        let last_bytes = self.last_sample_bytes.load(Ordering::Relaxed);
+        
+        // 获取开始时间，如果还未初始化则使用当前时间
+        let start_time = self.aggregator.start_time.get().copied().unwrap_or(now);
+        
+        // 首次调用：初始化采样点
+        if last_timestamp_ns == 0 {
+            let elapsed_ns = start_time.elapsed().as_nanos() as u64;
+            self.last_sample_timestamp_ns.store(elapsed_ns, Ordering::Relaxed);
+            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
+            return (0.0, false);
+        }
+        
+        // 计算距离上次采样的时间
+        let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
+        let elapsed_ns = current_elapsed_ns.saturating_sub(last_timestamp_ns);
+        let elapsed = Duration::from_nanos(elapsed_ns);
+        
+        // 如果超过时间窗口，更新采样点并计算速度
+        if elapsed >= self.instant_speed_window {
+            let bytes_diff = current_bytes.saturating_sub(last_bytes);
+            let elapsed_secs = elapsed.as_secs_f64();
+            let instant_speed = if elapsed_secs > 0.0 {
+                bytes_diff as f64 / elapsed_secs
+            } else {
+                0.0
+            };
+            
+            // 原子更新采样点（无锁）
+            self.last_sample_timestamp_ns.store(current_elapsed_ns, Ordering::Relaxed);
+            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
+            
+            (instant_speed, true)
+        } else {
+            // 时间窗口未到，返回估算速度
+            let bytes_diff = current_bytes.saturating_sub(last_bytes);
+            let elapsed_secs = elapsed.as_secs_f64();
+            let instant_speed = if elapsed_secs > 0.0 {
+                bytes_diff as f64 / elapsed_secs
+            } else {
+                0.0
+            };
+            
+            // 如果是刚初始化（elapsed 接近 0），返回 false
+            (instant_speed, elapsed_secs > 0.01)
+        }
     }
 
     /// 获取完整的聚合统计
@@ -558,7 +620,16 @@ impl DownloadStatsParent {
     /// ```
     #[allow(dead_code)]
     pub(crate) fn get_full_summary(&self) -> (u64, f64, usize, f64, f64, bool) {
-        self.inner.get_full_summary()
+        let bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
+        let ranges = self.aggregator.completed_ranges.load(Ordering::Relaxed);
+        let elapsed_secs = self.aggregator.start_time
+            .get()
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let avg_speed = self.get_speed();
+        let (instant_speed, instant_valid) = self.get_instant_speed();
+        
+        (bytes, elapsed_secs, ranges, avg_speed, instant_speed, instant_valid)
     }
 }
 
@@ -802,54 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn test_callback_on_chunk() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
-        
-        let total = Arc::new(AtomicU64::new(0));
-        let total_clone = Arc::clone(&total);
-        
-        let stats = DownloadStats::with_callbacks(
-            Duration::from_secs(1),
-            Some(Arc::new(move |bytes| {
-                total_clone.fetch_add(bytes, Ordering::Relaxed);
-            })),
-            None,
-        );
-        
-        stats.record_chunk(1024);
-        assert_eq!(total.load(Ordering::Relaxed), 1024);
-        
-        stats.record_chunk(2048);
-        assert_eq!(total.load(Ordering::Relaxed), 3072);
-    }
-
-    #[test]
-    fn test_callback_on_range_complete() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        
-        let count = Arc::new(AtomicUsize::new(0));
-        let count_clone = Arc::clone(&count);
-        
-        let stats = DownloadStats::with_callbacks(
-            Duration::from_secs(1),
-            None,
-            Some(Arc::new(move || {
-                count_clone.fetch_add(1, Ordering::Relaxed);
-            })),
-        );
-        
-        stats.record_range_complete();
-        assert_eq!(count.load(Ordering::Relaxed), 1);
-        
-        stats.record_range_complete();
-        stats.record_range_complete();
-        assert_eq!(count.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn test_parent_child_with_callbacks() {
+    fn test_parent_child_aggregation() {
         let parent = DownloadStatsParent::default();
         let child1 = parent.create_child();
         let child2 = parent.create_child();
@@ -870,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parent_child_concurrent_callbacks() {
+    fn test_parent_child_concurrent_aggregation() {
         use std::sync::Arc;
         use std::thread;
         
@@ -896,34 +920,8 @@ mod tests {
         }
         
         let (total_bytes, _, total_ranges) = parent.get_summary();
-        assert_eq!(total_bytes, 10 * 100 * 1024, "并发回调应该正确累加字节数");
-        assert_eq!(total_ranges, 10, "并发回调应该正确累加 range 数");
-    }
-
-    #[test]
-    fn test_callback_flexibility() {
-        use std::sync::Mutex;
-        use std::sync::Arc;
-        
-        // 测试回调的灵活性：可以执行任意逻辑
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let log_clone = Arc::clone(&log);
-        
-        let stats = DownloadStats::with_callbacks(
-            Duration::from_secs(1),
-            Some(Arc::new(move |bytes| {
-                log_clone.lock().unwrap().push(format!("chunk: {}", bytes));
-            })),
-            None,
-        );
-        
-        stats.record_chunk(1024);
-        stats.record_chunk(2048);
-        
-        let logs = log.lock().unwrap();
-        assert_eq!(logs.len(), 2);
-        assert_eq!(logs[0], "chunk: 1024");
-        assert_eq!(logs[1], "chunk: 2048");
+        assert_eq!(total_bytes, 10 * 100 * 1024, "并发聚合应该正确累加字节数");
+        assert_eq!(total_ranges, 10, "并发聚合应该正确累加 range 数");
     }
 }
 
