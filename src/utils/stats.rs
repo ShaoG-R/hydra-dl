@@ -57,6 +57,9 @@ pub(crate) struct DownloadStats {
     instant_speed_window: Duration,
     /// 父级聚合器（子统计通过此字段自动更新父级）
     parent_aggregator: Option<Arc<StatsAggregator>>,
+    /// 当前分块大小（原子操作，无锁）
+    /// 由 worker 内部的 ChunkStrategy 更新，外部只读访问
+    current_chunk_size: AtomicU64,
 }
 
 impl Default for DownloadStats {
@@ -90,6 +93,7 @@ impl DownloadStats {
             last_sample_bytes: AtomicU64::new(0),
             instant_speed_window,
             parent_aggregator: None,
+            current_chunk_size: AtomicU64::new(0),
         }
     }
 
@@ -125,6 +129,7 @@ impl DownloadStats {
             last_sample_bytes: AtomicU64::new(0),
             instant_speed_window,
             parent_aggregator: Some(parent_aggregator),
+            current_chunk_size: AtomicU64::new(0),
         }
     }
 
@@ -328,6 +333,24 @@ impl DownloadStats {
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0);
         (bytes, elapsed_secs, ranges)
+    }
+
+    /// 获取当前分块大小
+    /// 
+    /// # Returns
+    /// 
+    /// 当前分块大小 (bytes)
+    pub(crate) fn get_current_chunk_size(&self) -> u64 {
+        self.current_chunk_size.load(Ordering::Relaxed)
+    }
+    
+    /// 设置当前分块大小
+    /// 
+    /// # Arguments
+    /// 
+    /// * `size` - 新的分块大小 (bytes)
+    pub(crate) fn set_current_chunk_size(&self, size: u64) {
+        self.current_chunk_size.store(size, Ordering::Relaxed);
     }
 
     /// 获取完整的统计摘要（包含平均速度和实时速度）

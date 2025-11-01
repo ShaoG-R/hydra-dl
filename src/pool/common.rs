@@ -105,14 +105,24 @@ pub trait WorkerTask: Send + Clone + Debug + 'static {}
 /// - `Debug`: 结果可以被调试输出
 pub trait WorkerResult: Send + Debug + 'static {}
 
-/// Worker 上下文 trait
+/// Worker 统计 trait
 ///
-/// 每个 worker 独立持有的上下文数据（如统计信息、策略等）
+/// 外部可访问的只读统计数据，支持多线程并发访问
 ///
 /// # 要求
 ///
-/// - `Send + Sync`: 上下文可以在线程间安全共享
-pub trait WorkerContext: Send + Sync + 'static {}
+/// - `Send + Sync`: 统计数据可以在线程间安全共享（通过 Arc）
+pub trait WorkerStats: Send + Sync + 'static {}
+
+/// Worker 上下文 trait
+///
+/// 每个 worker 独立持有的上下文数据（如分块策略等）
+/// Context 完全归 worker 所有，外部无法访问
+///
+/// # 要求
+///
+/// - `Send`: 上下文可以在线程间传递（worker 独占所有权）
+pub trait WorkerContext: Send + 'static {}
 
 /// Worker 执行器 trait
 ///
@@ -123,24 +133,26 @@ pub trait WorkerContext: Send + Sync + 'static {}
 /// - `T`: 任务类型
 /// - `R`: 结果类型
 /// - `C`: 上下文类型
+/// - `S`: 统计类型
 ///
 /// # 要求
 ///
 /// - `Send + Sync`: 执行器可以在多个 worker 间共享
 #[async_trait]
-pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext>: Send + Sync + 'static {
+pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats>: Send + Sync + 'static {
     /// 执行任务
     ///
     /// # Arguments
     ///
     /// - `worker_id`: Worker ID
     /// - `task`: 要处理的任务
-    /// - `context`: Worker 的上下文（可用于访问统计、策略等）
+    /// - `context`: Worker 的上下文（可用于访问策略等，worker 独占）
+    /// - `stats`: Worker 的统计数据（外部可访问，只读）
     ///
     /// # Returns
     ///
     /// 任务执行结果
-    async fn execute(&self, worker_id: usize, task: T, context: &C) -> R;
+    async fn execute(&self, worker_id: usize, task: T, context: &mut C, stats: &S) -> R;
 }
 
 /// Worker 协程主循环
@@ -154,20 +166,23 @@ pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext>: Send
 /// - `T`: 任务类型
 /// - `R`: 结果类型
 /// - `C`: 上下文类型
+/// - `S`: 统计类型
 /// - `E`: 执行器类型
-pub(crate) async fn run_worker<T, R, C, E>(
+pub(crate) async fn run_worker<T, R, C, S, E>(
     id: usize,
     executor: Arc<E>,
     mut task_receiver: Receiver<T>,
     result_sender: Sender<R>,
-    context: Arc<C>,
+    mut context: C,
+    stats: Arc<S>,
     mut shutdown_receiver: tokio::sync::oneshot::Receiver<()>,
 )
 where
     T: WorkerTask,
     R: WorkerResult,
     C: WorkerContext,
-    E: WorkerExecutor<T, R, C> + ?Sized,
+    S: WorkerStats,
+    E: WorkerExecutor<T, R, C, S> + ?Sized,
 {
     info!("Worker #{} 启动", id);
 
@@ -182,7 +197,7 @@ where
                 debug!("Worker #{} 接收到任务: {:?}", id, task);
 
                 // 执行任务
-                let result = executor.execute(id, task, &context).await;
+                let result = executor.execute(id, task, &mut context, &stats).await;
 
                 // 发送结果
                 if let Err(e) = result_sender.send(result).await {
@@ -204,11 +219,11 @@ where
 /// 单个 Worker 的槽位
 ///
 /// 封装了与单个 worker 交互所需的所有信息
-pub struct WorkerSlot<T: WorkerTask, C: WorkerContext> {
+pub struct WorkerSlot<T: WorkerTask, S: WorkerStats> {
     /// 向 worker 发送任务的通道
     pub(crate) task_sender: Sender<T>,
-    /// 该 worker 的独立上下文（Arc 包装以便在 worker 协程中共享）
-    pub(crate) context: Arc<C>,
+    /// 该 worker 的统计数据（Arc 包装以便外部访问）
+    pub(crate) stats: Arc<S>,
     /// 关闭通道的发送端（用于向 worker 发送关闭信号）
     pub(crate) shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -216,18 +231,18 @@ pub struct WorkerSlot<T: WorkerTask, C: WorkerContext> {
 /// Worker 自动清理器
 /// 
 /// 封装 worker 退出时的资源清理逻辑
-pub(crate) struct WorkerCleanup<T: WorkerTask, C: WorkerContext> {
+pub(crate) struct WorkerCleanup<T: WorkerTask, S: WorkerStats> {
     /// Worker ID
     worker_id: usize,
     /// 该 worker 的 slot 引用（而非整个 workers 数组）
-    slot: Arc<ArcSwap<Option<WorkerSlot<T, C>>>>,
+    slot: Arc<ArcSwap<Option<WorkerSlot<T, S>>>>,
     /// Worker 槽位空闲位掩码
     free_mask: Arc<WorkerMask>,
     /// Worker 全部退出通知器
     shutdown_notify: Arc<Notify>,
 }
 
-impl<T: WorkerTask, C: WorkerContext> WorkerCleanup<T, C> {
+impl<T: WorkerTask, S: WorkerStats> WorkerCleanup<T, S> {
     /// 执行清理逻辑
     pub(crate) fn cleanup(self) {
         let worker_id = self.worker_id;
@@ -261,6 +276,7 @@ impl<T: WorkerTask, C: WorkerContext> WorkerCleanup<T, C> {
 /// - `T`: 任务类型
 /// - `R`: 结果类型
 /// - `C`: 上下文类型
+/// - `S`: 统计类型
 ///
 /// # 核心功能
 ///
@@ -268,20 +284,20 @@ impl<T: WorkerTask, C: WorkerContext> WorkerCleanup<T, C> {
 /// - 发送任务到指定 worker
 /// - 接收结果（统一 result channel）
 /// - 动态添加 worker
-/// - 访问 worker 上下文
+/// - 访问 worker 统计数据
 /// - Worker 自动清理（退出时自动释放资源）
-pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext> {
+pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats> {
     /// Worker 槽位数组（索引即为 worker_id，None 表示该位置空闲）
     /// 使用固定大小数组和 ArcSwap 实现无锁并发访问
     /// ArcSwap<T> = ArcSwapAny<Arc<T>>，所以这里是 Arc<Option<WorkerSlot>>
     /// 外层 Arc 允许在 tokio::spawn 闭包中访问（worker 自动清理需要）
-    pub(crate) workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT],
+    pub(crate) workers: [Arc<ArcSwap<Option<WorkerSlot<T, S>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT],
     /// 统一的结果接收器（所有 worker 共享）
     result_receiver: Receiver<R>,
     /// 结果发送器的克隆（用于创建新 worker）
     result_sender: Sender<R>,
     /// 执行器（所有 worker 共享）
-    pub(crate) executor: Arc<dyn WorkerExecutor<T, R, C>>,
+    pub(crate) executor: Arc<dyn WorkerExecutor<T, R, C, S>>,
     /// Worker 槽位空闲位掩码（1 表示已占用，0 表示空闲）
     /// 用于快速查找空闲槽位和判断是否所有 worker 都已退出
     free_mask: Arc<WorkerMask>,
@@ -289,18 +305,19 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext> {
     shutdown_notify: Arc<Notify>,
 }
 
-impl<T, R, C> WorkerPool<T, R, C>
+impl<T, R, C, S> WorkerPool<T, R, C, S>
 where
     T: WorkerTask,
     R: WorkerResult,
     C: WorkerContext,
+    S: WorkerStats,
 {
     /// 创建新的协程池
     ///
     /// # Arguments
     ///
     /// - `executor`: 任务执行器（所有 worker 共享）
-    /// - `contexts`: 每个 worker 的独立上下文（数量决定初始 worker 数）
+    /// - `contexts_with_stats`: 每个 worker 的独立上下文和统计数据（数量决定初始 worker 数）
     ///
     /// # Returns
     ///
@@ -310,14 +327,14 @@ where
     ///
     /// ```ignore
     /// let executor = Arc::new(MyExecutor);
-    /// let contexts = vec![MyContext::new(); 4];
-    /// let pool = WorkerPool::new(executor, contexts);
+    /// let contexts_with_stats = vec![(MyContext::new(), Arc::new(MyStats::new())); 4];
+    /// let pool = WorkerPool::new(executor, contexts_with_stats);
     /// ```
-    pub fn new<E>(executor: Arc<E>, contexts: Vec<C>) -> Result<Self>
+    pub fn new<E>(executor: Arc<E>, contexts_with_stats: Vec<(C, Arc<S>)>) -> Result<Self>
     where
-        E: WorkerExecutor<T, R, C>,
+        E: WorkerExecutor<T, R, C, S>,
     {
-        let worker_count = contexts.len();
+        let worker_count = contexts_with_stats.len();
         
         // 验证 worker 数量不超过最大限制
         if worker_count > ConcurrencyDefaults::MAX_WORKER_COUNT {
@@ -328,7 +345,7 @@ where
         let (result_sender, result_receiver) = mpsc::channel::<R>(100);
         
         // 将具体类型的 executor 转换为 trait object
-        let executor_trait_obj: Arc<dyn WorkerExecutor<T, R, C>> = executor;
+        let executor_trait_obj: Arc<dyn WorkerExecutor<T, R, C, S>> = executor;
         
         // 初始化空闲位掩码
         let free_mask = Arc::new(WorkerMask::new(worker_count)?);
@@ -337,28 +354,25 @@ where
         let shutdown_notify = Arc::new(Notify::new());
         
         // 使用 array::from_fn 初始化固定大小数组（暂时全部为 None）
-        let workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
+        let workers: [Arc<ArcSwap<Option<WorkerSlot<T, S>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
             std::array::from_fn(|_| Arc::new(ArcSwap::new(Arc::new(None))));
         
-        // 为每个 worker 创建独立的 task channel 和上下文，并启动协程
-        for (id, context) in contexts.into_iter().enumerate() {
+        // 为每个 worker 创建独立的 task channel、上下文和统计，并启动协程
+        for (id, (context, stats_arc)) in contexts_with_stats.into_iter().enumerate() {
             let (task_sender, task_receiver) = mpsc::channel::<T>(100);
             
             // 创建关闭通道
             let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
             
-            // 将上下文包装在 Arc 中
-            let context_arc = Arc::new(context);
-            
             // 克隆共享资源给每个 worker
             let executor_clone = Arc::clone(&executor_trait_obj);
             let result_sender_clone = result_sender.clone();
-            let context_for_worker = Arc::clone(&context_arc);
+            let stats_for_worker = Arc::clone(&stats_arc);
             
             // 先创建 WorkerSlot 并存入 workers 数组
             let slot = WorkerSlot {
                 task_sender,
-                context: context_arc,
+                stats: stats_arc,
                 shutdown_sender: Some(shutdown_sender),
             };
             workers[id].store(Arc::new(Some(slot)));
@@ -374,8 +388,8 @@ where
             
             // 启动 worker 协程（包含自动清理逻辑）
             tokio::spawn(async move {
-                // 执行 worker 主循环
-                run_worker(id, executor_clone, task_receiver, result_sender_clone, context_for_worker, shutdown_receiver).await;
+                // 执行 worker 主循环（context 直接 move，stats 通过 Arc 共享）
+                run_worker(id, executor_clone, task_receiver, result_sender_clone, context, stats_for_worker, shutdown_receiver).await;
                 
                 // worker 退出后自动清理
                 cleanup.cleanup();
@@ -400,7 +414,7 @@ where
     ///
     /// # Arguments
     ///
-    /// - `contexts`: 要添加的 worker 的上下文列表
+    /// - `contexts_with_stats`: 要添加的 worker 的上下文和统计数据列表
     ///
     /// # Returns
     ///
@@ -409,16 +423,16 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// let new_contexts = vec![MyContext::new(); 2];
+    /// let new_contexts = vec![(MyContext::new(), Arc::new(MyStats::new())); 2];
     /// pool.add_workers(new_contexts)?;
     /// ```
-    pub async fn add_workers(&mut self, contexts: Vec<C>) -> Result<()> {
-        let count = contexts.len();
+    pub async fn add_workers(&mut self, contexts_with_stats: Vec<(C, Arc<S>)>) -> Result<()> {
+        let count = contexts_with_stats.len();
         let current_active = self.worker_count();
         
         info!("动态添加 {} 个新 workers (当前活跃 {} 个)", count, current_active);
         
-        for context in contexts.into_iter() {
+        for (context, stats_arc) in contexts_with_stats.into_iter() {
             // 使用位掩码快速查找第一个空位
             let worker_id = self.free_mask.allocate()?;
             
@@ -427,18 +441,15 @@ where
             // 创建关闭通道
             let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
             
-            // 将上下文包装在 Arc 中
-            let context_arc = Arc::new(context);
-            
             // 克隆共享资源给新 worker
             let executor_clone = Arc::clone(&self.executor);
             let result_sender_clone = self.result_sender.clone();
-            let context_for_worker = Arc::clone(&context_arc);
+            let stats_for_worker = Arc::clone(&stats_arc);
             
             // 创建 WorkerSlot 并存入 workers 数组
             let new_slot = Some(WorkerSlot {
                 task_sender,
-                context: context_arc,
+                stats: stats_arc,
                 shutdown_sender: Some(shutdown_sender),
             });
             self.workers[worker_id].store(Arc::new(new_slot));
@@ -454,8 +465,8 @@ where
             
             // 启动 worker 协程（包含自动清理逻辑）
             tokio::spawn(async move {
-                // 执行 worker 主循环
-                run_worker(worker_id, executor_clone, task_receiver, result_sender_clone, context_for_worker, shutdown_receiver).await;
+                // 执行 worker 主循环（context 直接 move，stats 通过 Arc 共享）
+                run_worker(worker_id, executor_clone, task_receiver, result_sender_clone, context, stats_for_worker, shutdown_receiver).await;
                 
                 // worker 退出后自动清理
                 cleanup.cleanup();
@@ -568,7 +579,7 @@ where
         &mut self.result_receiver
     }
 
-    /// 获取指定 worker 的上下文引用
+    /// 获取指定 worker 的统计数据引用
     ///
     /// # Arguments
     ///
@@ -576,15 +587,15 @@ where
     ///
     /// # Returns
     ///
-    /// Worker 上下文的 Arc 引用，如果 worker 不存在则返回 `None`
-    pub fn worker_context(&self, worker_id: usize) -> Option<Arc<C>> {
+    /// Worker 统计数据的 Arc 引用，如果 worker 不存在则返回 `None`
+    pub fn worker_stats(&self, worker_id: usize) -> Option<Arc<S>> {
         if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
             return None;
         }
         
         // load() 返回 Arc<Option<WorkerSlot>>
         let slot_arc = self.workers[worker_id].load();
-        slot_arc.as_ref().as_ref().map(|slot| Arc::clone(&slot.context))
+        slot_arc.as_ref().as_ref().map(|slot| Arc::clone(&slot.stats))
     }
 
     /// 优雅关闭所有 workers
@@ -673,16 +684,23 @@ mod tests {
         processed_count: AtomicUsize,
     }
     impl WorkerContext for TestContext {}
+    
+    // 测试用的统计
+    struct TestStats {
+        task_count: AtomicUsize,
+    }
+    impl WorkerStats for TestStats {}
 
     // 测试用的执行器
     struct TestExecutor;
     
     #[async_trait]
-    impl WorkerExecutor<TestTask, TestResult, TestContext> for TestExecutor {
-        async fn execute(&self, worker_id: usize, task: TestTask, context: &TestContext) -> TestResult {
+    impl WorkerExecutor<TestTask, TestResult, TestContext, TestStats> for TestExecutor {
+        async fn execute(&self, worker_id: usize, task: TestTask, context: &mut TestContext, stats: &TestStats) -> TestResult {
             // 模拟处理任务
             sleep(Duration::from_millis(10)).await;
             context.processed_count.fetch_add(1, Ordering::SeqCst);
+            stats.task_count.fetch_add(1, Ordering::SeqCst);
             TestResult::Success {
                 worker_id,
                 task_id: task.id,
@@ -693,11 +711,11 @@ mod tests {
     #[tokio::test]
     async fn test_worker_pool_creation() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let pool = WorkerPool::new(executor, contexts).unwrap();
+        let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         assert_eq!(pool.worker_count(), 2);
     }
@@ -705,10 +723,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_pool_send_and_receive() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let mut pool = WorkerPool::new(executor, contexts).unwrap();
+        let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         let task = TestTask {
             id: 1,
@@ -734,19 +752,19 @@ mod tests {
     #[tokio::test]
     async fn test_worker_pool_add_workers() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let mut pool = WorkerPool::new(executor, contexts).unwrap();
+        let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         assert_eq!(pool.worker_count(), 1);
 
         // 添加新 worker
-        let new_contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let new_contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        pool.add_workers(new_contexts).await.unwrap();
+        pool.add_workers(new_contexts_with_stats).await.unwrap();
 
         assert_eq!(pool.worker_count(), 3);
     }
@@ -754,11 +772,11 @@ mod tests {
     #[tokio::test]
     async fn test_worker_pool_shutdown() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let mut pool = WorkerPool::new(executor, contexts).unwrap();
+        let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         // 关闭 workers
         pool.shutdown();
@@ -773,13 +791,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_context_access() {
+    async fn test_worker_stats_access() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let mut pool = WorkerPool::new(executor, contexts).unwrap();
+        let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         // 发送任务
         let task = TestTask { id: 1, data: "test".to_string() };
@@ -788,20 +806,20 @@ mod tests {
         // 等待处理
         let _ = pool.result_receiver().recv().await;
 
-        // 验证上下文
-        let context = pool.worker_context(0).unwrap();
-        assert_eq!(context.processed_count.load(Ordering::SeqCst), 1);
+        // 验证统计数据
+        let stats = pool.worker_stats(0).unwrap();
+        assert_eq!(stats.task_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn test_shutdown_single_worker() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let pool = WorkerPool::new(executor, contexts).unwrap();
+        let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         // 验证初始 worker 数量
         assert_eq!(pool.worker_count(), 3);
@@ -832,12 +850,12 @@ mod tests {
     #[tokio::test]
     async fn test_add_workers_fills_gaps() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let mut pool = WorkerPool::new(executor.clone(), contexts).unwrap();
+        let mut pool = WorkerPool::new(executor.clone(), contexts_with_stats).unwrap();
 
         // 验证初始状态
         assert_eq!(pool.worker_count(), 3);
@@ -855,11 +873,11 @@ mod tests {
         assert_eq!(pool.worker_count(), 1);
 
         // 添加 2 个新 worker，应该填充到 #0 和 #1
-        let new_contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let new_contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        pool.add_workers(new_contexts).await.unwrap();
+        pool.add_workers(new_contexts_with_stats).await.unwrap();
         assert_eq!(pool.worker_count(), 3);
 
         // 验证所有位置都可用
@@ -876,10 +894,10 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_nonexistent_worker() {
         let executor = Arc::new(TestExecutor);
-        let contexts = vec![
-            TestContext { processed_count: AtomicUsize::new(0) },
+        let contexts_with_stats = vec![
+            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
         ];
-        let pool = WorkerPool::new(executor, contexts).unwrap();
+        let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         // 尝试关闭不存在的 worker（不再是 async）
         let result = pool.shutdown_worker(5);

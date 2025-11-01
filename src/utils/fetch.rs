@@ -1,7 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use log::{debug, info};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -245,7 +244,7 @@ pub async fn fetch_range<C>(
     client: &C,
     url: &str,
     range: AllocatedRange,
-    stats: Arc<DownloadStats>,
+    stats: &DownloadStats,
 ) -> Result<Bytes>
 where
     C: HttpClient,
@@ -271,7 +270,7 @@ where
         let chunk = chunk?;
         let chunk_size = chunk.len() as u64;
         
-        // 实时记录 chunk
+        // 实时记录 chunk（DownloadStats 是 Sync 的，可以通过引用调用）
         stats.record_chunk(chunk_size);
         
         buffer.extend_from_slice(&chunk);
@@ -601,7 +600,7 @@ mod tests {
         let full_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         
         let client = MockHttpClient::new();
-        let stats = Arc::new(DownloadStats::default());
+        let stats = DownloadStats::default();
 
         // 创建一个 RangeAllocator 来生成 AllocatedRange
         // RangeAllocator 总是从 0 开始分配
@@ -624,7 +623,7 @@ mod tests {
         );
 
         // 执行下载
-        let result = fetch_range(&client, test_url, range, stats.clone()).await;
+        let result = fetch_range(&client, test_url, range, &stats).await;
         assert!(result.is_ok(), "Range 下载应该成功: {:?}", result);
 
         let data = result.unwrap();
@@ -639,7 +638,7 @@ mod tests {
     async fn test_fetch_range_http_error() {
         let test_url = "http://example.com/file.bin";
         let client = MockHttpClient::new();
-        let stats = Arc::new(DownloadStats::default());
+        let stats = DownloadStats::default();
 
         let mut allocator = RangeAllocator::new(100);
         let range = allocator.allocate(10).unwrap();
@@ -655,7 +654,7 @@ mod tests {
         );
 
         // 执行下载
-        let result = fetch_range(&client, test_url, range, stats).await;
+        let result = fetch_range(&client, test_url, range, &stats).await;
         assert!(result.is_err(), "应该返回错误");
     }
 
@@ -746,7 +745,7 @@ mod tests {
         let end = large_data.len() as u64;
 
         let client = MockHttpClient::new();
-        let stats = Arc::new(DownloadStats::default());
+        let stats = DownloadStats::default();
 
         let mut allocator = RangeAllocator::new(end);
         let range = allocator.allocate(end).unwrap();
@@ -764,7 +763,7 @@ mod tests {
         );
 
         // 执行下载
-        let result = fetch_range(&client, test_url, range, stats.clone()).await;
+        let result = fetch_range(&client, test_url, range, &stats).await;
         assert!(result.is_ok(), "大数据 Range 下载应该成功");
 
         let data = result.unwrap();

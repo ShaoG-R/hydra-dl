@@ -8,7 +8,7 @@
 //! - **DownloadWorkerExecutor**: 下载任务执行器，处理 Range 下载和文件写入
 //! - **DownloadWorkerPool**: 下载协程池，封装通用 WorkerPool 并提供下载特定方法
 
-use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
+use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerStats, WorkerTask};
 use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::utils::fetch::fetch_range;
@@ -27,14 +27,14 @@ impl WorkerTask for RangeTask {}
 
 impl WorkerResult for RangeResult {}
 
+impl WorkerStats for DownloadStats {}
+
 // ==================== 下载 Worker 上下文 ====================
 
 /// 下载 Worker 的上下文
 ///
-/// 包含每个 worker 独立的统计信息和分块策略
+/// 包含每个 worker 独立的分块策略（统计信息已移至 Stats）
 pub(crate) struct DownloadWorkerContext {
-    /// 该 worker 的独立下载统计
-    pub(crate) stats: Arc<DownloadStats>,
     /// 该 worker 的独立分块策略（ChunkStrategy 内部使用原子操作，无需外部锁）
     pub(crate) chunk_strategy: Box<dyn ChunkStrategy>,
 }
@@ -77,7 +77,7 @@ where
 }
 
 #[async_trait]
-impl<C, F> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext> for DownloadWorkerExecutor<C, F>
+impl<C, F> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext, DownloadStats> for DownloadWorkerExecutor<C, F>
 where
     C: HttpClient,
     F: AsyncFile,
@@ -86,7 +86,8 @@ where
         &self,
         worker_id: usize,
         task: RangeTask,
-        context: &DownloadWorkerContext,
+        context: &mut DownloadWorkerContext,
+        stats: &DownloadStats,
     ) -> RangeResult {
         match task {
             RangeTask::Range { url, range, retry_count } => {
@@ -100,7 +101,7 @@ where
                 );
 
                 // 下载数据（在下载过程中会实时更新 stats）
-                let fetch_result = fetch_range(&self.client, &url, range, Arc::clone(&context.stats)).await;
+                let fetch_result = fetch_range(&self.client, &url, range, stats).await;
 
                 match fetch_result {
                     Ok(data) => {
@@ -108,7 +109,16 @@ where
                         match self.writer.write_range(range, data).await {
                             Ok(()) => {
                                 // 记录 range 完成
-                                context.stats.record_range_complete();
+                                stats.record_range_complete();
+                                
+                                // 根据当前速度更新分块大小
+                                let (instant_speed, valid) = stats.get_instant_speed();
+                                let avg_speed = stats.get_speed();
+                                if valid && instant_speed > 0.0 {
+                                    let current_chunk_size = stats.get_current_chunk_size();
+                                    let new_chunk_size = context.chunk_strategy.calculate_chunk_size(current_chunk_size, instant_speed, avg_speed);
+                                    stats.set_current_chunk_size(new_chunk_size);
+                                }
 
                                 // 返回完成结果
                                 RangeResult::Complete { worker_id }
@@ -160,7 +170,7 @@ where
 /// - `F`: 异步文件类型
 pub(crate) struct DownloadWorkerPool<F: AsyncFile> {
     /// 底层通用协程池
-    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext>,
+    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext, DownloadStats>,
     /// 全局统计管理器（聚合所有 worker 的数据）
     global_stats: DownloadStatsParent,
     /// 下载配置（用于创建新 worker 的分块策略）
@@ -197,24 +207,26 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         // 创建执行器
         let executor = Arc::new(DownloadWorkerExecutor::new(client, Arc::clone(&writer)));
 
-        // 为每个 worker 创建独立的上下文
-        let contexts: Vec<DownloadWorkerContext> = (0..initial_worker_count)
+        // 为每个 worker 创建独立的上下文和统计
+        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<DownloadStats>)> = (0..initial_worker_count)
             .map(|_| {
                 // 通过 parent 创建 child stats
                 let worker_stats = Arc::new(global_stats.create_child());
-                // 创建独立的分块策略（策略内部使用原子操作，无需外部锁）
+                // 设置初始分块大小
+                worker_stats.set_current_chunk_size(config.chunk().initial_size());
+                // 创建独立的分块策略（每个 worker 独立一份，策略是无状态的）
                 let chunk_strategy = 
                     Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
 
-                DownloadWorkerContext {
-                    stats: worker_stats,
+                let context = DownloadWorkerContext {
                     chunk_strategy,
-                }
+                };
+                (context, worker_stats)
             })
             .collect();
 
         // 创建通用协程池
-        let pool = WorkerPool::new(executor, contexts)?;
+        let pool = WorkerPool::new(executor, contexts_with_stats)?;
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
@@ -241,23 +253,25 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         C: HttpClient + Clone + Send + Sync + 'static,
     {
         let _ = client; // 当前实现使用现有的 executor，此参数保留以备将来使用
-        // 创建新的 worker 上下文
-        let contexts: Vec<DownloadWorkerContext> = (0..count)
+        // 创建新的 worker 上下文和统计
+        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<DownloadStats>)> = (0..count)
             .map(|_| {
                 let worker_stats = Arc::new(self.global_stats.create_child());
+                // 设置初始分块大小
+                worker_stats.set_current_chunk_size(self.config.chunk().initial_size());
                 // 创建独立的分块策略（策略内部使用原子操作，无需外部锁）
                 let chunk_strategy = 
                     Box::new(SpeedBasedChunkStrategy::from_config(&self.config)) as Box<dyn ChunkStrategy + Send + Sync>;
 
-                DownloadWorkerContext {
-                    stats: worker_stats,
+                let context = DownloadWorkerContext {
                     chunk_strategy,
-                }
+                };
+                (context, worker_stats)
             })
             .collect();
 
         // 添加新 workers（使用现有的执行器）
-        self.pool.add_workers(contexts).await
+        self.pool.add_workers(contexts_with_stats).await
     }
 
     /// 获取当前活跃 worker 总数
@@ -278,8 +292,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     /// 获取指定 worker 的统计信息
     #[allow(dead_code)]
     pub(crate) fn worker_stats(&self, worker_id: usize) -> Option<Arc<DownloadStats>> {
-        let context = self.pool.worker_context(worker_id)?;
-        Some(Arc::clone(&context.stats))
+        self.pool.worker_stats(worker_id)
     }
 
     /// 获取所有 worker 的聚合统计（O(1)，无需遍历）
@@ -312,42 +325,9 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     /// 当前分块大小 (bytes)，如果 worker 不存在返回默认初始分块大小
     #[inline]
     pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
-        self.pool.worker_context(worker_id).map(|context| context.chunk_strategy.current_chunk_size()).unwrap_or(self.config.chunk().initial_size())
-    }
-
-    /// 根据 worker 的实时速度和平均速度计算新的分块大小
-    ///
-    /// 使用该 worker 的独立分块策略、实时速度和平均速度来计算，并更新策略状态
-    ///
-    /// # Arguments
-    ///
-    /// - `worker_id`: Worker ID
-    ///
-    /// # Returns
-    ///
-    /// 计算得到的分块大小 (bytes)，如果 worker 不存在返回默认初始分块大小
-    ///
-    /// # Note
-    ///
-    /// 此方法会根据实时速度和平均速度（带权重）动态调整分块大小，策略内部使用原子操作更新状态
-    pub(crate) fn calculate_worker_chunk_size(&mut self, worker_id: usize) -> u64 {
-        match self.pool.worker_context(worker_id) {
-            Some(context) => {
-                let (instant_speed, valid) = context.stats.get_instant_speed();
-                let avg_speed = context.stats.get_speed();
-                
-                if valid && instant_speed > 0.0 {
-                    // 直接调用策略计算（内部使用原子操作更新）
-                    let new_chunk_size = context.chunk_strategy.calculate_chunk_size(instant_speed, avg_speed);
-                    new_chunk_size
-                } else {
-                    // 速度无效时返回当前分块大小
-                    context.chunk_strategy.current_chunk_size()
-                }
-            }
-            // 如果 worker 不存在，返回默认初始分块大小
-            None => self.config.chunk().initial_size(),
-        }
+        self.pool.worker_stats(worker_id)
+            .map(|stats| stats.get_current_chunk_size())
+            .unwrap_or(self.config.chunk().initial_size())
     }
 
     /// 优雅关闭所有 workers
@@ -402,8 +382,8 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
                 let slot_arc = worker_slot.load();
                 slot_arc.as_ref().as_ref().map(|worker| {
                     let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
-                        worker.context.stats.get_full_summary();
-                    let current_chunk_size = worker.context.chunk_strategy.current_chunk_size();
+                        worker.stats.get_full_summary();
+                    let current_chunk_size = worker.stats.get_current_chunk_size();
                     crate::download::WorkerStatSnapshot {
                         worker_id: id,
                         bytes: worker_bytes,
@@ -423,8 +403,8 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     ///
     /// Some((实时速度 bytes/s, 是否有效)) 或 None（如果 worker 不存在）
     pub(crate) fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
-        let context = self.pool.worker_context(worker_id)?;
-        Some(context.stats.get_instant_speed())
+        let stats = self.pool.worker_stats(worker_id)?;
+        Some(stats.get_instant_speed())
     }
 }
 
@@ -559,13 +539,12 @@ mod tests {
         // 创建执行器
         let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
 
-        // 创建上下文
-        let stats = Arc::new(DownloadStats::default());
+        // 创建上下文和统计
+        let stats = DownloadStats::default();
         let config = crate::config::DownloadConfig::default();
         let chunk_strategy = 
             Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
-        let context = DownloadWorkerContext {
-            stats: Arc::clone(&stats),
+        let mut context = DownloadWorkerContext {
             chunk_strategy,
         };
 
@@ -576,7 +555,7 @@ mod tests {
             retry_count: 0,
         };
 
-        let result = executor.execute(0, task, &context).await;
+        let result = executor.execute(0, task, &mut context, &stats).await;
 
         // 验证结果
         match result {
@@ -619,12 +598,11 @@ mod tests {
 
         let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
 
-        let stats = Arc::new(DownloadStats::default());
+        let stats = DownloadStats::default();
         let config = crate::config::DownloadConfig::default();
         let chunk_strategy = 
             Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
-        let context = DownloadWorkerContext {
-            stats,
+        let mut context = DownloadWorkerContext {
             chunk_strategy,
         };
 
@@ -634,7 +612,7 @@ mod tests {
             retry_count: 0,
         };
 
-        let result = executor.execute(0, task, &context).await;
+        let result = executor.execute(0, task, &mut context, &stats).await;
 
         // 验证结果
         match result {

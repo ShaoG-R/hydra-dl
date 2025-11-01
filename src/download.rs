@@ -449,9 +449,9 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
     
     /// 尝试为指定 worker 分配下一个任务
     /// 
-    /// 计算该 worker 的分块大小，并尝试分配新任务
+    /// 获取该 worker 的当前分块大小，并尝试分配新任务
     async fn try_allocate_next_task(&mut self, worker_id: usize) {
-        let chunk_size = self.pool.calculate_worker_chunk_size(worker_id);
+        let chunk_size = self.pool.get_worker_chunk_size(worker_id);
         
         if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
             debug!(
