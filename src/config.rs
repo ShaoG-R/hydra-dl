@@ -109,6 +109,23 @@ impl Default for ChunkConfig {
     }
 }
 
+impl ChunkConfig {
+    #[inline]
+    pub fn min_size(&self) -> u64 {
+        self.min_size
+    }
+
+    #[inline]
+    pub fn initial_size(&self) -> u64 {
+        self.initial_size
+    }
+
+    #[inline]
+    pub fn max_size(&self) -> u64 {
+        self.max_size
+    }
+}
+
 /// 并发配置
 ///
 /// 控制 Worker 并发数量
@@ -123,6 +140,13 @@ impl Default for ConcurrencyConfig {
         Self {
             worker_count: ConcurrencyDefaults::WORKER_COUNT,
         }
+    }
+}
+
+impl ConcurrencyConfig {
+    #[inline]
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
     }
 }
 
@@ -143,6 +167,18 @@ impl Default for NetworkConfig {
             timeout: Duration::from_secs(NetworkDefaults::TIMEOUT_SECS),
             connect_timeout: Duration::from_secs(NetworkDefaults::CONNECT_TIMEOUT_SECS),
         }
+    }
+}
+
+impl NetworkConfig {
+    #[inline]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    #[inline]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
     }
 }
 
@@ -175,6 +211,33 @@ impl Default for SpeedConfig {
     }
 }
 
+impl SpeedConfig {
+    #[inline]
+    pub fn instant_speed_window(&self) -> Duration {
+        self.instant_speed_window
+    }
+
+    #[inline]
+    pub fn expected_chunk_duration(&self) -> Duration {
+        self.expected_chunk_duration
+    }
+
+    #[inline]
+    pub fn smoothing_factor(&self) -> f64 {
+        self.smoothing_factor
+    }
+
+    #[inline]
+    pub fn instant_speed_weight(&self) -> f64 {
+        self.instant_speed_weight
+    }
+
+    #[inline]
+    pub fn avg_speed_weight(&self) -> f64 {
+        self.avg_speed_weight
+    }
+}
+
 /// 渐进式启动配置
 ///
 /// 控制 Worker 的渐进式启动策略
@@ -192,6 +255,18 @@ impl Default for ProgressiveConfig {
             worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: ProgressiveDefaults::MIN_SPEED_THRESHOLD,
         }
+    }
+}
+
+impl ProgressiveConfig {
+    #[inline]
+    pub fn worker_ratios(&self) -> &[f64] {
+        &self.worker_ratios
+    }
+
+    #[inline]
+    pub fn min_speed_threshold(&self) -> u64 {
+        self.min_speed_threshold
     }
 }
 
@@ -218,6 +293,18 @@ impl Default for RetryConfig {
     }
 }
 
+impl RetryConfig {
+    #[inline]
+    pub fn max_retry_count(&self) -> usize {
+        self.max_retry_count
+    }
+
+    #[inline]
+    pub fn retry_delays(&self) -> &[Duration] {
+        &self.retry_delays
+    }
+}
+
 // ==================== 主配置结构体 ====================
 
 /// 下载配置
@@ -226,17 +313,17 @@ impl Default for RetryConfig {
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
     /// 分块配置
-    pub chunk: ChunkConfig,
+    chunk: ChunkConfig,
     /// 并发配置
-    pub concurrency: ConcurrencyConfig,
+    concurrency: ConcurrencyConfig,
     /// 网络配置
-    pub network: NetworkConfig,
+    network: NetworkConfig,
     /// 速度计算配置
-    pub speed: SpeedConfig,
+    speed: SpeedConfig,
     /// 渐进式启动配置
-    pub progressive: ProgressiveConfig,
+    progressive: ProgressiveConfig,
     /// 重试配置
-    pub retry: RetryConfig,
+    retry: RetryConfig,
 }
 
 impl DownloadConfig {
@@ -267,81 +354,34 @@ impl DownloadConfig {
         }
     }
     
-    // ==================== 便捷访问方法（兼容旧API） ====================
-    
-    /// 获取 Worker 数量
-    pub fn worker_count(&self) -> usize {
-        self.concurrency.worker_count
+    #[inline]
+    pub fn chunk(&self) -> &ChunkConfig {
+        &self.chunk
+    }
+
+    #[inline]
+    pub fn concurrency(&self) -> &ConcurrencyConfig {
+        &self.concurrency
+    }
+
+    #[inline]
+    pub fn network(&self) -> &NetworkConfig {
+        &self.network
     }
     
-    /// 获取最小分块大小
-    pub fn min_chunk_size(&self) -> u64 {
-        self.chunk.min_size
+    #[inline]
+    pub fn speed(&self) -> &SpeedConfig {
+        &self.speed
     }
-    
-    /// 获取初始分块大小
-    pub fn initial_chunk_size(&self) -> u64 {
-        self.chunk.initial_size
+
+    #[inline]
+    pub fn progressive(&self) -> &ProgressiveConfig {
+        &self.progressive
     }
-    
-    /// 获取最大分块大小
-    pub fn max_chunk_size(&self) -> u64 {
-        self.chunk.max_size
-    }
-    
-    /// 获取实时速度窗口
-    pub fn instant_speed_window(&self) -> Duration {
-        self.speed.instant_speed_window
-    }
-    
-    /// 获取预期分块下载时长
-    pub fn expected_chunk_duration(&self) -> Duration {
-        self.speed.expected_chunk_duration
-    }
-    
-    /// 获取平滑系数
-    pub fn smoothing_factor(&self) -> f64 {
-        self.speed.smoothing_factor
-    }
-    
-    /// 获取瞬时速度权重
-    pub fn instant_speed_weight(&self) -> f64 {
-        self.speed.instant_speed_weight
-    }
-    
-    /// 获取平均速度权重
-    pub fn avg_speed_weight(&self) -> f64 {
-        self.speed.avg_speed_weight
-    }
-    
-    /// 获取请求超时时间
-    pub fn timeout(&self) -> Duration {
-        self.network.timeout
-    }
-    
-    /// 获取连接超时时间
-    pub fn connect_timeout(&self) -> Duration {
-        self.network.connect_timeout
-    }
-    
-    /// 获取渐进式启动比例序列
-    pub fn progressive_worker_ratios(&self) -> &[f64] {
-        &self.progressive.worker_ratios
-    }
-    
-    /// 获取最小速度阈值
-    pub fn min_speed_threshold(&self) -> u64 {
-        self.progressive.min_speed_threshold
-    }
-    
-    /// 获取最大重试次数
-    pub fn max_retry_count(&self) -> usize {
-        self.retry.max_retry_count
-    }
-    
-    /// 获取重试延迟序列
-    pub fn retry_delays(&self) -> &[Duration] {
-        &self.retry.retry_delays
+
+    #[inline]
+    pub fn retry(&self) -> &RetryConfig {
+        &self.retry
     }
 }
 
@@ -878,19 +918,19 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = DownloadConfig::default();
-        assert_eq!(config.worker_count(), ConcurrencyDefaults::WORKER_COUNT);
-        assert_eq!(config.min_chunk_size(), ChunkDefaults::MIN_SIZE);
-        assert_eq!(config.initial_chunk_size(), ChunkDefaults::INITIAL_SIZE);
-        assert_eq!(config.max_chunk_size(), ChunkDefaults::MAX_SIZE);
+        assert_eq!(config.concurrency().worker_count(), ConcurrencyDefaults::WORKER_COUNT);
+        assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
+        assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
+        assert_eq!(config.chunk().max_size(), ChunkDefaults::MAX_SIZE);
     }
 
     #[test]
     fn test_builder_default() {
         let config = DownloadConfig::builder().build().unwrap();
-        assert_eq!(config.worker_count(), ConcurrencyDefaults::WORKER_COUNT);
-        assert_eq!(config.min_chunk_size(), ChunkDefaults::MIN_SIZE);
-        assert_eq!(config.initial_chunk_size(), ChunkDefaults::INITIAL_SIZE);
-        assert_eq!(config.max_chunk_size(), ChunkDefaults::MAX_SIZE);
+        assert_eq!(config.concurrency().worker_count(), ConcurrencyDefaults::WORKER_COUNT);
+        assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
+        assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
+        assert_eq!(config.chunk().max_size(), ChunkDefaults::MAX_SIZE);
     }
 
     #[test]
@@ -903,10 +943,10 @@ mod tests {
                 .max_size(100 * 1024 * 1024))
             .build().unwrap();
         
-        assert_eq!(config.worker_count(), 8);
-        assert_eq!(config.min_chunk_size(), 1 * 1024 * 1024);
-        assert_eq!(config.initial_chunk_size(), 10 * 1024 * 1024);
-        assert_eq!(config.max_chunk_size(), 100 * 1024 * 1024);
+        assert_eq!(config.concurrency().worker_count(), 8);
+        assert_eq!(config.chunk().min_size(), 1 * 1024 * 1024);
+        assert_eq!(config.chunk().initial_size(), 10 * 1024 * 1024);
+        assert_eq!(config.chunk().max_size(), 100 * 1024 * 1024);
     }
 
     #[test]
@@ -919,10 +959,10 @@ mod tests {
                 .max_size(0))  // 应该被限制为 1
             .build().unwrap();
         
-        assert_eq!(config.worker_count(), 1);
-        assert_eq!(config.min_chunk_size(), 1);
-        assert_eq!(config.initial_chunk_size(), 1);
-        assert_eq!(config.max_chunk_size(), 1);
+        assert_eq!(config.concurrency().worker_count(), 1);
+        assert_eq!(config.chunk().min_size(), 1);
+        assert_eq!(config.chunk().initial_size(), 1);
+        assert_eq!(config.chunk().max_size(), 1);
     }
 
     #[test]
@@ -935,16 +975,16 @@ mod tests {
                 .max_size(3 * 1024 * 1024))      // 小于 initial
             .build().unwrap();
         
-        assert_eq!(config.min_chunk_size(), 10 * 1024 * 1024);
-        assert_eq!(config.initial_chunk_size(), 10 * 1024 * 1024);  // 调整为 min
-        assert_eq!(config.max_chunk_size(), 10 * 1024 * 1024);      // 调整为 initial
+        assert_eq!(config.chunk().min_size(), 10 * 1024 * 1024);
+        assert_eq!(config.chunk().initial_size(), 10 * 1024 * 1024);  // 调整为 min
+        assert_eq!(config.chunk().max_size(), 10 * 1024 * 1024);      // 调整为 initial
     }
 
     #[test]
     fn test_progressive_worker_ratios_default() {
         let config = DownloadConfig::default();
-        assert_eq!(config.progressive_worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
-        assert_eq!(config.min_speed_threshold(), ProgressiveDefaults::MIN_SPEED_THRESHOLD);
+        assert_eq!(config.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
+        assert_eq!(config.progressive().min_speed_threshold(), ProgressiveDefaults::MIN_SPEED_THRESHOLD);
     }
 
     #[test]
@@ -953,7 +993,7 @@ mod tests {
             .progressive(|p| p.worker_ratios(vec![0.5, 1.0]))
             .build().unwrap();
         
-        assert_eq!(config.progressive_worker_ratios(), &[0.5, 1.0]);
+        assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
     }
 
     #[test]
@@ -963,7 +1003,7 @@ mod tests {
             .progressive(|p| p.worker_ratios(vec![1.0, 0.25, 0.75, 0.5]))
             .build().unwrap();
         
-        assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
     }
 
     #[test]
@@ -974,7 +1014,7 @@ mod tests {
             .build().unwrap();
         
         // 0.0, 1.5, -0.1 应该被过滤掉
-        assert_eq!(config.progressive_worker_ratios(), &[0.5, 1.0]);
+        assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
     }
 
     #[test]
@@ -984,7 +1024,7 @@ mod tests {
             .progressive(|p| p.worker_ratios(vec![0.5, 0.5, 1.0, 1.0, 0.25]))
             .build().unwrap();
         
-        assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 1.0]);
+        assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 1.0]);
     }
 
     #[test]
@@ -994,13 +1034,13 @@ mod tests {
             .progressive(|p| p.worker_ratios(vec![]))
             .build().unwrap();
         
-        assert_eq!(config.progressive_worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
+        assert_eq!(config.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
         
         let config2 = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.0, -1.0, 2.0]))
             .build().unwrap();
         
-        assert_eq!(config2.progressive_worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
+        assert_eq!(config2.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
     }
 
     #[test]
@@ -1009,7 +1049,7 @@ mod tests {
             .progressive(|p| p.min_speed_threshold(5 * 1024 * 1024))  // 5 MB/s
             .build().unwrap();
         
-        assert_eq!(config.min_speed_threshold(), 5 * 1024 * 1024);
+        assert_eq!(config.progressive().min_speed_threshold(), 5 * 1024 * 1024);
     }
 
     #[test]
@@ -1025,22 +1065,22 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(config.max_retry_count(), 5);
-        assert_eq!(config.retry_delays().len(), 3);
-        assert_eq!(config.retry_delays()[0], Duration::from_secs(1));
-        assert_eq!(config.retry_delays()[1], Duration::from_secs(2));
-        assert_eq!(config.retry_delays()[2], Duration::from_secs(5));
+        assert_eq!(config.retry().max_retry_count(), 5);
+        assert_eq!(config.retry().retry_delays().len(), 3);
+        assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
+        assert_eq!(config.retry().retry_delays()[1], Duration::from_secs(2));
+        assert_eq!(config.retry().retry_delays()[2], Duration::from_secs(5));
     }
 
     #[test]
     fn test_retry_config_default() {
         let config = DownloadConfig::default();
         
-        assert_eq!(config.max_retry_count(), RetryDefaults::MAX_RETRY_COUNT);
-        assert_eq!(config.retry_delays().len(), 3);
-        assert_eq!(config.retry_delays()[0], Duration::from_secs(1));
-        assert_eq!(config.retry_delays()[1], Duration::from_secs(2));
-        assert_eq!(config.retry_delays()[2], Duration::from_secs(3));
+        assert_eq!(config.retry().max_retry_count(), RetryDefaults::MAX_RETRY_COUNT);
+        assert_eq!(config.retry().retry_delays().len(), 3);
+        assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
+        assert_eq!(config.retry().retry_delays()[1], Duration::from_secs(2));
+        assert_eq!(config.retry().retry_delays()[2], Duration::from_secs(3));
     }
 
     #[test]
@@ -1050,8 +1090,8 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(config.retry_delays().len(), 3);
-        assert_eq!(config.retry_delays()[0], Duration::from_secs(1));
+        assert_eq!(config.retry().retry_delays().len(), 3);
+        assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
     }
 
     #[test]

@@ -92,13 +92,13 @@ impl SpeedBasedChunkStrategy {
     /// * `config` - 下载配置
     pub(crate) fn from_config(config: &DownloadConfig) -> Self {
         Self::new(
-            config.initial_chunk_size(),
-            config.min_chunk_size(),
-            config.max_chunk_size(),
-            config.expected_chunk_duration().as_secs_f64(),
-            config.smoothing_factor(),
-            config.instant_speed_weight(),
-            config.avg_speed_weight(),
+            config.chunk().initial_size(),
+            config.chunk().min_size(),
+            config.chunk().max_size(),
+            config.speed().expected_chunk_duration().as_secs_f64(),
+            config.speed().smoothing_factor(),
+            config.speed().instant_speed_weight(),
+            config.speed().avg_speed_weight(),
         )
     }
 }

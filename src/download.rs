@@ -271,7 +271,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
             .ok_or_else(|| DownloadError::Other("无法获取定时器接收器".to_string()))?;
         
         // 创建定时器，用于定期更新进度和调整分块大小
-        let mut progress_timer = tokio::time::interval(self.config.instant_speed_window());
+        let mut progress_timer = tokio::time::interval(self.config.speed().instant_speed_window());
         progress_timer.tick().await; // 跳过首次立即触发
         
         // 分配初始任务
@@ -526,11 +526,11 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         range: AllocatedRange,
         retry_count: usize,
     ) {
-        let max_retry = self.config.max_retry_count();
+        let max_retry = self.config.retry().max_retry_count();
         
         if retry_count < max_retry {
             // 还可以重试，计算延迟时间
-            let retry_delays = self.config.retry_delays();
+            let retry_delays = self.config.retry().retry_delays();
             let delay = if retry_count < retry_delays.len() {
                 retry_delays[retry_count]
             } else {
@@ -645,7 +645,7 @@ where
     FS: FileSystem,
     FS::File: Send + 'static,
 {
-    let worker_count = config.worker_count();
+    let worker_count = config.concurrency().worker_count();
     
     info!("准备 Range 下载: {} ({} 个 workers, 动态分块)", url, worker_count);
 
@@ -665,9 +665,9 @@ where
     info!("文件大小: {} bytes ({:.2} MB)", content_length, content_length as f64 / 1024.0 / 1024.0);
     info!(
         "动态分块配置: 初始 {} bytes, 范围 {} ~ {} bytes",
-        config.initial_chunk_size(),
-        config.min_chunk_size(),
-        config.max_chunk_size()
+        config.chunk().initial_size(),
+        config.chunk().min_size(),
+        config.chunk().max_size()
     );
 
     // 创建 RangeWriter 和 RangeAllocator（会预分配文件）
@@ -794,8 +794,8 @@ pub async fn download_ranged(
     
     // 创建带超时设置的 HTTP 客户端
     let client = Client::builder()
-        .timeout(config.timeout())
-        .connect_timeout(config.connect_timeout())
+        .timeout(config.network().timeout())
+        .connect_timeout(config.network().connect_timeout())
         .build()?;
     
     let fs = TokioFileSystem::default();
@@ -1384,9 +1384,9 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(config.worker_count(), 12);
-        assert_eq!(config.progressive_worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
-        assert_eq!(config.min_speed_threshold(), 5 * 1024 * 1024);
+        assert_eq!(config.concurrency().worker_count(), 12);
+        assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(config.progressive().min_speed_threshold(), 5 * 1024 * 1024);
     }
 
     #[test]
@@ -1404,11 +1404,11 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(config.max_retry_count(), 5);
-        assert_eq!(config.retry_delays().len(), 3);
-        assert_eq!(config.retry_delays()[0], std::time::Duration::from_secs(1));
-        assert_eq!(config.retry_delays()[1], std::time::Duration::from_secs(2));
-        assert_eq!(config.retry_delays()[2], std::time::Duration::from_secs(5));
+        assert_eq!(config.retry().max_retry_count(), 5);
+        assert_eq!(config.retry().retry_delays().len(), 3);
+        assert_eq!(config.retry().retry_delays()[0], std::time::Duration::from_secs(1));
+        assert_eq!(config.retry().retry_delays()[1], std::time::Duration::from_secs(2));
+        assert_eq!(config.retry().retry_delays()[2], std::time::Duration::from_secs(5));
     }
 
     #[test]
@@ -1416,11 +1416,11 @@ mod tests {
         // 测试默认重试配置
         let config = crate::config::DownloadConfig::default();
         
-        assert_eq!(config.max_retry_count(), 3);
-        assert_eq!(config.retry_delays().len(), 3);
-        assert_eq!(config.retry_delays()[0], std::time::Duration::from_secs(1));
-        assert_eq!(config.retry_delays()[1], std::time::Duration::from_secs(2));
-        assert_eq!(config.retry_delays()[2], std::time::Duration::from_secs(3));
+        assert_eq!(config.retry().max_retry_count(), 3);
+        assert_eq!(config.retry().retry_delays().len(), 3);
+        assert_eq!(config.retry().retry_delays()[0], std::time::Duration::from_secs(1));
+        assert_eq!(config.retry().retry_delays()[1], std::time::Duration::from_secs(2));
+        assert_eq!(config.retry().retry_delays()[2], std::time::Duration::from_secs(3));
     }
 
     #[test]
@@ -1434,8 +1434,8 @@ mod tests {
             .unwrap();
             
 
-        assert_eq!(config.retry_delays().len(), 3);
-        assert_eq!(config.retry_delays()[0], std::time::Duration::from_secs(1));
+        assert_eq!(config.retry().retry_delays().len(), 3);
+        assert_eq!(config.retry().retry_delays()[0], std::time::Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -1649,7 +1649,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let delays = config.retry_delays();
+        let delays = config.retry().retry_delays();
         
         // 第 0 次重试使用第一个延迟
         assert_eq!(delays[0.min(delays.len() - 1)], std::time::Duration::from_secs(1));

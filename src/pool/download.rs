@@ -192,7 +192,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         C: HttpClient + Clone + Send + Sync + 'static,
     {
         // 创建全局统计管理器（使用配置的时间窗口）
-        let global_stats = DownloadStatsParent::with_window(config.instant_speed_window());
+        let global_stats = DownloadStatsParent::with_window(config.speed().instant_speed_window());
 
         // 创建执行器
         let executor = Arc::new(DownloadWorkerExecutor::new(client, Arc::clone(&writer)));
@@ -312,7 +312,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     /// 当前分块大小 (bytes)，如果 worker 不存在返回默认初始分块大小
     #[inline]
     pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
-        self.pool.worker_context(worker_id).map(|context| context.chunk_strategy.current_chunk_size()).unwrap_or(self.config.initial_chunk_size())
+        self.pool.worker_context(worker_id).map(|context| context.chunk_strategy.current_chunk_size()).unwrap_or(self.config.chunk().initial_size())
     }
 
     /// 根据 worker 的实时速度和平均速度计算新的分块大小
@@ -346,7 +346,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
                 }
             }
             // 如果 worker 不存在，返回默认初始分块大小
-            None => self.config.initial_chunk_size(),
+            None => self.config.chunk().initial_size(),
         }
     }
 

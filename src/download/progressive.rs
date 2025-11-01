@@ -30,10 +30,10 @@ impl ProgressiveLauncher {
     /// 
     /// 返回初始化好的 ProgressiveLauncher 实例
     pub(super) fn new(config: &DownloadConfig) -> Self {
-        let total_worker_count = config.worker_count();
+        let total_worker_count = config.concurrency().worker_count();
         
         // 根据配置的比例序列计算渐进式启动阶段
-        let worker_launch_stages: Vec<usize> = config.progressive_worker_ratios()
+        let worker_launch_stages: Vec<usize> = config.progressive().worker_ratios()
             .iter()
             .map(|&ratio| {
                 let stage_count = ((total_worker_count as f64 * ratio).ceil() as usize).min(total_worker_count);
@@ -109,7 +109,7 @@ impl ProgressiveLauncher {
             speeds.push(instant_speed);
             
             // 所有worker的速度都必须有效且达到阈值
-            if !valid || instant_speed < config.min_speed_threshold() as f64 {
+            if !valid || instant_speed < config.progressive().min_speed_threshold() as f64 {
                 all_ready = false;
             }
         }
@@ -124,7 +124,7 @@ impl ProgressiveLauncher {
                     "渐进式启动 - 第{}批: 所有已启动worker速度达标 ({:?} bytes/s >= {} bytes/s)，启动 {} 个新 workers (总计 {} 个)",
                     self.next_launch_stage + 1,
                     speeds,
-                    config.min_speed_threshold(),
+                    config.progressive().min_speed_threshold(),
                     workers_to_add,
                     next_target
                 );
@@ -162,7 +162,7 @@ impl ProgressiveLauncher {
                 "渐进式启动 - 等待第{}批worker速度达标 (当前速度: {:?} bytes/s, 阈值: {} bytes/s)",
                 self.next_launch_stage + 1,
                 speeds,
-                config.min_speed_threshold()
+                config.progressive().min_speed_threshold()
             );
         }
         

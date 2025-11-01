@@ -25,10 +25,10 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     );
     info!(
         "配置: {} workers, 分块大小: {} ~ {} (初始: {})",
-        config.worker_count(),
-        format_bytes(config.min_chunk_size()),
-        format_bytes(config.max_chunk_size()),
-        format_bytes(config.initial_chunk_size()),
+        config.concurrency().worker_count(),
+        format_bytes(config.chunk().min_size()),
+        format_bytes(config.chunk().max_size()),
+        format_bytes(config.chunk().initial_size()),
     );
 
     // 启动下载任务（会自动检测文件名）

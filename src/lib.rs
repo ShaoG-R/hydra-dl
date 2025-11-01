@@ -281,8 +281,8 @@ pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std:
     // 创建带超时设置的 HTTP 客户端（使用默认超时配置）
     let default_config = DownloadConfig::default();
     let client = Client::builder()
-        .timeout(default_config.timeout())
-        .connect_timeout(default_config.connect_timeout())
+        .timeout(default_config.network().timeout())
+        .connect_timeout(default_config.network().connect_timeout())
         .build()?;
     
     let fs = TokioFileSystem::default();
