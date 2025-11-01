@@ -12,10 +12,8 @@ use kestrel_timer::{TimerWheel, config::ServiceConfig};
 pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     // 构建下载配置
     let config = DownloadConfig::builder()
-        .worker_count(cli.workers)
-        .initial_chunk_size(cli.chunk_size * 1024 * 1024)
-        .min_chunk_size(cli.min_chunk * 1024 * 1024)
-        .max_chunk_size(cli.max_chunk * 1024 * 1024)
+        .concurrency(|c| c.worker_count(cli.workers))
+        .chunk(|c| c.initial_size(cli.chunk_size * 1024 * 1024).min_size(cli.min_chunk * 1024 * 1024).max_size(cli.max_chunk * 1024 * 1024))
         .build()?;
 
     let timer = TimerWheel::with_defaults();

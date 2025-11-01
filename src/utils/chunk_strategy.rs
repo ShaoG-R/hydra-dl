@@ -156,13 +156,15 @@ mod tests {
         use std::time::Duration;
         
         let config = DownloadConfig::builder()
-            .initial_chunk_size(10 * 1024 * 1024)
-            .min_chunk_size(5 * 1024 * 1024)
-            .max_chunk_size(100 * 1024 * 1024)
-            .expected_chunk_duration(Duration::from_secs(3))
-            .smoothing_factor(0.5)
-            .instant_speed_weight(0.6)
-            .avg_speed_weight(0.4)
+            .chunk(|c| c
+                .initial_size(10 * 1024 * 1024)
+                .min_size(5 * 1024 * 1024)
+                .max_size(100 * 1024 * 1024))
+            .speed(|s| s
+                .expected_chunk_duration(Duration::from_secs(3))
+                .smoothing_factor(0.5)
+                .instant_weight(0.6)
+                .avg_weight(0.4))
             .build().unwrap();
 
         let strategy = SpeedBasedChunkStrategy::from_config(&config);

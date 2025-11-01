@@ -80,7 +80,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Notify;
 
-use crate::config::MAX_WORKER_COUNT;
+use crate::config::ConcurrencyDefaults;
 use crate::{DownloadError, Result};
 use super::worker_mask::WorkerMask;
 
@@ -275,7 +275,7 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext> {
     /// 使用固定大小数组和 ArcSwap 实现无锁并发访问
     /// ArcSwap<T> = ArcSwapAny<Arc<T>>，所以这里是 Arc<Option<WorkerSlot>>
     /// 外层 Arc 允许在 tokio::spawn 闭包中访问（worker 自动清理需要）
-    pub(crate) workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; MAX_WORKER_COUNT],
+    pub(crate) workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT],
     /// 统一的结果接收器（所有 worker 共享）
     result_receiver: Receiver<R>,
     /// 结果发送器的克隆（用于创建新 worker）
@@ -320,8 +320,8 @@ where
         let worker_count = contexts.len();
         
         // 验证 worker 数量不超过最大限制
-        if worker_count > MAX_WORKER_COUNT {
-            return Err(crate::DownloadError::WorkerCountExceeded(worker_count, MAX_WORKER_COUNT));
+        if worker_count > ConcurrencyDefaults::MAX_WORKER_COUNT {
+            return Err(crate::DownloadError::WorkerCountExceeded(worker_count, ConcurrencyDefaults::MAX_WORKER_COUNT));
         }
         
         // 创建统一的 result channel（所有 worker 共享同一个 sender）
@@ -337,7 +337,7 @@ where
         let shutdown_notify = Arc::new(Notify::new());
         
         // 使用 array::from_fn 初始化固定大小数组（暂时全部为 None）
-        let workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; MAX_WORKER_COUNT] = 
+        let workers: [Arc<ArcSwap<Option<WorkerSlot<T, C>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
             std::array::from_fn(|_| Arc::new(ArcSwap::new(Arc::new(None))));
         
         // 为每个 worker 创建独立的 task channel 和上下文，并启动协程
@@ -495,7 +495,7 @@ where
         info!("开始关闭 Worker #{}", worker_id);
         
         // 检查 worker_id 是否在范围内
-        if worker_id >= MAX_WORKER_COUNT {
+        if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
             return Err(crate::DownloadError::WorkerNotFound(worker_id));
         }
         
@@ -538,7 +538,7 @@ where
     /// 成功时返回 `Ok(())`，如果 worker 不存在则返回 `Err(DownloadError::WorkerNotFound)`
     pub async fn send_task(&self, task: T, worker_id: usize) -> Result<()> {
         // 检查 worker_id 是否在范围内
-        if worker_id >= MAX_WORKER_COUNT {
+        if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
             return Err(crate::DownloadError::WorkerNotFound(worker_id));
         }
         
@@ -578,7 +578,7 @@ where
     ///
     /// Worker 上下文的 Arc 引用，如果 worker 不存在则返回 `None`
     pub fn worker_context(&self, worker_id: usize) -> Option<Arc<C>> {
-        if worker_id >= MAX_WORKER_COUNT {
+        if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
             return None;
         }
         
@@ -601,7 +601,7 @@ where
         
         let mut closed_count = 0;
         
-        for id in 0..MAX_WORKER_COUNT {
+        for id in 0..ConcurrencyDefaults::MAX_WORKER_COUNT {
             // 原子性地取出 worker slot（swap 为 None）
             let old_slot_arc = self.workers[id].swap(Arc::new(None));
             

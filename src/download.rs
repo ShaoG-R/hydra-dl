@@ -914,10 +914,11 @@ mod tests {
         // 执行下载（使用 1 个 worker 以简化测试）
         let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(1)
-            .initial_chunk_size(chunk_size)
-            .min_chunk_size(1)  // 设置为 1 以允许小文件测试
-            .max_chunk_size(chunk_size)  // 固定分块大小以便测试
+            .concurrency(|c| c.worker_count(1))
+            .chunk(|c| c
+                .initial_size(chunk_size)
+                .min_size(1)  // 设置为 1 以允许小文件测试
+                .max_size(chunk_size))  // 固定分块大小以便测试
             .build()
             .unwrap();
         
@@ -976,10 +977,11 @@ mod tests {
 
         // 执行下载
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(2)
-            .initial_chunk_size(test_data.len() as u64)  // 单次分块完成
-            .min_chunk_size(1)
-            .max_chunk_size(test_data.len() as u64)
+            .concurrency(|c| c.worker_count(2))
+            .chunk(|c| c
+                .initial_size(test_data.len() as u64)  // 单次分块完成
+                .min_size(1)
+                .max_size(test_data.len() as u64))
             .build()
             .unwrap();
         
@@ -1057,10 +1059,11 @@ mod tests {
         // 使用 2 个 workers 下载
         let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(2)
-            .initial_chunk_size(chunk_size)
-            .min_chunk_size(1)
-            .max_chunk_size(chunk_size)  // 固定分块大小以便测试
+            .concurrency(|c| c.worker_count(2))
+            .chunk(|c| c
+                .initial_size(chunk_size)
+                .min_size(1)
+                .max_size(chunk_size))  // 固定分块大小以便测试
             .build()
             .unwrap();
         
@@ -1118,10 +1121,11 @@ mod tests {
 
         // 使用 1 MB 的初始分块大小下载 1 MB 文件
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(4)
-            .initial_chunk_size(1 * 1024 * 1024)  // 1 MB
-            .min_chunk_size(512 * 1024)  // 512 KB
-            .max_chunk_size(2 * 1024 * 1024)  // 2 MB
+            .concurrency(|c| c.worker_count(4))
+            .chunk(|c| c
+                .initial_size(1 * 1024 * 1024)  // 1 MB
+                .min_size(512 * 1024)  // 512 KB
+                .max_size(2 * 1024 * 1024))  // 2 MB
             .build()
             .unwrap();
 
@@ -1193,10 +1197,11 @@ mod tests {
         }
 
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(3)
-            .initial_chunk_size(chunk_size as u64)
-            .min_chunk_size(chunk_size as u64)
-            .max_chunk_size(chunk_size as u64)  // 固定 2 MB 分块
+            .concurrency(|c| c.worker_count(3))
+            .chunk(|c| c
+                .initial_size(chunk_size as u64)
+                .min_size(chunk_size as u64)
+                .max_size(chunk_size as u64))  // 固定 2 MB 分块
             .build()
             .unwrap();
 
@@ -1267,10 +1272,11 @@ mod tests {
         }
 
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(4)
-            .initial_chunk_size(chunk_size as u64)
-            .min_chunk_size(chunk_size as u64)
-            .max_chunk_size(chunk_size as u64)  // 固定 10 MB 分块
+            .concurrency(|c| c.worker_count(4))
+            .chunk(|c| c
+                .initial_size(chunk_size as u64)
+                .min_size(chunk_size as u64)
+                .max_size(chunk_size as u64))  // 固定 10 MB 分块
             .build()
             .unwrap();
 
@@ -1342,12 +1348,14 @@ mod tests {
 
         // 配置渐进式启动：[0.5, 1.0] 表示先启动2个worker，再启动剩余2个
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(4)
-            .initial_chunk_size(chunk_size as u64)
-            .min_chunk_size(chunk_size as u64)
-            .max_chunk_size(chunk_size as u64)
-            .progressive_worker_ratios(vec![0.5, 1.0])
-            .min_speed_threshold(0)  // 设置为0以便立即启动下一批
+            .concurrency(|c| c.worker_count(4))
+            .chunk(|c| c
+                .initial_size(chunk_size as u64)
+                .min_size(chunk_size as u64)
+                .max_size(chunk_size as u64))
+            .progressive(|p| p
+                .worker_ratios(vec![0.5, 1.0])
+                .min_speed_threshold(0))  // 设置为0以便立即启动下一批
             .build()
             .unwrap();
 
@@ -1369,9 +1377,10 @@ mod tests {
     fn test_progressive_config() {
         // 测试渐进式启动配置的正确性
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(12)
-            .progressive_worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
-            .min_speed_threshold(5 * 1024 * 1024)  // 5 MB/s
+            .concurrency(|c| c.worker_count(12))
+            .progressive(|p| p
+                .worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
+                .min_speed_threshold(5 * 1024 * 1024))  // 5 MB/s
             .build()
             .unwrap();
 
@@ -1384,12 +1393,14 @@ mod tests {
     fn test_retry_config() {
         // 测试重试配置的正确性
         let config = crate::config::DownloadConfig::builder()
-            .max_retry_count(5)
-            .retry_delays(vec![
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(2),
-                std::time::Duration::from_secs(5),
-            ])
+            .retry(|r| r
+                .max_retry_count(5)
+                .retry_delays(vec![
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(5),
+                ])
+            )
             .build()
             .unwrap();
 
@@ -1416,9 +1427,12 @@ mod tests {
     fn test_retry_delays_empty_uses_default() {
         // 测试空延迟序列使用默认值
         let config = crate::config::DownloadConfig::builder()
-            .retry_delays(vec![])
+            .retry(|r| { r
+                .retry_delays(vec![])
+            })
             .build()
             .unwrap();
+            
 
         assert_eq!(config.retry_delays().len(), 3);
         assert_eq!(config.retry_delays()[0], std::time::Duration::from_secs(1));
@@ -1500,16 +1514,15 @@ mod tests {
 
         // 配置：1 个 worker，最大重试 3 次，快速重试（100ms）
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(1)
-            .initial_chunk_size(chunk_size as u64)
-            .min_chunk_size(1)
-            .max_chunk_size(chunk_size as u64)
-            .max_retry_count(3)
-            .retry_delays(vec![
-                std::time::Duration::from_millis(100),
-                std::time::Duration::from_millis(200),
-                std::time::Duration::from_millis(300),
-            ])
+            .concurrency(|c| c.worker_count(1))
+            .chunk(|c| c.initial_size(chunk_size as u64).min_size(1).max_size(chunk_size as u64))
+            .retry(|r| r
+                .max_retry_count(3)
+                .retry_delays(vec![
+                    std::time::Duration::from_millis(100),
+                    std::time::Duration::from_millis(200),
+                    std::time::Duration::from_millis(300),
+                ]))
             .build()
             .unwrap();
 
@@ -1594,15 +1607,14 @@ mod tests {
 
         // 配置：1 个 worker，最大重试 2 次，快速重试（50ms）
         let config = crate::config::DownloadConfig::builder()
-            .worker_count(1)
-            .initial_chunk_size(chunk_size as u64)
-            .min_chunk_size(1)
-            .max_chunk_size(chunk_size as u64)
-            .max_retry_count(2)
-            .retry_delays(vec![
-                std::time::Duration::from_millis(50),
-                std::time::Duration::from_millis(50),
-            ])
+            .concurrency(|c| c.worker_count(1))
+            .chunk(|c| c.initial_size(chunk_size as u64).min_size(1).max_size(chunk_size as u64))
+            .retry(|r| r
+                .max_retry_count(2)
+                .retry_delays(vec![
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                ]))
             .build()
             .unwrap();
 
@@ -1628,11 +1640,12 @@ mod tests {
     async fn test_retry_delay_sequence() {
         // 测试重试延迟序列正确使用
         let config = crate::config::DownloadConfig::builder()
-            .max_retry_count(5)
-            .retry_delays(vec![
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(2),
-            ])
+            .retry(|r| r
+                .max_retry_count(5)
+                .retry_delays(vec![
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(2),
+                ]))
             .build()
             .unwrap();
 

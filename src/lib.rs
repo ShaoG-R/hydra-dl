@@ -86,17 +86,18 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use hydra_dl::{DownloadConfig, DownloadProgress};
+//! use hydra_dl::{DownloadConfig, DownloadProgress, constants::*};
 //! use kestrel_timer::{TimerWheel, config::ServiceConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), hydra_dl::DownloadError> {
 //!     // 自定义配置：更多 worker，更大的分块范围
 //!     let config = DownloadConfig::builder()
-//!         .worker_count(8)                         // 8 个并发 worker
-//!         .initial_chunk_size(10 * 1024 * 1024)    // 初始 10 MB 分块
-//!         .min_chunk_size(5 * 1024 * 1024)         // 最小 5 MB（慢速时）
-//!         .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB（高速时）
+//!         .concurrency(|c| c.worker_count(8))         // 8 个并发 worker
+//!         .chunk(|c| c
+//!             .initial_size(10 * MB)                  // 初始 10 MB 分块
+//!             .min_size(5 * MB)                       // 最小 5 MB（慢速时）
+//!             .max_size(100 * MB))                    // 最大 100 MB（高速时）
 //!         .build().unwrap();
 //!     
 //!     let timer = TimerWheel::with_defaults();
@@ -152,8 +153,8 @@ pub mod utils {
 /// use hydra_dl::DownloadConfig;
 /// 
 /// let config = DownloadConfig::builder()
-///     .initial_chunk_size(10 * MB)  // 10 MB
-///     .min_speed_threshold(5 * MB)  // 5 MB/s
+///     .chunk(|c| c.initial_size(10 * MB))  // 10 MB
+///     .progressive(|p| p.min_speed_threshold(5 * MB))  // 5 MB/s
 ///     .build();
 /// ```
 pub mod constants {
@@ -166,7 +167,17 @@ pub mod constants {
 }
 
 // 重新导出核心类型和函数
-pub use config::{DownloadConfig, DownloadConfigBuilder};
+pub use config::{
+    DownloadConfig, DownloadConfigBuilder,
+    ChunkConfig, ChunkConfigBuilder,
+    ConcurrencyConfig, ConcurrencyConfigBuilder,
+    NetworkConfig, NetworkConfigBuilder,
+    SpeedConfig, SpeedConfigBuilder,
+    ProgressiveConfig, ProgressiveConfigBuilder,
+    RetryConfig, RetryConfigBuilder,
+    ChunkDefaults, ConcurrencyDefaults, NetworkDefaults, SpeedDefaults, ProgressiveDefaults, RetryDefaults,
+    BuildError,
+};
 pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
 pub use task::FileTask;
 pub use utils::fetch::{fetch_file_metadata, FileMetadata};
