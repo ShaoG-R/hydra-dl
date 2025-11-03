@@ -5,7 +5,7 @@
 use crate::{Result, DownloadError};
 use crate::utils::range_writer::{AllocatedRange, RangeAllocator};
 use crate::task::WorkerTask;
-use kestrel_timer::{TimerService, TaskId};
+use kestrel_timer::{TaskId, TimerService, TimerTask};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use log::{debug, error};
@@ -188,7 +188,7 @@ impl TaskAllocator {
         );
         
         // 创建定时器任务（无回调，仅通知）
-        let timer_task = TimerService::create_task(delay, None);
+        let timer_task = TimerTask::new_oneshot(delay, None);
         let timer_id = timer_task.get_id();
         
         // 注册到 TimerService
@@ -391,14 +391,14 @@ mod tests {
         assert_eq!(task_allocator.pending_retry_count(), 1);
         
         // 获取定时器 ID（从 timer_service 获取下一个超时）
-        let mut timeout_rx = timer_service.take_receiver().unwrap();
+        let timeout_rx = timer_service.take_receiver().unwrap();
         
         // 等待定时器触发
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         
         if let Some(timer_id) = timeout_rx.recv().await {
             // 取出失败任务
-            let failed_info = task_allocator.pop_failed_task(timer_id);
+            let failed_info = task_allocator.pop_failed_task(timer_id.task_id());
             assert!(failed_info.is_some());
             
             let info = failed_info.unwrap();

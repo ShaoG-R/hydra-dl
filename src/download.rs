@@ -267,7 +267,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
     async fn wait_for_completion(&mut self) -> Result<Vec<FailedRange>> {
         // 获取定时器超时接收器
-        let mut timeout_rx = self.timer_service.take_receiver()
+        let timeout_rx = self.timer_service.take_receiver()
             .ok_or_else(|| DownloadError::Other("无法获取定时器接收器".to_string()))?;
         
         // 创建定时器，用于定期更新进度和调整分块大小
@@ -281,7 +281,7 @@ impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTas
         loop {
             let control = tokio::select! {
                 _ = progress_timer.tick() => self.handle_progress_tick().await,
-                Some(timer_id) = timeout_rx.recv() => self.handle_retry_timeout(timer_id).await,
+                Some(notification) = timeout_rx.recv() => self.handle_retry_timeout(notification.task_id()).await,
                 result = self.pool.result_receiver().recv() => self.handle_worker_result(result).await,
             };
             
