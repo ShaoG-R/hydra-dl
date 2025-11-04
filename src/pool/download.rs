@@ -11,7 +11,7 @@
 use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
 use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
-use crate::utils::fetch::fetch_range;
+use crate::utils::fetch::{fetch_range, FetchRangeResult};
 use crate::utils::io_traits::{AsyncFile, HttpClient};
 use crate::utils::range_writer::RangeWriter;
 use crate::utils::stats::TaskStats;
@@ -101,11 +101,12 @@ where
                 );
 
                 // 下载数据（在下载过程中会实时更新 stats）
-                let fetch_result = fetch_range(&self.client, &url, range, stats).await;
+                // 暂时传递 None 作为 cancel_rx 参数，保持现有行为
+                let fetch_result = fetch_range(&self.client, &url, range, stats, None).await;
 
                 match fetch_result {
-                    Ok(data) => {
-                        // 直接写入文件
+                    Ok(FetchRangeResult::Complete(data)) => {
+                        // 下载完成，直接写入文件
                         match self.writer.write_range(range, data).await {
                             Ok(()) => {
                                 // 记录 range 完成
@@ -134,6 +135,17 @@ where
                                     retry_count,
                                 }
                             }
+                        }
+                    }
+                    Ok(FetchRangeResult::Cancelled(_data)) => {
+                        // 下载被取消
+                        let error_msg = "下载被取消".to_string();
+                        debug!("Worker #{} Range {}..{} {}", worker_id, range.start(), range.end(), error_msg);
+                        RangeResult::Failed {
+                            worker_id,
+                            range,
+                            error: error_msg,
+                            retry_count,
                         }
                     }
                     Err(e) => {
