@@ -212,7 +212,7 @@ struct DownloadTask<C: HttpClient, F: AsyncFile> {
     timer_service: TimerService,
 }
 
-impl<C: HttpClient + Clone + Send + 'static, F: AsyncFile + 'static> DownloadTask<C, F> {
+impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
     /// 创建新的下载任务
     fn new(
         client: C,

@@ -21,7 +21,7 @@ indicatif = "0.18.2"
 url = "2.5"
 urlencoding = "2.1"
 arc-swap = "1.7.1"
-kestrel-timer = "0.2.0"
+kestrel-timer = "0.2.2"
 rustc-hash = "2.1.1"
 
 
