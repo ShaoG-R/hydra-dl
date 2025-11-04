@@ -2,7 +2,7 @@
 //!
 //! 提供下载任务的配置选项，按功能域分类组织
 
-use std::time::Duration;
+use std::{num::NonZeroU32, time::Duration};
 use crate::constants::MB;
 
 // ==================== 常量结构体 ====================
@@ -43,8 +43,10 @@ impl NetworkDefaults {
 pub struct SpeedDefaults;
 
 impl SpeedDefaults {
-    /// 实时速度窗口：1 秒
-    pub const INSTANT_WINDOW_SECS: u64 = 1;
+    /// 基础时间间隔：1000 毫秒（1 秒）
+    pub const BASE_INTERVAL_MILLIS: u64 = 1000;
+    /// 实时速度窗口倍数：1
+    pub const INSTANT_WINDOW_MULTIPLIER: u32 = 1;
     /// 预期分块下载时长：5 秒
     pub const EXPECTED_CHUNK_DURATION_SECS: u64 = 5;
     /// 分块大小平滑系数：0.7
@@ -187,8 +189,10 @@ impl NetworkConfig {
 /// 控制速度计算和分块大小调整策略
 #[derive(Debug, Clone)]
 pub struct SpeedConfig {
-    /// 实时速度窗口
-    pub instant_speed_window: Duration,
+    /// 基础时间间隔（统计数据的基础时间间隔）
+    pub base_interval: Duration,
+    /// 实时速度窗口倍数（实际窗口 = base_interval × multiplier）
+    pub instant_speed_window_multiplier: NonZeroU32,
     /// 预期单个分块下载时长
     pub expected_chunk_duration: Duration,
     /// 分块大小平滑系数 (0.0 ~ 1.0)
@@ -202,7 +206,8 @@ pub struct SpeedConfig {
 impl Default for SpeedConfig {
     fn default() -> Self {
         Self {
-            instant_speed_window: Duration::from_secs(SpeedDefaults::INSTANT_WINDOW_SECS),
+            base_interval: Duration::from_millis(SpeedDefaults::BASE_INTERVAL_MILLIS),
+            instant_speed_window_multiplier: NonZeroU32::new(SpeedDefaults::INSTANT_WINDOW_MULTIPLIER).unwrap(),
             expected_chunk_duration: Duration::from_secs(SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: SpeedDefaults::SMOOTHING_FACTOR,
             instant_speed_weight: SpeedDefaults::INSTANT_WEIGHT,
@@ -213,8 +218,18 @@ impl Default for SpeedConfig {
 
 impl SpeedConfig {
     #[inline]
+    pub fn base_interval(&self) -> Duration {
+        self.base_interval
+    }
+
+    #[inline]
+    pub fn instant_speed_window_multiplier(&self) -> u32 {
+        self.instant_speed_window_multiplier.get()
+    }
+
+    #[inline]
     pub fn instant_speed_window(&self) -> Duration {
-        self.instant_speed_window
+        self.base_interval * self.instant_speed_window_multiplier.get()
     }
 
     #[inline]
@@ -519,7 +534,8 @@ impl Default for NetworkConfigBuilder {
 /// 速度配置构建器
 #[derive(Debug, Clone)]
 pub struct SpeedConfigBuilder {
-    instant_speed_window: Duration,
+    base_interval: Duration,
+    instant_speed_window_multiplier: NonZeroU32,
     expected_chunk_duration: Duration,
     smoothing_factor: f64,
     instant_speed_weight: f64,
@@ -530,7 +546,8 @@ impl SpeedConfigBuilder {
     /// 创建新的速度配置构建器（使用默认值）
     pub fn new() -> Self {
         Self {
-            instant_speed_window: Duration::from_secs(SpeedDefaults::INSTANT_WINDOW_SECS),
+            base_interval: Duration::from_millis(SpeedDefaults::BASE_INTERVAL_MILLIS),
+            instant_speed_window_multiplier: NonZeroU32::new(SpeedDefaults::INSTANT_WINDOW_MULTIPLIER).unwrap(),
             expected_chunk_duration: Duration::from_secs(SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: SpeedDefaults::SMOOTHING_FACTOR,
             instant_speed_weight: SpeedDefaults::INSTANT_WEIGHT,
@@ -538,9 +555,15 @@ impl SpeedConfigBuilder {
         }
     }
 
-    /// 设置实时速度窗口
-    pub fn instant_window(mut self, window: Duration) -> Self {
-        self.instant_speed_window = window;
+    /// 设置基础时间间隔
+    pub fn base_interval(mut self, interval: Duration) -> Self {
+        self.base_interval = interval;
+        self
+    }
+
+    /// 设置实时速度窗口倍数
+    pub fn instant_window_multiplier(mut self, multiplier: NonZeroU32) -> Self {
+        self.instant_speed_window_multiplier = multiplier;
         self
     }
 
@@ -571,7 +594,8 @@ impl SpeedConfigBuilder {
     /// 构建速度配置
     pub fn build(self) -> SpeedConfig {
         SpeedConfig {
-            instant_speed_window: self.instant_speed_window,
+            base_interval: self.base_interval,
+            instant_speed_window_multiplier: self.instant_speed_window_multiplier,
             expected_chunk_duration: self.expected_chunk_duration,
             smoothing_factor: self.smoothing_factor,
             instant_speed_weight: self.instant_speed_weight,
@@ -821,7 +845,8 @@ impl DownloadConfigBuilder {
         F: FnOnce(SpeedConfigBuilder) -> SpeedConfigBuilder,
     {
         let builder = SpeedConfigBuilder {
-            instant_speed_window: self.speed.instant_speed_window,
+            base_interval: self.speed.base_interval,
+            instant_speed_window_multiplier: self.speed.instant_speed_window_multiplier,
             expected_chunk_duration: self.speed.expected_chunk_duration,
             smoothing_factor: self.speed.smoothing_factor,
             instant_speed_weight: self.speed.instant_speed_weight,
