@@ -503,6 +503,7 @@ dependencies = [
  "kestrel-timer",
  "log",
  "parking_lot",
+ "portable-atomic",
  "reqwest",
  "rustc-hash",
  "tempfile",

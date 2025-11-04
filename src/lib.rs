@@ -137,6 +137,7 @@ pub(crate) mod pool {
 pub mod utils {
     pub(crate) mod chunk_strategy;
     pub(crate) mod fetch;
+    pub(crate) mod speed_calculator;
     pub(crate) mod stats;
     pub mod io_traits;
     pub mod range_writer;

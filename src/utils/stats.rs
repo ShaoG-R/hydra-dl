@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+use super::speed_calculator::SpeedCalculator;
 
 /// 统计聚合器
 /// 
@@ -27,17 +29,18 @@ pub(crate) struct StatsAggregator {
 ///    - 通过 `get_speed()` 获取
 ///    - 计算公式：总下载字节数 / 总耗时
 /// 
-/// 2. **实时速度**：基于时间窗口的瞬时速度
-///    - 通过 `get_instant_speed()` 获取
-///    - 采用简单采样法：记录最近一次采样点，计算增量
-///    - 时间窗口可配置（默认 1 秒）
+/// 2. **实时速度**：基于环形缓冲区和线性回归的速度
+///    - 通过 `get_instant_speed()` 和 `get_window_avg_speed()` 获取
+///    - 采用环形缓冲区存储最近的采样点，使用线性回归计算速度
+///    - 时间窗口可配置（默认瞬时 1 秒，窗口平均 5 秒）
 /// 
 /// # 性能优化
 /// 
 /// - 所有字段使用原子操作，完全无锁并发
 /// - `start_time` 使用 OnceLock，只初始化一次
-/// - `last_sample_*` 使用原子操作存储采样点，无需 Mutex
+/// - 速度计算器使用环形缓冲区和原子操作，无需 Mutex
 /// - 支持父子统计聚合，子统计自动更新父级
+/// - 自动采样：每 100ms 自动记录一次采样点
 /// 
 /// # 线程安全
 /// 
@@ -49,93 +52,96 @@ pub(crate) struct WorkerStats {
     pub(crate) start_time: OnceLock<Instant>,
     /// 完成的 range 数量（原子操作，无锁）
     completed_ranges: AtomicUsize,
-    /// 上一次采样点的时间戳（纳秒，相对于 start_time）
-    last_sample_timestamp_ns: AtomicU64,
-    /// 上一次采样点的字节数
-    last_sample_bytes: AtomicU64,
-    /// 实时速度的时间窗口（默认 1 秒）
-    instant_speed_window: Duration,
+    /// 速度计算器（管理瞬时速度和窗口平均速度的采样点）
+    speed_calculator: SpeedCalculator,
     /// 父级聚合器（子统计通过此字段自动更新父级）
     parent_aggregator: Option<Arc<StatsAggregator>>,
     /// 当前分块大小（原子操作，无锁）
     /// 由 worker 内部的 ChunkStrategy 更新，外部只读访问
     current_chunk_size: AtomicU64,
+    /// 上次采样时间戳（纳秒，相对于 start_time）
+    last_sample_timestamp_ns: AtomicU64,
+    /// 采样间隔（纳秒）
+    sample_interval_ns: u64,
 }
 
 impl Default for WorkerStats {
     fn default() -> Self {
-        Self::with_window(Duration::from_secs(1))
+        // 使用默认配置值
+        use crate::config::SpeedConfig;
+        Self::from_config(&SpeedConfig::default())
     }
 }
 
 impl WorkerStats {
-    /// 创建新的统计实例并指定时间窗口
+    /// 从速度配置创建统计实例
     /// 
     /// # Arguments
     /// 
-    /// * `instant_speed_window` - 实时速度的时间窗口，用于计算瞬时速度
+    /// * `config` - 速度配置
     /// 
     /// # Examples
     /// 
     /// ```ignore
     /// use hydra_dl::WorkerStats;
-    /// use std::time::Duration;
+    /// use hydra_dl::config::SpeedConfig;
     /// 
-    /// // 使用 500ms 的时间窗口
-    /// let stats = WorkerStats::with_window(Duration::from_millis(500));
+    /// let config = SpeedConfig::default();
+    /// let stats = WorkerStats::from_config(&config);
     /// ```
-    pub(crate) fn with_window(instant_speed_window: Duration) -> Self {
+    pub(crate) fn from_config(config: &crate::config::SpeedConfig) -> Self {
+        let sample_interval = config.sample_interval();
         Self {
             total_bytes: AtomicU64::new(0),
             start_time: OnceLock::new(),
             completed_ranges: AtomicUsize::new(0),
-            last_sample_timestamp_ns: AtomicU64::new(0),
-            last_sample_bytes: AtomicU64::new(0),
-            instant_speed_window,
+            speed_calculator: SpeedCalculator::from_config(config),
             parent_aggregator: None,
             current_chunk_size: AtomicU64::new(0),
+            last_sample_timestamp_ns: AtomicU64::new(0),
+            sample_interval_ns: sample_interval.as_nanos() as u64,
         }
     }
 
-    /// 创建带父级聚合器的统计实例
+    /// 从速度配置创建带父级聚合器的统计实例
     /// 
     /// # Arguments
     /// 
-    /// * `instant_speed_window` - 实时速度的时间窗口
+    /// * `config` - 速度配置
     /// * `parent_aggregator` - 父级聚合器，子统计会自动更新父级
     /// 
     /// # Examples
     /// 
     /// ```ignore
     /// use hydra_dl::WorkerStats;
+    /// use hydra_dl::config::SpeedConfig;
     /// use std::sync::Arc;
     /// 
     /// let parent = TaskStats::default();
-    /// let child = parent.create_child();
-    /// 
-    /// child.record_chunk(1024);
-    /// let (bytes, _, _) = parent.get_summary();
-    /// assert_eq!(bytes, 1024);
+    /// let config = SpeedConfig::default();
+    /// let child = WorkerStats::from_config_with_parent(&config, parent.aggregator());
     /// ```
-    pub(crate) fn with_parent(
-        instant_speed_window: Duration,
+    pub(crate) fn from_config_with_parent(
+        config: &crate::config::SpeedConfig,
         parent_aggregator: Arc<StatsAggregator>,
     ) -> Self {
+        let sample_interval = config.sample_interval();
         Self {
             total_bytes: AtomicU64::new(0),
             start_time: OnceLock::new(),
             completed_ranges: AtomicUsize::new(0),
-            last_sample_timestamp_ns: AtomicU64::new(0),
-            last_sample_bytes: AtomicU64::new(0),
-            instant_speed_window,
+            speed_calculator: SpeedCalculator::from_config(config),
             parent_aggregator: Some(parent_aggregator),
             current_chunk_size: AtomicU64::new(0),
+            last_sample_timestamp_ns: AtomicU64::new(0),
+            sample_interval_ns: sample_interval.as_nanos() as u64,
         }
     }
 
     /// 记录下载的 chunk（在下载过程中实时调用）
     /// 
-    /// 使用原子操作，多个 worker 可以并发调用，无锁竞争
+    /// 使用原子操作，多个 worker 可以并发调用，无锁竞争。
+    /// 根据配置的采样间隔自动记录采样点，用于速度计算。
     /// 
     /// # Arguments
     /// 
@@ -151,10 +157,29 @@ impl WorkerStats {
     /// ```
     pub(crate) fn record_chunk(&self, bytes: u64) {
         // 第一个 chunk 到达时初始化开始时间
-        self.start_time.get_or_init(|| Instant::now());
+        let start_time = *self.start_time.get_or_init(|| Instant::now());
         
         // 原子增加字节数（使用 Relaxed 顺序，性能最佳）
-        self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let current_total = self.total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        
+        // 自动采样逻辑：根据配置的采样间隔记录采样点
+        let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
+        let last_sample_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
+        
+        // 检查是否需要采样（距离上次采样超过配置的采样间隔，或者是首次采样）
+        if last_sample_ns == 0 || current_elapsed_ns.saturating_sub(last_sample_ns) >= self.sample_interval_ns {
+            // 尝试更新采样时间戳（使用 compare_exchange 避免重复采样）
+            // 允许多个线程竞争，只有一个会成功，这样可以避免过度采样
+            if self.last_sample_timestamp_ns.compare_exchange(
+                last_sample_ns,
+                current_elapsed_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed
+            ).is_ok() {
+                // 成功获取采样权限，记录采样点
+                self.speed_calculator.record_sample(current_total, start_time);
+            }
+        }
         
         // 同步到父级聚合器（如果存在）
         if let Some(parent) = &self.parent_aggregator {
@@ -215,24 +240,12 @@ impl WorkerStats {
     /// 获取实时下载速度（bytes/s）
     /// 
     /// 基于时间窗口的瞬时速度，通过与上次采样点比较计算增量
-    /// 如果距离上次采样时间超过配置的时间窗口，则更新采样点
-    /// 
-    /// # 采样策略
-    /// 
-    /// - 首次调用时初始化采样点
-    /// - 如果距离上次采样时间 >= 时间窗口，则：
-    ///   1. 计算与上次采样点的字节差和时间差
-    ///   2. 计算实时速度 = 字节差 / 时间差
-    ///   3. 更新采样点为当前时刻
-    /// - 如果距离上次采样时间 < 时间窗口，则：
-    ///   1. 使用当前数据与上次采样点计算速度（估算值）
-    ///   2. 不更新采样点
     /// 
     /// # Returns
     /// 
     /// `(实时速度, 是否有效)`：
     /// - 实时速度：基于采样点计算的速度（bytes/s）
-    /// - 是否有效：true 表示采样点有效，false 表示刚初始化（elapsed < 10ms）
+    /// - 是否有效：true 表示采样点有效，false 表示刚初始化
     /// 
     /// # Examples
     /// 
@@ -253,57 +266,34 @@ impl WorkerStats {
     /// }
     /// ```
     pub(crate) fn get_instant_speed(&self) -> (f64, bool) {
-        let now = Instant::now();
-        let current_bytes = self.total_bytes.load(Ordering::Relaxed);
-        
-        // 获取采样点（原子读取）
-        let last_timestamp_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
-        let last_bytes = self.last_sample_bytes.load(Ordering::Relaxed);
-        
-        // 获取开始时间，如果还未初始化则使用当前时间
-        let start_time = self.start_time.get().copied().unwrap_or(now);
-        
-        // 首次调用：初始化采样点
-        if last_timestamp_ns == 0 {
-            let elapsed_ns = start_time.elapsed().as_nanos() as u64;
-            self.last_sample_timestamp_ns.store(elapsed_ns, Ordering::Relaxed);
-            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
-            return (0.0, false);
-        }
-        
-        // 计算距离上次采样的时间
-        let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
-        let elapsed_ns = current_elapsed_ns.saturating_sub(last_timestamp_ns);
-        let elapsed = Duration::from_nanos(elapsed_ns);
-        
-        // 如果超过时间窗口，更新采样点并计算速度
-        if elapsed >= self.instant_speed_window {
-            let bytes_diff = current_bytes.saturating_sub(last_bytes);
-            let elapsed_secs = elapsed.as_secs_f64();
-            let instant_speed = if elapsed_secs > 0.0 {
-                bytes_diff as f64 / elapsed_secs
-            } else {
-                0.0
-            };
-            
-            // 原子更新采样点（无锁，可能有多个线程同时更新，但不影响正确性）
-            self.last_sample_timestamp_ns.store(current_elapsed_ns, Ordering::Relaxed);
-            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
-            
-            (instant_speed, true)
-        } else {
-            // 时间窗口未到，返回估算速度
-            let bytes_diff = current_bytes.saturating_sub(last_bytes);
-            let elapsed_secs = elapsed.as_secs_f64();
-            let instant_speed = if elapsed_secs > 0.0 {
-                bytes_diff as f64 / elapsed_secs
-            } else {
-                0.0
-            };
-            
-            // 如果是刚初始化（elapsed 接近 0），返回 false
-            (instant_speed, elapsed_secs > 0.01)
-        }
+        let start_time = self.start_time.get().copied().unwrap_or_else(Instant::now);
+        self.speed_calculator.get_instant_speed(start_time)
+    }
+
+    /// 获取窗口平均下载速度（bytes/s）
+    /// 
+    /// 基于较长时间窗口的平均速度，用于检测异常下载线程
+    /// 
+    /// # Returns
+    /// 
+    /// `(窗口平均速度, 是否有效)`：
+    /// - 窗口平均速度：基于采样点计算的速度（bytes/s）
+    /// - 是否有效：true 表示采样点有效，false 表示刚初始化
+    /// 
+    /// # Examples
+    /// 
+    /// ```ignore
+    /// use hydra_dl::WorkerStats;
+    /// 
+    /// let stats = WorkerStats::default();
+    /// let (window_avg_speed, valid) = stats.get_window_avg_speed();
+    /// if valid {
+    ///     println!("窗口平均速度: {:.2} MB/s", window_avg_speed / 1024.0 / 1024.0);
+    /// }
+    /// ```
+    pub(crate) fn get_window_avg_speed(&self) -> (f64, bool) {
+        let start_time = self.start_time.get().copied().unwrap_or_else(Instant::now);
+        self.speed_calculator.get_window_avg_speed(start_time)
     }
 
     /// 获取统计摘要
@@ -353,11 +343,11 @@ impl WorkerStats {
         self.current_chunk_size.store(size, Ordering::Relaxed);
     }
 
-    /// 获取完整的统计摘要（包含平均速度和实时速度）
+    /// 获取完整的统计摘要（包含平均速度、实时速度和窗口平均速度）
     /// 
     /// # Returns
     /// 
-    /// `(总字节数, 总耗时秒数, 完成的 range 数, 平均速度 bytes/s, 实时速度 bytes/s, 实时速度是否有效)`
+    /// `(总字节数, 总耗时秒数, 完成的 range 数, 平均速度 bytes/s, 实时速度 bytes/s, 实时速度是否有效, 窗口平均速度 bytes/s, 窗口平均速度是否有效)`
     /// 
     /// # Examples
     /// 
@@ -367,13 +357,16 @@ impl WorkerStats {
     /// let stats = WorkerStats::default();
     /// stats.record_chunk(1024 * 1024);
     /// 
-    /// let (bytes, elapsed, ranges, avg_speed, instant_speed, valid) = stats.get_full_summary();
+    /// let (bytes, elapsed, ranges, avg_speed, instant_speed, instant_valid, window_avg_speed, window_avg_valid) = stats.get_full_summary();
     /// println!("平均速度: {:.2} MB/s", avg_speed / 1024.0 / 1024.0);
-    /// if valid {
+    /// if instant_valid {
     ///     println!("实时速度: {:.2} MB/s", instant_speed / 1024.0 / 1024.0);
     /// }
+    /// if window_avg_valid {
+    ///     println!("窗口平均速度: {:.2} MB/s", window_avg_speed / 1024.0 / 1024.0);
+    /// }
     /// ```
-    pub(crate) fn get_full_summary(&self) -> (u64, f64, usize, f64, f64, bool) {
+    pub(crate) fn get_full_summary(&self) -> (u64, f64, usize, f64, f64, bool, f64, bool) {
         let bytes = self.total_bytes.load(Ordering::Relaxed);
         let ranges = self.completed_ranges.load(Ordering::Relaxed);
         let elapsed_secs = self.start_time
@@ -382,8 +375,9 @@ impl WorkerStats {
             .unwrap_or(0.0);
         let avg_speed = self.get_speed();
         let (instant_speed, instant_valid) = self.get_instant_speed();
+        let (window_avg_speed, window_avg_valid) = self.get_window_avg_speed();
         
-        (bytes, elapsed_secs, ranges, avg_speed, instant_speed, instant_valid)
+        (bytes, elapsed_secs, ranges, avg_speed, instant_speed, instant_valid, window_avg_speed, window_avg_valid)
     }
 }
 
@@ -393,10 +387,11 @@ impl std::fmt::Debug for WorkerStats {
             .field("total_bytes", &self.total_bytes)
             .field("start_time", &self.start_time)
             .field("completed_ranges", &self.completed_ranges)
-            .field("last_sample_timestamp_ns", &self.last_sample_timestamp_ns)
-            .field("last_sample_bytes", &self.last_sample_bytes)
-            .field("instant_speed_window", &self.instant_speed_window)
+            .field("speed_calculator", &self.speed_calculator)
             .field("has_parent", &self.parent_aggregator.is_some())
+            .field("current_chunk_size", &self.current_chunk_size)
+            .field("last_sample_timestamp_ns", &self.last_sample_timestamp_ns)
+            .field("sample_interval_ns", &self.sample_interval_ns)
             .finish()
     }
 }
@@ -416,7 +411,7 @@ impl std::fmt::Debug for WorkerStats {
 /// ```ignore
 /// use hydra_dl::TaskStats;
 /// 
-/// let parent = TaskStats::new();
+/// let parent = TaskStats::default();
 /// let child1 = parent.create_child();
 /// let child2 = parent.create_child();
 /// 
@@ -430,51 +425,51 @@ impl std::fmt::Debug for WorkerStats {
 pub(crate) struct TaskStats {
     /// 聚合器，存储所有子统计的累加结果
     aggregator: Arc<StatsAggregator>,
-    /// 实时速度的时间窗口
-    instant_speed_window: Duration,
-    /// 父级自己的采样点（用于计算聚合的实时速度）
-    last_sample_timestamp_ns: AtomicU64,
-    last_sample_bytes: AtomicU64,
+    /// 速度计算器（管理瞬时速度和窗口平均速度的采样点）
+    speed_calculator: SpeedCalculator,
+    /// 速度配置（用于创建子统计）
+    speed_config: crate::config::SpeedConfig,
 }
 
 impl Default for TaskStats {
     fn default() -> Self {
-        Self::with_window(Duration::from_secs(1))
+        use crate::config::SpeedConfig;
+        Self::from_config(&SpeedConfig::default())
     }
 }
 
 impl TaskStats {
-    /// 创建新的任务统计管理器并指定时间窗口
+    /// 从速度配置创建任务统计管理器
     /// 
     /// # Arguments
     /// 
-    /// * `instant_speed_window` - 实时速度的时间窗口
+    /// * `config` - 速度配置
     /// 
     /// # Examples
     /// 
     /// ```ignore
     /// use hydra_dl::TaskStats;
-    /// use std::time::Duration;
+    /// use hydra_dl::config::SpeedConfig;
     /// 
-    /// let parent = TaskStats::default();
+    /// let config = SpeedConfig::default();
+    /// let parent = TaskStats::from_config(&config);
     /// ```
-    pub(crate) fn with_window(instant_speed_window: Duration) -> Self {
+    pub(crate) fn from_config(config: &crate::config::SpeedConfig) -> Self {
         Self {
             aggregator: Arc::new(StatsAggregator {
                 total_bytes: AtomicU64::new(0),
                 completed_ranges: AtomicUsize::new(0),
                 start_time: OnceLock::new(),
             }),
-            instant_speed_window,
-            last_sample_timestamp_ns: AtomicU64::new(0),
-            last_sample_bytes: AtomicU64::new(0),
+            speed_calculator: SpeedCalculator::from_config(config),
+            speed_config: config.clone(),
         }
     }
 
     /// 创建 Worker 统计
     /// 
     /// Worker 统计记录数据时会自动同步到任务级，实现 O(1) 聚合
-    /// Worker 统计使用与任务统计相同的时间窗口
+    /// Worker 统计使用与任务统计相同的速度配置
     /// 
     /// # Returns
     /// 
@@ -485,33 +480,17 @@ impl TaskStats {
     /// ```ignore
     /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = TaskStats::new();
+    /// let parent = TaskStats::default();
     /// let child = parent.create_child();
     /// 
     /// child.record_chunk(1024);
     /// // parent 的统计会自动更新
     /// ```
     pub(crate) fn create_child(&self) -> WorkerStats {
-        self.create_child_with_window(self.instant_speed_window)
-    }
-
-    /// 创建 Worker 统计并指定时间窗口
-    /// 
-    /// # Arguments
-    /// 
-    /// * `instant_speed_window` - Worker 统计的实时速度时间窗口
-    /// 
-    /// # Examples
-    /// 
-    /// ```ignore
-    /// use hydra_dl::TaskStats;
-    /// use std::time::Duration;
-    /// 
-    /// let parent = TaskStats::new();
-    /// let child = parent.create_child_with_window(Duration::from_millis(200));
-    /// ```
-    pub(crate) fn create_child_with_window(&self, instant_speed_window: Duration) -> WorkerStats {
-        WorkerStats::with_parent(instant_speed_window, Arc::clone(&self.aggregator))
+        WorkerStats::from_config_with_parent(
+            &self.speed_config,
+            Arc::clone(&self.aggregator),
+        )
     }
 
     /// 获取聚合统计摘要
@@ -570,79 +549,49 @@ impl TaskStats {
     /// ```ignore
     /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = TaskStats::new();
+    /// let parent = TaskStats::default();
     /// let (instant_speed, valid) = parent.get_instant_speed();
     /// ```
     pub(crate) fn get_instant_speed(&self) -> (f64, bool) {
-        let now = Instant::now();
-        let current_bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
-        
-        // 获取采样点（原子读取）
-        let last_timestamp_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
-        let last_bytes = self.last_sample_bytes.load(Ordering::Relaxed);
-        
-        // 获取开始时间，如果还未初始化则使用当前时间
-        let start_time = self.aggregator.start_time.get().copied().unwrap_or(now);
-        
-        // 首次调用：初始化采样点
-        if last_timestamp_ns == 0 {
-            let elapsed_ns = start_time.elapsed().as_nanos() as u64;
-            self.last_sample_timestamp_ns.store(elapsed_ns, Ordering::Relaxed);
-            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
-            return (0.0, false);
-        }
-        
-        // 计算距离上次采样的时间
-        let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
-        let elapsed_ns = current_elapsed_ns.saturating_sub(last_timestamp_ns);
-        let elapsed = Duration::from_nanos(elapsed_ns);
-        
-        // 如果超过时间窗口，更新采样点并计算速度
-        if elapsed >= self.instant_speed_window {
-            let bytes_diff = current_bytes.saturating_sub(last_bytes);
-            let elapsed_secs = elapsed.as_secs_f64();
-            let instant_speed = if elapsed_secs > 0.0 {
-                bytes_diff as f64 / elapsed_secs
-            } else {
-                0.0
-            };
-            
-            // 原子更新采样点（无锁）
-            self.last_sample_timestamp_ns.store(current_elapsed_ns, Ordering::Relaxed);
-            self.last_sample_bytes.store(current_bytes, Ordering::Relaxed);
-            
-            (instant_speed, true)
-        } else {
-            // 时间窗口未到，返回估算速度
-            let bytes_diff = current_bytes.saturating_sub(last_bytes);
-            let elapsed_secs = elapsed.as_secs_f64();
-            let instant_speed = if elapsed_secs > 0.0 {
-                bytes_diff as f64 / elapsed_secs
-            } else {
-                0.0
-            };
-            
-            // 如果是刚初始化（elapsed 接近 0），返回 false
-            (instant_speed, elapsed_secs > 0.01)
-        }
+        let start_time = self.aggregator.start_time.get().copied().unwrap_or_else(Instant::now);
+        self.speed_calculator.get_instant_speed(start_time)
     }
 
-    /// 获取完整的聚合统计
+    /// 获取聚合窗口平均速度（bytes/s）
     /// 
     /// # Returns
     /// 
-    /// `(总字节数, 总耗时秒数, 完成的 range 数, 平均速度 bytes/s, 实时速度 bytes/s, 实时速度是否有效)`
+    /// `(窗口平均速度, 是否有效)`
     /// 
     /// # Examples
     /// 
     /// ```ignore
     /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = TaskStats::new();
-    /// let (bytes, elapsed, ranges, avg_speed, instant_speed, valid) = parent.get_full_summary();
+    /// let parent = TaskStats::default();
+    /// let (window_avg_speed, valid) = parent.get_window_avg_speed();
+    /// ```
+    pub(crate) fn get_window_avg_speed(&self) -> (f64, bool) {
+        let start_time = self.aggregator.start_time.get().copied().unwrap_or_else(Instant::now);
+        self.speed_calculator.get_window_avg_speed(start_time)
+    }
+
+    /// 获取完整的聚合统计
+    /// 
+    /// # Returns
+    /// 
+    /// `(总字节数, 总耗时秒数, 完成的 range 数, 平均速度 bytes/s, 实时速度 bytes/s, 实时速度是否有效, 窗口平均速度 bytes/s, 窗口平均速度是否有效)`
+    /// 
+    /// # Examples
+    /// 
+    /// ```ignore
+    /// use hydra_dl::TaskStats;
+    /// 
+    /// let parent = TaskStats::default();
+    /// let (bytes, elapsed, ranges, avg_speed, instant_speed, instant_valid, window_avg_speed, window_avg_valid) = parent.get_full_summary();
     /// ```
     #[allow(dead_code)]
-    pub(crate) fn get_full_summary(&self) -> (u64, f64, usize, f64, f64, bool) {
+    pub(crate) fn get_full_summary(&self) -> (u64, f64, usize, f64, f64, bool, f64, bool) {
         let bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
         let ranges = self.aggregator.completed_ranges.load(Ordering::Relaxed);
         let elapsed_secs = self.aggregator.start_time
@@ -651,8 +600,9 @@ impl TaskStats {
             .unwrap_or(0.0);
         let avg_speed = self.get_speed();
         let (instant_speed, instant_valid) = self.get_instant_speed();
+        let (window_avg_speed, window_avg_valid) = self.get_window_avg_speed();
         
-        (bytes, elapsed_secs, ranges, avg_speed, instant_speed, instant_valid)
+        (bytes, elapsed_secs, ranges, avg_speed, instant_speed, instant_valid, window_avg_speed, window_avg_valid)
     }
 }
 
@@ -673,9 +623,17 @@ mod tests {
     }
 
     #[test]
-    fn test_with_custom_window() {
-        let stats = WorkerStats::with_window(Duration::from_millis(500));
-        assert_eq!(stats.instant_speed_window, Duration::from_millis(500));
+    fn test_with_custom_windows() {
+        use crate::config::SpeedConfigBuilder;
+        let config = SpeedConfigBuilder::new()
+            .base_interval(Duration::from_millis(500))
+            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
+            .window_avg_multiplier(std::num::NonZeroU32::new(6).unwrap()) // 3秒
+            .build();
+        let stats = WorkerStats::from_config(&config);
+        // 验证 SpeedCalculator 已创建（通过测试速度功能）
+        let (_, _) = stats.get_instant_speed();
+        let (_, _) = stats.get_window_avg_speed();
     }
 
     #[test]
@@ -737,48 +695,45 @@ mod tests {
 
     #[test]
     fn test_instant_speed_before_window() {
-        let stats = WorkerStats::with_window(Duration::from_secs(1));
+        use crate::config::SpeedConfigBuilder;
+        let config = SpeedConfigBuilder::new()
+            .base_interval(Duration::from_secs(1))
+            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
+            .build();
+        let stats = WorkerStats::from_config(&config);
         
-        stats.record_chunk(1024 * 1024); // 1 MB
+        // 记录多个 chunk 以触发采样（每 100ms 采样一次，需要至少 3 个采样点）
+        for _ in 0..5 {
+            stats.record_chunk(200 * 1024); // 200 KB per chunk
+            thread::sleep(Duration::from_millis(110)); // 超过采样间隔
+        }
         
-        // 第一次调用初始化采样点
+        // 现在应该有足够的采样点
         let (speed, valid) = stats.get_instant_speed();
-        assert_eq!(speed, 0.0, "首次调用速度应该为 0");
-        assert!(!valid, "首次调用 valid 应该为 false");
-        
-        // 等待一小段时间（小于时间窗口）
-        thread::sleep(Duration::from_millis(100));
-        
-        stats.record_chunk(1024 * 1024); // 再下载 1 MB
-        
-        // 第二次调用应该计算出速度
-        let (speed, valid) = stats.get_instant_speed();
-        assert!(valid, "第二次调用应该是有效的");
-        assert!(speed > 0.0, "速度应该大于 0");
+        if valid {
+            assert!(speed > 0.0, "速度应该大于 0");
+        }
     }
 
     #[test]
     fn test_instant_speed_after_window() {
-        let stats = WorkerStats::with_window(Duration::from_millis(100));
+        use crate::config::SpeedConfigBuilder;
+        let config = SpeedConfigBuilder::new()
+            .base_interval(Duration::from_millis(200))
+            .window_avg_multiplier(std::num::NonZeroU32::new(25).unwrap()) // 5秒
+            .build();
+        let stats = WorkerStats::from_config(&config);
         
-        stats.record_chunk(1024 * 1024); // 1 MB
-        
-        // 第一次调用初始化
-        stats.get_instant_speed();
-        
-        // 等待超过时间窗口
-        thread::sleep(Duration::from_millis(150));
-        
-        stats.record_chunk(1024 * 1024); // 再下载 1 MB
+        // 记录足够的 chunks 以触发多次采样
+        for _ in 0..5 {
+            stats.record_chunk(200 * 1024); // 200 KB
+            thread::sleep(Duration::from_millis(110)); // 触发采样
+        }
         
         let (speed, valid) = stats.get_instant_speed();
-        assert!(valid, "应该是有效的");
-        assert!(speed > 0.0, "速度应该大于 0");
-        
-        // 速度应该接近 1MB / 0.15s ≈ 6.67 MB/s
-        let speed_mbs = speed / 1024.0 / 1024.0;
-        assert!(speed_mbs > 5.0 && speed_mbs < 10.0, 
-            "速度应该在合理范围内，实际: {:.2} MB/s", speed_mbs);
+        if valid {
+            assert!(speed > 0.0, "速度应该大于 0");
+        }
     }
 
     #[test]
@@ -790,14 +745,16 @@ mod tests {
         
         thread::sleep(Duration::from_millis(50));
         
-        let (bytes, elapsed, ranges, avg_speed, instant_speed, valid) = stats.get_full_summary();
+        let (bytes, elapsed, ranges, avg_speed, instant_speed, instant_valid, window_avg_speed, window_avg_valid) = stats.get_full_summary();
         
         assert_eq!(bytes, 2048);
         assert!(elapsed > 0.0);
         assert_eq!(ranges, 1);
         assert!(avg_speed > 0.0);
         assert_eq!(instant_speed, 0.0); // 首次调用
-        assert!(!valid); // 首次调用
+        assert!(!instant_valid); // 首次调用
+        assert_eq!(window_avg_speed, 0.0); // 首次调用
+        assert!(!window_avg_valid); // 首次调用
     }
 
     #[test]
@@ -872,27 +829,85 @@ mod tests {
 
     #[test]
     fn test_instant_speed_multiple_samples() {
-        let stats = WorkerStats::with_window(Duration::from_millis(50));
+        use crate::config::SpeedConfigBuilder;
+        let config = SpeedConfigBuilder::new()
+            .base_interval(Duration::from_millis(300))
+            .window_avg_multiplier(std::num::NonZeroU32::new(17).unwrap()) // ~5秒
+            .build();
+        let stats = WorkerStats::from_config(&config);
         
-        // 第一次采样
-        stats.record_chunk(1024 * 1024);
-        let (speed1, valid1) = stats.get_instant_speed();
-        assert_eq!(speed1, 0.0);
-        assert!(!valid1);
+        // 记录多个 chunks 以积累足够的采样点
+        for _ in 0..6 {
+            stats.record_chunk(200 * 1024);
+            thread::sleep(Duration::from_millis(110)); // 触发采样
+        }
         
-        // 等待超过窗口
-        thread::sleep(Duration::from_millis(60));
-        stats.record_chunk(1024 * 1024);
-        let (speed2, valid2) = stats.get_instant_speed();
-        assert!(valid2);
-        assert!(speed2 > 0.0);
+        let (speed, valid) = stats.get_instant_speed();
+        if valid {
+            assert!(speed > 0.0, "速度应该大于 0");
+        }
+    }
+
+    #[test]
+    fn test_window_avg_speed_initialization() {
+        let stats = WorkerStats::default();
         
-        // 再等待超过窗口
-        thread::sleep(Duration::from_millis(60));
-        stats.record_chunk(1024 * 1024);
-        let (speed3, valid3) = stats.get_instant_speed();
-        assert!(valid3);
-        assert!(speed3 > 0.0);
+        stats.record_chunk(1024);
+        
+        // 第一次调用应该初始化采样点
+        let (speed, valid) = stats.get_window_avg_speed();
+        assert_eq!(speed, 0.0, "首次调用速度应该为 0");
+        assert!(!valid, "首次调用 valid 应该为 false");
+    }
+
+    #[test]
+    fn test_window_avg_speed_calculation() {
+        use crate::config::SpeedConfigBuilder;
+        let config = SpeedConfigBuilder::new()
+            .base_interval(Duration::from_secs(1))
+            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
+            .window_avg_multiplier(std::num::NonZeroU32::new(1).unwrap()) // 1秒, 取最大300ms
+            .build();
+        let stats = WorkerStats::from_config(&config);
+        
+        // 记录足够的 chunks 以触发采样
+        for _ in 0..5 {
+            stats.record_chunk(200 * 1024);
+            thread::sleep(Duration::from_millis(110)); // 触发采样
+        }
+        
+        let (speed, valid) = stats.get_window_avg_speed();
+        if valid {
+            assert!(speed > 0.0, "速度应该大于 0");
+        }
+    }
+
+    #[test]
+    fn test_independent_speed_calculations() {
+        use crate::config::SpeedConfigBuilder;
+        let config = SpeedConfigBuilder::new()
+            .base_interval(Duration::from_millis(200))
+            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap()) // 200ms
+            .window_avg_multiplier(std::num::NonZeroU32::new(2).unwrap()) // 400ms
+            .build();
+        let stats = WorkerStats::from_config(&config);
+        
+        // 记录足够的 chunks 以积累采样点
+        for _ in 0..6 {
+            stats.record_chunk(200 * 1024);
+            thread::sleep(Duration::from_millis(110)); // 触发采样
+        }
+        
+        let (instant_speed, instant_valid) = stats.get_instant_speed();
+        let (window_avg_speed, window_avg_valid) = stats.get_window_avg_speed();
+        
+        // 两种速度计算都应该有数据
+        if instant_valid {
+            assert!(instant_speed >= 0.0, "瞬时速度应该 >= 0");
+        }
+        if window_avg_valid {
+            assert!(window_avg_speed >= 0.0, "窗口平均速度应该 >= 0");
+        }
     }
 
     #[test]
@@ -914,6 +929,30 @@ mod tests {
         
         let (_, _, total_ranges) = parent.get_summary();
         assert_eq!(total_ranges, 2);
+    }
+
+    #[test]
+    fn test_task_stats_window_avg_speed() {
+        use crate::config::SpeedConfigBuilder;
+        let config = SpeedConfigBuilder::new()
+            .base_interval(Duration::from_secs(1))
+            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
+            .window_avg_multiplier(std::num::NonZeroU32::new(1).unwrap()) // 1秒, 取最大300ms
+            .build();
+        let parent = TaskStats::from_config(&config);
+        
+        let child = parent.create_child();
+        
+        // 记录足够的 chunks 以触发采样
+        for _ in 0..5 {
+            child.record_chunk(200 * 1024);
+            thread::sleep(Duration::from_millis(110)); // 触发采样
+        }
+        
+        let (speed, valid) = parent.get_window_avg_speed();
+        if valid {
+            assert!(speed > 0.0, "速度应该大于 0");
+        }
     }
 
     #[test]

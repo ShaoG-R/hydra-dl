@@ -47,6 +47,8 @@ impl SpeedDefaults {
     pub const BASE_INTERVAL_MILLIS: u64 = 1000;
     /// 实时速度窗口倍数：1
     pub const INSTANT_WINDOW_MULTIPLIER: u32 = 1;
+    /// 窗口平均速度倍数：5（计算过去 5 个时间窗口的平均速度）
+    pub const WINDOW_AVG_MULTIPLIER: u32 = 5;
     /// 预期分块下载时长：5 秒
     pub const EXPECTED_CHUNK_DURATION_SECS: u64 = 5;
     /// 分块大小平滑系数：0.7
@@ -55,6 +57,10 @@ impl SpeedDefaults {
     pub const INSTANT_WEIGHT: f64 = 0.7;
     /// 平均速度权重：0.3
     pub const AVG_WEIGHT: f64 = 0.3;
+    /// 采样间隔：100 毫秒
+    pub const SAMPLE_INTERVAL_MILLIS: u64 = 100;
+    /// 环形缓冲区大小安全余量：1.2（在理论值基础上增加 20%）
+    pub const BUFFER_SIZE_MARGIN: f64 = 1.2;
 }
 
 /// 渐进式启动配置常量
@@ -193,6 +199,8 @@ pub struct SpeedConfig {
     pub base_interval: Duration,
     /// 实时速度窗口倍数（实际窗口 = base_interval × multiplier）
     pub instant_speed_window_multiplier: NonZeroU32,
+    /// 窗口平均速度倍数（实际窗口 = base_interval × multiplier）
+    pub window_avg_multiplier: NonZeroU32,
     /// 预期单个分块下载时长
     pub expected_chunk_duration: Duration,
     /// 分块大小平滑系数 (0.0 ~ 1.0)
@@ -201,6 +209,10 @@ pub struct SpeedConfig {
     pub instant_speed_weight: f64,
     /// 平均速度权重 (0.0 ~ 1.0)
     pub avg_speed_weight: f64,
+    /// 采样间隔（用于速度计算的采样频率）
+    pub sample_interval: Duration,
+    /// 环形缓冲区大小安全余量（在理论值基础上增加的比例）
+    pub buffer_size_margin: f64,
 }
 
 impl Default for SpeedConfig {
@@ -208,10 +220,13 @@ impl Default for SpeedConfig {
         Self {
             base_interval: Duration::from_millis(SpeedDefaults::BASE_INTERVAL_MILLIS),
             instant_speed_window_multiplier: NonZeroU32::new(SpeedDefaults::INSTANT_WINDOW_MULTIPLIER).unwrap(),
+            window_avg_multiplier: NonZeroU32::new(SpeedDefaults::WINDOW_AVG_MULTIPLIER).unwrap(),
             expected_chunk_duration: Duration::from_secs(SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: SpeedDefaults::SMOOTHING_FACTOR,
             instant_speed_weight: SpeedDefaults::INSTANT_WEIGHT,
             avg_speed_weight: SpeedDefaults::AVG_WEIGHT,
+            sample_interval: Duration::from_millis(SpeedDefaults::SAMPLE_INTERVAL_MILLIS),
+            buffer_size_margin: SpeedDefaults::BUFFER_SIZE_MARGIN,
         }
     }
 }
@@ -233,6 +248,16 @@ impl SpeedConfig {
     }
 
     #[inline]
+    pub fn window_avg_multiplier(&self) -> u32 {
+        self.window_avg_multiplier.get()
+    }
+
+    #[inline]
+    pub fn window_avg_duration(&self) -> Duration {
+        self.base_interval * self.window_avg_multiplier.get()
+    }
+
+    #[inline]
     pub fn expected_chunk_duration(&self) -> Duration {
         self.expected_chunk_duration
     }
@@ -250,6 +275,16 @@ impl SpeedConfig {
     #[inline]
     pub fn avg_speed_weight(&self) -> f64 {
         self.avg_speed_weight
+    }
+
+    #[inline]
+    pub fn sample_interval(&self) -> Duration {
+        self.sample_interval
+    }
+
+    #[inline]
+    pub fn buffer_size_margin(&self) -> f64 {
+        self.buffer_size_margin
     }
 }
 
@@ -536,10 +571,13 @@ impl Default for NetworkConfigBuilder {
 pub struct SpeedConfigBuilder {
     base_interval: Duration,
     instant_speed_window_multiplier: NonZeroU32,
+    window_avg_multiplier: NonZeroU32,
     expected_chunk_duration: Duration,
     smoothing_factor: f64,
     instant_speed_weight: f64,
     avg_speed_weight: f64,
+    sample_interval: Duration,
+    buffer_size_margin: f64,
 }
 
 impl SpeedConfigBuilder {
@@ -548,10 +586,13 @@ impl SpeedConfigBuilder {
         Self {
             base_interval: Duration::from_millis(SpeedDefaults::BASE_INTERVAL_MILLIS),
             instant_speed_window_multiplier: NonZeroU32::new(SpeedDefaults::INSTANT_WINDOW_MULTIPLIER).unwrap(),
+            window_avg_multiplier: NonZeroU32::new(SpeedDefaults::WINDOW_AVG_MULTIPLIER).unwrap(),
             expected_chunk_duration: Duration::from_secs(SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS),
             smoothing_factor: SpeedDefaults::SMOOTHING_FACTOR,
             instant_speed_weight: SpeedDefaults::INSTANT_WEIGHT,
             avg_speed_weight: SpeedDefaults::AVG_WEIGHT,
+            sample_interval: Duration::from_millis(SpeedDefaults::SAMPLE_INTERVAL_MILLIS),
+            buffer_size_margin: SpeedDefaults::BUFFER_SIZE_MARGIN,
         }
     }
 
@@ -564,6 +605,12 @@ impl SpeedConfigBuilder {
     /// 设置实时速度窗口倍数
     pub fn instant_window_multiplier(mut self, multiplier: NonZeroU32) -> Self {
         self.instant_speed_window_multiplier = multiplier;
+        self
+    }
+
+    /// 设置窗口平均速度倍数
+    pub fn window_avg_multiplier(mut self, multiplier: NonZeroU32) -> Self {
+        self.window_avg_multiplier = multiplier;
         self
     }
 
@@ -591,15 +638,30 @@ impl SpeedConfigBuilder {
         self
     }
 
+    /// 设置采样间隔
+    pub fn sample_interval(mut self, interval: Duration) -> Self {
+        self.sample_interval = interval;
+        self
+    }
+
+    /// 设置缓冲区大小安全余量
+    pub fn buffer_size_margin(mut self, margin: f64) -> Self {
+        self.buffer_size_margin = margin.max(1.0); // 至少为 1.0，不能缩小缓冲区
+        self
+    }
+
     /// 构建速度配置
     pub fn build(self) -> SpeedConfig {
         SpeedConfig {
             base_interval: self.base_interval,
             instant_speed_window_multiplier: self.instant_speed_window_multiplier,
+            window_avg_multiplier: self.window_avg_multiplier,
             expected_chunk_duration: self.expected_chunk_duration,
             smoothing_factor: self.smoothing_factor,
             instant_speed_weight: self.instant_speed_weight,
             avg_speed_weight: self.avg_speed_weight,
+            sample_interval: self.sample_interval,
+            buffer_size_margin: self.buffer_size_margin,
         }
     }
 }
@@ -847,10 +909,13 @@ impl DownloadConfigBuilder {
         let builder = SpeedConfigBuilder {
             base_interval: self.speed.base_interval,
             instant_speed_window_multiplier: self.speed.instant_speed_window_multiplier,
+            window_avg_multiplier: self.speed.window_avg_multiplier,
             expected_chunk_duration: self.speed.expected_chunk_duration,
             smoothing_factor: self.speed.smoothing_factor,
             instant_speed_weight: self.speed.instant_speed_weight,
             avg_speed_weight: self.speed.avg_speed_weight,
+            sample_interval: self.speed.sample_interval,
+            buffer_size_margin: self.speed.buffer_size_margin,
         };
         self.speed = f(builder).build();
         self

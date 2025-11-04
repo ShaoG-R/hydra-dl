@@ -201,8 +201,8 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     where
         C: HttpClient + Clone + Send + Sync + 'static,
     {
-        // 创建全局统计管理器（使用配置的时间窗口）
-        let global_stats = TaskStats::with_window(config.speed().instant_speed_window());
+        // 创建全局统计管理器（使用配置的速度配置）
+        let global_stats = TaskStats::from_config(config.speed());
 
         // 创建执行器
         let executor = Arc::new(DownloadWorkerExecutor::new(client, Arc::clone(&writer)));
@@ -381,7 +381,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
                 // load() 返回 Arc<Option<WorkerSlot>>
                 let slot_arc = worker_slot.load();
                 slot_arc.as_ref().as_ref().map(|worker| {
-                    let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid) = 
+                    let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid, _window_avg_speed, _window_avg_valid) = 
                         worker.stats.get_full_summary();
                     let current_chunk_size = worker.stats.get_current_chunk_size();
                     crate::download::WorkerStatSnapshot {
