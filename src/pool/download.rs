@@ -8,13 +8,13 @@
 //! - **DownloadWorkerExecutor**: 下载任务执行器，处理 Range 下载和文件写入
 //! - **DownloadWorkerPool**: 下载协程池，封装通用 WorkerPool 并提供下载特定方法
 
-use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerStats, WorkerTask};
+use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
 use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::utils::fetch::fetch_range;
 use crate::utils::io_traits::{AsyncFile, HttpClient};
 use crate::utils::range_writer::RangeWriter;
-use crate::utils::stats::{DownloadStats, DownloadStatsParent};
+use crate::utils::stats::TaskStats;
 use crate::Result;
 use async_trait::async_trait;
 use log::{debug, error, info};
@@ -27,7 +27,7 @@ impl WorkerTask for RangeTask {}
 
 impl WorkerResult for RangeResult {}
 
-impl WorkerStats for DownloadStats {}
+impl super::common::WorkerStats for crate::utils::stats::WorkerStats {}
 
 // ==================== 下载 Worker 上下文 ====================
 
@@ -77,7 +77,7 @@ where
 }
 
 #[async_trait]
-impl<C, F> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext, DownloadStats> for DownloadWorkerExecutor<C, F>
+impl<C, F> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats> for DownloadWorkerExecutor<C, F>
 where
     C: HttpClient,
     F: AsyncFile,
@@ -87,7 +87,7 @@ where
         worker_id: usize,
         task: RangeTask,
         context: &mut DownloadWorkerContext,
-        stats: &DownloadStats,
+        stats: &crate::utils::stats::WorkerStats,
     ) -> RangeResult {
         match task {
             RangeTask::Range { url, range, retry_count } => {
@@ -170,9 +170,9 @@ where
 /// - `F`: 异步文件类型
 pub(crate) struct DownloadWorkerPool<F: AsyncFile> {
     /// 底层通用协程池
-    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext, DownloadStats>,
+    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats>,
     /// 全局统计管理器（聚合所有 worker 的数据）
-    global_stats: DownloadStatsParent,
+    global_stats: TaskStats,
     /// 下载配置（用于创建新 worker 的分块策略）
     config: Arc<crate::config::DownloadConfig>,
     /// Phantom data 用于类型参数
@@ -202,13 +202,13 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         C: HttpClient + Clone + Send + Sync + 'static,
     {
         // 创建全局统计管理器（使用配置的时间窗口）
-        let global_stats = DownloadStatsParent::with_window(config.speed().instant_speed_window());
+        let global_stats = TaskStats::with_window(config.speed().instant_speed_window());
 
         // 创建执行器
         let executor = Arc::new(DownloadWorkerExecutor::new(client, Arc::clone(&writer)));
 
         // 为每个 worker 创建独立的上下文和统计
-        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<DownloadStats>)> = (0..initial_worker_count)
+        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..initial_worker_count)
             .map(|_| {
                 // 通过 parent 创建 child stats
                 let worker_stats = Arc::new(global_stats.create_child());
@@ -254,7 +254,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     {
         let _ = client; // 当前实现使用现有的 executor，此参数保留以备将来使用
         // 创建新的 worker 上下文和统计
-        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<DownloadStats>)> = (0..count)
+        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..count)
             .map(|_| {
                 let worker_stats = Arc::new(self.global_stats.create_child());
                 // 设置初始分块大小
@@ -291,7 +291,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
 
     /// 获取指定 worker 的统计信息
     #[allow(dead_code)]
-    pub(crate) fn worker_stats(&self, worker_id: usize) -> Option<Arc<DownloadStats>> {
+    pub(crate) fn worker_stats(&self, worker_id: usize) -> Option<Arc<crate::utils::stats::WorkerStats>> {
         self.pool.worker_stats(worker_id)
     }
 
@@ -540,7 +540,7 @@ mod tests {
         let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
 
         // 创建上下文和统计
-        let stats = DownloadStats::default();
+        let stats = crate::utils::stats::WorkerStats::default();
         let config = crate::config::DownloadConfig::default();
         let chunk_strategy = 
             Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
@@ -598,7 +598,7 @@ mod tests {
 
         let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
 
-        let stats = DownloadStats::default();
+        let stats = crate::utils::stats::WorkerStats::default();
         let config = crate::config::DownloadConfig::default();
         let chunk_strategy = 
             Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;

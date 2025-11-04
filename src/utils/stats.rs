@@ -42,7 +42,7 @@ pub(crate) struct StatsAggregator {
 /// # 线程安全
 /// 
 /// 所有方法都是线程安全的，可以被多个 worker 并发调用
-pub(crate) struct DownloadStats {
+pub(crate) struct WorkerStats {
     /// 总下载字节数（原子操作，无锁）
     total_bytes: AtomicU64,
     /// 下载开始时间（只初始化一次）
@@ -62,13 +62,13 @@ pub(crate) struct DownloadStats {
     current_chunk_size: AtomicU64,
 }
 
-impl Default for DownloadStats {
+impl Default for WorkerStats {
     fn default() -> Self {
         Self::with_window(Duration::from_secs(1))
     }
 }
 
-impl DownloadStats {
+impl WorkerStats {
     /// 创建新的统计实例并指定时间窗口
     /// 
     /// # Arguments
@@ -78,11 +78,11 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// use std::time::Duration;
     /// 
     /// // 使用 500ms 的时间窗口
-    /// let stats = DownloadStats::with_window(Duration::from_millis(500));
+    /// let stats = WorkerStats::with_window(Duration::from_millis(500));
     /// ```
     pub(crate) fn with_window(instant_speed_window: Duration) -> Self {
         Self {
@@ -107,10 +107,10 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// use std::sync::Arc;
     /// 
-    /// let parent = DownloadStatsParent::default();
+    /// let parent = TaskStats::default();
     /// let child = parent.create_child();
     /// 
     /// child.record_chunk(1024);
@@ -144,9 +144,9 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// 
-    /// let stats = DownloadStats::default();
+    /// let stats = WorkerStats::default();
     /// stats.record_chunk(1024); // 记录下载了 1KB
     /// ```
     pub(crate) fn record_chunk(&self, bytes: u64) {
@@ -168,9 +168,9 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// 
-    /// let stats = DownloadStats::default();
+    /// let stats = WorkerStats::default();
     /// stats.record_range_complete(); // 记录完成了一个 range
     /// ```
     pub(crate) fn record_range_complete(&self) {
@@ -193,9 +193,9 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// 
-    /// let stats = DownloadStats::default();
+    /// let stats = WorkerStats::default();
     /// stats.record_chunk(1024 * 1024); // 下载 1MB
     /// 
     /// let speed = stats.get_speed();
@@ -237,11 +237,11 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// use std::time::Duration;
     /// use std::thread;
     /// 
-    /// let stats = DownloadStats::default();
+    /// let stats = WorkerStats::default();
     /// stats.record_chunk(1024 * 1024); // 下载 1MB
     /// 
     /// thread::sleep(Duration::from_secs(1));
@@ -315,9 +315,9 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// 
-    /// let stats = DownloadStats::default();
+    /// let stats = WorkerStats::default();
     /// stats.record_chunk(1024);
     /// stats.record_range_complete();
     /// 
@@ -362,9 +362,9 @@ impl DownloadStats {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStats;
+    /// use hydra_dl::WorkerStats;
     /// 
-    /// let stats = DownloadStats::default();
+    /// let stats = WorkerStats::default();
     /// stats.record_chunk(1024 * 1024);
     /// 
     /// let (bytes, elapsed, ranges, avg_speed, instant_speed, valid) = stats.get_full_summary();
@@ -387,9 +387,9 @@ impl DownloadStats {
     }
 }
 
-impl std::fmt::Debug for DownloadStats {
+impl std::fmt::Debug for WorkerStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DownloadStats")
+        f.debug_struct("WorkerStats")
             .field("total_bytes", &self.total_bytes)
             .field("start_time", &self.start_time)
             .field("completed_ranges", &self.completed_ranges)
@@ -401,22 +401,22 @@ impl std::fmt::Debug for DownloadStats {
     }
 }
 
-/// 父级统计管理器
+/// 任务级统计管理器
 /// 
-/// 管理多个子统计（child stats），子统计的数据会自动聚合到父级
-/// 通过父级可以 O(1) 获取所有子统计的聚合结果，无需遍历
+/// 管理多个 Worker 统计，Worker 统计的数据会自动聚合到任务级
+/// 通过任务统计可以 O(1) 获取所有 Worker 统计的聚合结果，无需遍历
 /// 
 /// # 使用场景
 /// 
-/// 在 WorkerPool 中，创建一个 parent stats，每个 worker 通过 `create_child()` 
-/// 创建自己的 child stats。当 child 记录数据时，会自动同步到 parent。
+/// 在 WorkerPool 中，创建一个任务统计，每个 worker 通过 `create_child()` 
+/// 创建自己的 Worker 统计。当 Worker 记录数据时，会自动同步到任务统计。
 /// 
 /// # Examples
 /// 
 /// ```ignore
-/// use hydra_dl::DownloadStatsParent;
+/// use hydra_dl::TaskStats;
 /// 
-/// let parent = DownloadStatsParent::new();
+/// let parent = TaskStats::new();
 /// let child1 = parent.create_child();
 /// let child2 = parent.create_child();
 /// 
@@ -427,7 +427,7 @@ impl std::fmt::Debug for DownloadStats {
 /// assert_eq!(total_bytes, 3072);  // 自动聚合
 /// ```
 #[derive(Debug)]
-pub(crate) struct DownloadStatsParent {
+pub(crate) struct TaskStats {
     /// 聚合器，存储所有子统计的累加结果
     aggregator: Arc<StatsAggregator>,
     /// 实时速度的时间窗口
@@ -437,14 +437,14 @@ pub(crate) struct DownloadStatsParent {
     last_sample_bytes: AtomicU64,
 }
 
-impl Default for DownloadStatsParent {
+impl Default for TaskStats {
     fn default() -> Self {
         Self::with_window(Duration::from_secs(1))
     }
 }
 
-impl DownloadStatsParent {
-    /// 创建新的父级统计管理器并指定时间窗口
+impl TaskStats {
+    /// 创建新的任务统计管理器并指定时间窗口
     /// 
     /// # Arguments
     /// 
@@ -453,10 +453,10 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStatsParent;
+    /// use hydra_dl::TaskStats;
     /// use std::time::Duration;
     /// 
-    /// let parent = DownloadStatsParent::default();
+    /// let parent = TaskStats::default();
     /// ```
     pub(crate) fn with_window(instant_speed_window: Duration) -> Self {
         Self {
@@ -471,47 +471,47 @@ impl DownloadStatsParent {
         }
     }
 
-    /// 创建子统计
+    /// 创建 Worker 统计
     /// 
-    /// 子统计记录数据时会自动同步到父级，实现 O(1) 聚合
-    /// 子统计使用与父级相同的时间窗口
+    /// Worker 统计记录数据时会自动同步到任务级，实现 O(1) 聚合
+    /// Worker 统计使用与任务统计相同的时间窗口
     /// 
     /// # Returns
     /// 
-    /// 返回一个新的 `DownloadStats` 实例，其 parent 字段指向当前父级
+    /// 返回一个新的 `WorkerStats` 实例，其 parent 字段指向当前任务统计
     /// 
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStatsParent;
+    /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = DownloadStatsParent::new();
+    /// let parent = TaskStats::new();
     /// let child = parent.create_child();
     /// 
     /// child.record_chunk(1024);
     /// // parent 的统计会自动更新
     /// ```
-    pub(crate) fn create_child(&self) -> DownloadStats {
+    pub(crate) fn create_child(&self) -> WorkerStats {
         self.create_child_with_window(self.instant_speed_window)
     }
 
-    /// 创建子统计并指定时间窗口
+    /// 创建 Worker 统计并指定时间窗口
     /// 
     /// # Arguments
     /// 
-    /// * `instant_speed_window` - 子统计的实时速度时间窗口
+    /// * `instant_speed_window` - Worker 统计的实时速度时间窗口
     /// 
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStatsParent;
+    /// use hydra_dl::TaskStats;
     /// use std::time::Duration;
     /// 
-    /// let parent = DownloadStatsParent::new();
+    /// let parent = TaskStats::new();
     /// let child = parent.create_child_with_window(Duration::from_millis(200));
     /// ```
-    pub(crate) fn create_child_with_window(&self, instant_speed_window: Duration) -> DownloadStats {
-        DownloadStats::with_parent(instant_speed_window, Arc::clone(&self.aggregator))
+    pub(crate) fn create_child_with_window(&self, instant_speed_window: Duration) -> WorkerStats {
+        WorkerStats::with_parent(instant_speed_window, Arc::clone(&self.aggregator))
     }
 
     /// 获取聚合统计摘要
@@ -523,9 +523,9 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStatsParent;
+    /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = DownloadStatsParent::new();
+    /// let parent = TaskStats::new();
     /// let (bytes, elapsed, ranges) = parent.get_summary();
     /// ```
     pub(crate) fn get_summary(&self) -> (u64, f64, usize) {
@@ -543,9 +543,9 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStatsParent;
+    /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = DownloadStatsParent::new();
+    /// let parent = TaskStats::new();
     /// let speed = parent.get_speed();
     /// ```
     pub(crate) fn get_speed(&self) -> f64 {
@@ -568,9 +568,9 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStatsParent;
+    /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = DownloadStatsParent::new();
+    /// let parent = TaskStats::new();
     /// let (instant_speed, valid) = parent.get_instant_speed();
     /// ```
     pub(crate) fn get_instant_speed(&self) -> (f64, bool) {
@@ -636,9 +636,9 @@ impl DownloadStatsParent {
     /// # Examples
     /// 
     /// ```ignore
-    /// use hydra_dl::DownloadStatsParent;
+    /// use hydra_dl::TaskStats;
     /// 
-    /// let parent = DownloadStatsParent::new();
+    /// let parent = TaskStats::new();
     /// let (bytes, elapsed, ranges, avg_speed, instant_speed, valid) = parent.get_full_summary();
     /// ```
     #[allow(dead_code)]
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_new_stats() {
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
         let (bytes, elapsed, ranges) = stats.get_summary();
         
         assert_eq!(bytes, 0);
@@ -674,13 +674,13 @@ mod tests {
 
     #[test]
     fn test_with_custom_window() {
-        let stats = DownloadStats::with_window(Duration::from_millis(500));
+        let stats = WorkerStats::with_window(Duration::from_millis(500));
         assert_eq!(stats.instant_speed_window, Duration::from_millis(500));
     }
 
     #[test]
     fn test_record_chunk() {
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
         
         stats.record_chunk(1024);
         let (bytes, _, _) = stats.get_summary();
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_record_range_complete() {
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
         
         stats.record_range_complete();
         let (_, _, ranges) = stats.get_summary();
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_average_speed() {
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
         
         // 第一次记录会初始化开始时间
         stats.record_chunk(1024 * 1024); // 1 MB
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_instant_speed_initialization() {
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
         
         stats.record_chunk(1024);
         
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_instant_speed_before_window() {
-        let stats = DownloadStats::with_window(Duration::from_secs(1));
+        let stats = WorkerStats::with_window(Duration::from_secs(1));
         
         stats.record_chunk(1024 * 1024); // 1 MB
         
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_instant_speed_after_window() {
-        let stats = DownloadStats::with_window(Duration::from_millis(100));
+        let stats = WorkerStats::with_window(Duration::from_millis(100));
         
         stats.record_chunk(1024 * 1024); // 1 MB
         
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_full_summary() {
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
         
         stats.record_chunk(2048);
         stats.record_range_complete();
@@ -804,7 +804,7 @@ mod tests {
     fn test_concurrent_record_chunk() {
         use std::sync::Arc;
         
-        let stats = Arc::new(DownloadStats::default());
+        let stats = Arc::new(WorkerStats::default());
         let mut handles = vec![];
         
         // 启动 10 个线程，每个记录 100 次
@@ -831,7 +831,7 @@ mod tests {
     fn test_concurrent_range_complete() {
         use std::sync::Arc;
         
-        let stats = Arc::new(DownloadStats::default());
+        let stats = Arc::new(WorkerStats::default());
         let mut handles = vec![];
         
         // 启动 5 个线程，每个完成 20 个 range
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_speed_calculation_accuracy() {
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
         
         stats.record_chunk(10 * 1024 * 1024); // 10 MB
         
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_instant_speed_multiple_samples() {
-        let stats = DownloadStats::with_window(Duration::from_millis(50));
+        let stats = WorkerStats::with_window(Duration::from_millis(50));
         
         // 第一次采样
         stats.record_chunk(1024 * 1024);
@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn test_parent_child_aggregation() {
-        let parent = DownloadStatsParent::default();
+        let parent = TaskStats::default();
         let child1 = parent.create_child();
         let child2 = parent.create_child();
         
@@ -921,7 +921,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
         
-        let parent = Arc::new(DownloadStatsParent::default());
+        let parent = Arc::new(TaskStats::default());
         let mut handles = vec![];
         
         // 启动 10 个线程，每个创建一个 child 并记录数据

@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient, HttpResponse, IoError};
 use crate::utils::range_writer::AllocatedRange;
 use crate::task::FileTask;
-use crate::utils::stats::DownloadStats;
+use crate::utils::stats::WorkerStats;
 
 /// Fetch 操作错误类型
 #[derive(Error, Debug)]
@@ -244,7 +244,7 @@ pub async fn fetch_range<C>(
     client: &C,
     url: &str,
     range: AllocatedRange,
-    stats: &DownloadStats,
+    stats: &WorkerStats,
 ) -> Result<Bytes>
 where
     C: HttpClient,
@@ -270,7 +270,7 @@ where
         let chunk = chunk?;
         let chunk_size = chunk.len() as u64;
         
-        // 实时记录 chunk（DownloadStats 是 Sync 的，可以通过引用调用）
+        // 实时记录 chunk（WorkerStats 是 Sync 的，可以通过引用调用）
         stats.record_chunk(chunk_size);
         
         buffer.extend_from_slice(&chunk);
@@ -600,7 +600,7 @@ mod tests {
         let full_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         
         let client = MockHttpClient::new();
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
 
         // 创建一个 RangeAllocator 来生成 AllocatedRange
         // RangeAllocator 总是从 0 开始分配
@@ -638,7 +638,7 @@ mod tests {
     async fn test_fetch_range_http_error() {
         let test_url = "http://example.com/file.bin";
         let client = MockHttpClient::new();
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
 
         let mut allocator = RangeAllocator::new(100);
         let range = allocator.allocate(10).unwrap();
@@ -745,7 +745,7 @@ mod tests {
         let end = large_data.len() as u64;
 
         let client = MockHttpClient::new();
-        let stats = DownloadStats::default();
+        let stats = WorkerStats::default();
 
         let mut allocator = RangeAllocator::new(end);
         let range = allocator.allocate(end).unwrap();
