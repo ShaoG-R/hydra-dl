@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: 测试 - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 安装 Rust 工具链
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        target: ${{ matrix.target }}
+
+    - name: 缓存 Cargo 依赖
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: 检查代码格式
+      run: cargo fmt --all -- --check
+      continue-on-error: true
+
+    - name: 运行 Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      continue-on-error: true
+
+    - name: 构建项目
+      run: cargo build --verbose
+
+    - name: 运行测试
+      run: cargo test --verbose
+
+    - name: 构建 Release 版本
+      run: cargo build --release --verbose
+
+  build-artifacts:
+    name: 构建发布文件 - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: hydra-dl-linux-x86_64
+            binary_extension: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: hydra-dl-windows-x86_64
+            binary_extension: '.exe'
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: hydra-dl-macos-x86_64
+            binary_extension: ''
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 安装 Rust 工具链
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        target: ${{ matrix.target }}
+
+    - name: 缓存 Cargo 依赖
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-release-
+          ${{ runner.os }}-cargo-
+
+    - name: 构建 Release 版本
+      run: cargo build --release --target ${{ matrix.target }}
+
+    - name: 准备发布文件 (Unix)
+      if: runner.os != 'Windows'
+      run: |
+        cd target/${{ matrix.target }}/release
+        tar czf ${{ matrix.artifact_name }}.tar.gz hydra-dl${{ matrix.binary_extension }}
+        mv ${{ matrix.artifact_name }}.tar.gz ../../../
+
+    - name: 准备发布文件 (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        cd target/${{ matrix.target }}/release
+        7z a ${{ matrix.artifact_name }}.zip hydra-dl${{ matrix.binary_extension }}
+        move ${{ matrix.artifact_name }}.zip ../../../
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: |
+          ${{ matrix.artifact_name }}.tar.gz
+          ${{ matrix.artifact_name }}.zip
+        if-no-files-found: ignore
+
