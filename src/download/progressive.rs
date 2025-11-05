@@ -90,7 +90,8 @@ impl ProgressiveLauncher {
     /// 
     /// # Returns
     /// 
-    /// 成功返回 Ok(())，失败返回错误
+    /// 成功返回 `Ok(Vec<(worker_id, cancel_tx)>)`，包含新分配任务的取消通道列表
+    /// 失败返回错误
     pub(super) async fn check_and_launch_next_stage<C, F>(
         &mut self,
         pool: &mut DownloadWorkerPool<F>,
@@ -98,11 +99,14 @@ impl ProgressiveLauncher {
         config: &DownloadConfig,
         task_allocator: &mut TaskAllocator,
         writer: &crate::utils::range_writer::RangeWriter<F>,
-    ) -> Result<()>
+    ) -> Result<Vec<(usize, tokio::sync::oneshot::Sender<()>)>>
     where
         C: HttpClient + Clone + Send + 'static,
         F: AsyncFile + 'static,
     {
+        // 用于收集新分配任务的取消通道
+        let mut new_cancel_senders = Vec::new();
+        
         let current_worker_count = pool.worker_count();
         
         // 检测 worker 数量变化并降级批次（应对部分 worker 被手动关闭的情况）
@@ -170,7 +174,7 @@ impl ProgressiveLauncher {
                         estimated_time_left,
                         threshold
                     );
-                    return Ok(());
+                    return Ok(new_cancel_senders);
                 }
             }
             
@@ -201,12 +205,15 @@ impl ProgressiveLauncher {
                         let chunk_size = pool.get_worker_chunk_size(worker_id);
                         
                         if let Some(allocated) = task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
-                            let (task, assigned_worker, _cancel_tx) = allocated.into_parts();
+                            let (task, assigned_worker, cancel_tx) = allocated.into_parts();
                             info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", assigned_worker, chunk_size);
                             if let Err(e) = pool.send_task(task, assigned_worker).await {
                                 error!("为新 worker 分配任务失败: {:?}", e);
                                 // 失败了，将 worker 放回队列
                                 task_allocator.mark_worker_idle(assigned_worker);
+                            } else {
+                                // 收集取消通道，稍后由调用者保存
+                                new_cancel_senders.push((assigned_worker, cancel_tx));
                             }
                         } else {
                             debug!("没有足够的数据为新 worker #{} 分配任务", worker_id);
@@ -226,7 +233,7 @@ impl ProgressiveLauncher {
             );
         }
         
-        Ok(())
+        Ok(new_cancel_senders)
     }
 }
 

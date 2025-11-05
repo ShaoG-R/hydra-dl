@@ -308,14 +308,22 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         
         // 检查是否可以启动下一批worker（渐进式启动）
         if self.progressive_launcher.should_check_next_stage() {
-            if let Err(e) = self.progressive_launcher.check_and_launch_next_stage(
+            match self.progressive_launcher.check_and_launch_next_stage(
                 &mut self.pool,
                 self.client.clone(),
                 &self.config,
                 &mut self.task_allocator,
                 self.writer.as_ref(),
             ).await {
-                error!("渐进式启动下一批 worker 失败: {:?}", e);
+                Ok(new_cancel_senders) => {
+                    // 保存新分配任务的取消通道
+                    for (worker_id, cancel_tx) in new_cancel_senders {
+                        self.cancel_senders.insert(worker_id, cancel_tx);
+                    }
+                }
+                Err(e) => {
+                    error!("渐进式启动下一批 worker 失败: {:?}", e);
+                }
             }
         }
         
