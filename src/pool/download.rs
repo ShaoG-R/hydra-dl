@@ -438,6 +438,16 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         let stats = self.pool.worker_stats(worker_id)?;
         Some(stats.get_instant_speed())
     }
+
+    /// 获取指定 worker 的窗口平均速度
+    ///
+    /// # Returns
+    ///
+    /// Some((窗口平均速度 bytes/s, 是否有效)) 或 None（如果 worker 不存在）
+    pub(crate) fn get_worker_window_avg_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
+        let stats = self.pool.worker_stats(worker_id)?;
+        Some(stats.get_window_avg_speed())
+    }
 }
 
 #[cfg(test)]
