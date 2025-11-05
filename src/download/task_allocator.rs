@@ -75,10 +75,11 @@ impl TaskAllocator {
         
         // 优先从重试队列中取任务
         if let Some(retry_info) = self.ready_retry_queue.pop_front() {
+            let (start, end) = retry_info.range.as_file_range();
             debug!(
                 "从重试队列分配任务 range {}..{}, 重试次数 {}",
-                retry_info.range.start(),
-                retry_info.range.end(),
+                start,
+                end,
                 retry_info.retry_count
             );
             
@@ -151,10 +152,11 @@ impl TaskAllocator {
     /// 
     /// * `task_info` - 失败任务信息
     pub(super) fn push_ready_retry_task(&mut self, task_info: FailedTaskInfo) {
+        let (start, end) = task_info.range.as_file_range();
         debug!(
             "推入重试任务到就绪队列 range {}..{}, 重试次数 {}",
-            task_info.range.start(),
-            task_info.range.end(),
+            start,
+            end,
             task_info.retry_count
         );
         self.ready_retry_queue.push_back(task_info);
@@ -179,10 +181,11 @@ impl TaskAllocator {
         delay: std::time::Duration,
         timer_service: &TimerService,
     ) -> Result<()> {
+        let (start, end) = range.as_file_range();
         debug!(
             "记录失败任务 range {}..{}, 重试次数 {}, 将在 {:.1}s 后重试",
-            range.start(),
-            range.end(),
+            start,
+            end,
             retry_count,
             delay.as_secs_f64()
         );
@@ -211,10 +214,11 @@ impl TaskAllocator {
     /// * `range` - 失败的 range
     /// * `error` - 错误信息
     pub(super) fn record_permanent_failure(&mut self, range: AllocatedRange, error: String) {
+        let (start, end) = range.as_file_range();
         error!(
             "任务永久失败 range {}..{}: {}",
-            range.start(),
-            range.end(),
+            start,
+            end,
             error
         );
         self.permanently_failed.push((range, error));
@@ -282,8 +286,9 @@ mod tests {
         match task {
             WorkerTask::Range { url, range, retry_count } => {
                 assert_eq!(url, "http://example.com/file");
-                assert_eq!(range.start(), 0);
-                assert_eq!(range.end(), 100);
+                let (start, end) = range.as_file_range();
+                assert_eq!(start, 0);
+                assert_eq!(end, 100);
                 assert_eq!(retry_count, 0);
             }
         }
@@ -403,8 +408,10 @@ mod tests {
             
             let info = failed_info.unwrap();
             assert_eq!(info.retry_count, 1);
-            assert_eq!(info.range.start(), range.start());
-            assert_eq!(info.range.end(), range.end());
+            let (info_start, info_end) = info.range.as_file_range();
+            let (range_start, range_end) = range.as_file_range();
+            assert_eq!(info_start, range_start);
+            assert_eq!(info_end, range_end);
             
             // 取出后应该没有待重试的任务了
             assert_eq!(task_allocator.pending_retry_count(), 0);
@@ -430,8 +437,10 @@ mod tests {
         
         let failures = task_allocator.get_permanent_failures();
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].0.start(), range.start());
-        assert_eq!(failures[0].0.end(), range.end());
+        let (failure_start, failure_end) = failures[0].0.as_file_range();
+        let (range_start, range_end) = range.as_file_range();
+        assert_eq!(failure_start, range_start);
+        assert_eq!(failure_end, range_end);
         assert_eq!(failures[0].1, "Connection timeout");
     }
 

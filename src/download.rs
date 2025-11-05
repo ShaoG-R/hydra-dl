@@ -321,10 +321,11 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
             return LoopControl::Continue;
         };
         
+        let (start, end) = info.range.as_file_range();
         info!(
             "定时器触发，重试任务 range {}..{}, 重试次数 {}",
-            info.range.start(),
-            info.range.end(),
+            start,
+            end,
             info.retry_count
         );
         
@@ -390,11 +391,12 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         error: String,
         retry_count: usize,
     ) -> LoopControl {
+        let (start, end) = range.as_file_range();
         warn!(
             "Worker #{} Range {}..{} 失败 (重试 {}): {}",
             worker_id,
-            range.start(),
-            range.end(),
+            start,
+            end,
             retry_count,
             error
         );
@@ -501,7 +503,8 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
             let error_details: Vec<String> = failures
                 .iter()
                 .map(|(range, error)| {
-                    format!("range {}..{}: {}", range.start(), range.end(), error)
+                    let (start, end) = range.as_file_range();
+                    format!("range {}..{}: {}", start, end, error)
                 })
                 .collect();
             
@@ -527,7 +530,7 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         retry_count: usize,
     ) {
         let max_retry = self.config.retry().max_retry_count();
-        
+        let (start, end) = range.as_file_range();
         if retry_count < max_retry {
             // 还可以重试，计算延迟时间
             let retry_delays = self.config.retry().retry_delays();
@@ -540,8 +543,8 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
             
             info!(
                 "任务 range {}..{} 将在 {:.1}s 后进行第 {} 次重试",
-                range.start(),
-                range.end(),
+                start,
+                end,
                 delay.as_secs_f64(),
                 retry_count + 1
             );
@@ -565,8 +568,8 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
             // 已达到最大重试次数，记录为永久失败
             error!(
                 "任务 range {}..{} 已达到最大重试次数 {}，标记为永久失败",
-                range.start(),
-                range.end(),
+                start,
+                end,
                 max_retry
             );
             self.task_allocator.record_permanent_failure(range, "达到最大重试次数".to_string());

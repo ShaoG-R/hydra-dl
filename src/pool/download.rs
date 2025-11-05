@@ -11,9 +11,9 @@
 use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
 use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
-use crate::utils::fetch::{fetch_range, FetchRangeResult};
+use crate::utils::fetch::{RangeFetcher, FetchRangeResult};
 use crate::utils::io_traits::{AsyncFile, HttpClient};
-use crate::utils::range_writer::RangeWriter;
+use crate::utils::range_writer::{AllocatedRange, RangeWriter};
 use crate::utils::stats::TaskStats;
 use crate::Result;
 use async_trait::async_trait;
@@ -91,18 +91,20 @@ where
     ) -> RangeResult {
         match task {
             RangeTask::Range { url, range, retry_count } => {
+                let (start, end) = range.as_file_range();
                 debug!(
                     "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
                     worker_id,
                     url,
-                    range.start(),
-                    range.end(),
+                    start,
+                    end,
                     retry_count
                 );
 
                 // 下载数据（在下载过程中会实时更新 stats）
-                // 暂时传递 None 作为 cancel_rx 参数，保持现有行为
-                let fetch_result = fetch_range(&self.client, &url, range, stats, None).await;
+                // 创建一个永远不会被触发的取消通道
+                let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                let fetch_result = RangeFetcher::new(&self.client, &url, range, stats).fetch_with_cancel(cancel_rx).await;
 
                 match fetch_result {
                     Ok(FetchRangeResult::Complete(data)) => {
@@ -137,13 +139,25 @@ where
                             }
                         }
                     }
-                    Ok(FetchRangeResult::Cancelled(_data)) => {
-                        // 下载被取消
-                        let error_msg = "下载被取消".to_string();
-                        debug!("Worker #{} Range {}..{} {}", worker_id, range.start(), range.end(), error_msg);
+                    Ok(FetchRangeResult::Cancelled { data, remaining_range }) => {
+                        // 下载被取消，先写入已下载的部分数据（如果有）
+                        if !data.is_empty() {
+                            // 计算已下载部分的 range
+                            let downloaded_range = AllocatedRange::from_file_range(start, start + data.len() as u64);
+                            if let Err(e) = self.writer.write_range(downloaded_range, data).await {
+                                error!("Worker #{} 写入已下载的部分数据失败: {:?}", worker_id, e);
+                            } else {
+                                debug!("Worker #{} 成功写入已下载的 {} bytes", worker_id, downloaded_range.len());
+                            }
+                        }
+                        
+                        // 返回剩余的 range 用于重试
+                        let (remaining_start, remaining_end) = remaining_range.as_file_range();
+                        let error_msg = format!("下载被取消，剩余 range: {}..{}", remaining_start, remaining_end);
+                        debug!("Worker #{} {}", worker_id, error_msg);
                         RangeResult::Failed {
                             worker_id,
-                            range,
+                            range: remaining_range,
                             error: error_msg,
                             retry_count,
                         }
@@ -154,8 +168,8 @@ where
                         error!(
                             "Worker #{} Range {}..{} {}",
                             worker_id,
-                            range.start(),
-                            range.end(),
+                            start,
+                            end,
                             error_msg
                         );
                         RangeResult::Failed {

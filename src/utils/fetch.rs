@@ -40,8 +40,13 @@ pub type Result<T> = std::result::Result<T, FetchError>;
 pub enum FetchRangeResult {
     /// 下载完成
     Complete(Bytes),
-    /// 下载被取消（包含已下载的部分数据）
-    Cancelled(Bytes),
+    /// 下载被取消（包含已下载的部分数据和剩余需要下载的 range）
+    Cancelled {
+        /// 已下载的部分数据
+        data: Bytes,
+        /// 剩余需要下载的 range
+        remaining_range: AllocatedRange,
+    },
 }
 
 // ============================================================================
@@ -238,65 +243,150 @@ where
     Ok(())
 }
 
-/// 获取文件的指定范围
+/// Range 下载器
 /// 
-/// # Arguments
-/// * `client` - HTTP 客户端
-/// * `url` - 下载 URL
-/// * `range` - 已分配的 Range，定义要下载的字节范围
-/// * `stats` - 共享的下载统计，每个 chunk 到达时实时更新
-/// * `cancel_rx` - 可选的取消信号接收器，收到信号时中途停止下载
-/// 
-/// # Returns
-/// 
-/// 返回 `FetchRangeResult`：
-/// - `Complete(Bytes)`: 下载完整完成，包含所有请求的数据
-/// - `Cancelled(Bytes)`: 下载被取消，包含已下载的部分数据
-pub async fn fetch_range<C>(
-    client: &C,
-    url: &str,
+/// 封装 Range 下载的参数和逻辑，提供可取消和不可取消两种下载方式
+pub struct RangeFetcher<'a, C: HttpClient> {
+    client: &'a C,
+    url: &'a str,
     range: AllocatedRange,
-    stats: &WorkerStats,
-    cancel_rx: Option<tokio::sync::oneshot::Receiver<()>>,
-) -> Result<FetchRangeResult>
-where
-    C: HttpClient,
-{
-    debug!(
-        "开始下载 Range: {} (bytes {}-{})",
-        url, range.start(), range.end() - 1  // HTTP Range 是包含结束位置的
-    );
+    stats: &'a WorkerStats,
+}
 
-    let response = client
-        .get_with_range(url, range.start(), range.end() - 1)
-        .await?;
-
-    if !response.status().is_success() && response.status().as_u16() != 206 {
-        return Err(FetchError::HttpStatus(response.status().as_u16()));
+impl<'a, C: HttpClient> RangeFetcher<'a, C> {
+    /// 创建新的 Range 下载器
+    /// 
+    /// # Arguments
+    /// * `client` - HTTP 客户端
+    /// * `url` - 下载 URL
+    /// * `range` - 已分配的 Range，定义要下载的字节范围
+    /// * `stats` - 共享的下载统计，每个 chunk 到达时实时更新
+    pub fn new(
+        client: &'a C,
+        url: &'a str,
+        range: AllocatedRange,
+        stats: &'a WorkerStats,
+    ) -> Self {
+        Self { client, url, range, stats }
     }
+    
+    /// 下载指定范围的数据（不可取消）
+    /// 
+    /// # Returns
+    /// 
+    /// 返回下载的完整数据
+    #[allow(unused)]
+    pub async fn fetch(self) -> Result<Bytes> {
+        let (http_start, http_end) = self.range.as_http_range();
+        debug!(
+            "开始下载 Range: {} (bytes {}-{})",
+            self.url, http_start, http_end
+        );
 
-    // 流式下载到内存，每个 chunk 到达时实时更新统计
-    let mut stream = response.bytes_stream();
-    let mut buffer = BytesMut::new();
-    let mut cancel_rx = cancel_rx;
+        let response = self.client
+            .get_with_range(self.url, http_start, http_end)
+            .await?;
 
-    loop {
-        // 如果没有取消信号，只监听数据流
-        if cancel_rx.is_none() {
-            match stream.next().await {
-                Some(chunk) => {
-                    let chunk = chunk?;
-                    let chunk_size = chunk.len() as u64;
-                    
-                    // 实时记录 chunk（WorkerStats 是 Sync 的，可以通过引用调用）
-                    stats.record_chunk(chunk_size);
-                    
-                    buffer.extend_from_slice(&chunk);
-                }
-                None => break, // 流结束
+        if !response.status().is_success() && response.status().as_u16() != 206 {
+            return Err(FetchError::HttpStatus(response.status().as_u16()));
+        }
+
+        let data = self.download_stream(response.bytes_stream()).await?;
+        
+
+        let (start, end) = self.range.as_file_range();
+        debug!(
+            "Range {}..{} 下载完成: {} bytes",
+            start, end, data.len()
+        );
+        
+        Ok(data)
+    }
+    
+    /// 下载指定范围的数据（可取消）
+    /// 
+    /// # Arguments
+    /// * `cancel_rx` - 取消信号接收器，收到信号时中途停止下载
+    /// 
+    /// # Returns
+    /// 
+    /// 返回 `FetchRangeResult`：
+    /// - `Complete(Bytes)`: 下载完整完成，包含所有请求的数据
+    /// - `Cancelled { data, remaining_range }`: 下载被取消，包含已下载的部分数据和剩余需要下载的 range
+    pub async fn fetch_with_cancel(
+        self,
+        cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<FetchRangeResult> {
+        let (http_start, http_end) = self.range.as_http_range();
+        debug!(
+            "开始下载 Range (可取消): {} (bytes {}-{})",
+            self.url, http_start, http_end
+        );
+
+        let response = self.client
+            .get_with_range(self.url, http_start, http_end)
+            .await?;
+
+        if !response.status().is_success() && response.status().as_u16() != 206 {
+            return Err(FetchError::HttpStatus(response.status().as_u16()));
+        }
+
+        let result = self.download_stream_with_cancel(response.bytes_stream(), cancel_rx).await?;
+        
+        let (start, end) = self.range.as_file_range();
+        match &result {
+            FetchRangeResult::Complete(data) => {
+                debug!(
+                    "Range {}..{} 下载完成: {} bytes",
+                    start, end, data.len()
+                );
             }
-        } else {
-            // 同时监听数据流和取消信号
+            FetchRangeResult::Cancelled { data, remaining_range } => {
+                let (remaining_start, remaining_end) = remaining_range.as_file_range();
+                debug!(
+                    "Range {}..{} 下载被取消，已下载: {} bytes，剩余 range: {}..{}",
+                    start, end, data.len(),
+                    remaining_start, remaining_end
+                );
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// 下载数据流（不可取消版本）
+    async fn download_stream<S>(&self, mut stream: S) -> Result<Bytes>
+    where
+        S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
+    {
+        let mut buffer = BytesMut::new();
+        
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
+            let chunk_size = chunk.len() as u64;
+            
+            // 实时记录 chunk
+            self.stats.record_chunk(chunk_size);
+            
+            buffer.extend_from_slice(&chunk);
+        }
+        
+        Ok(buffer.freeze())
+    }
+    
+    /// 下载数据流（可取消版本）
+    async fn download_stream_with_cancel<S>(
+        &self,
+        mut stream: S,
+        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<FetchRangeResult>
+    where
+        S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
+    {
+        let mut buffer = BytesMut::new();
+        let mut downloaded_bytes = 0u64;
+        
+        loop {
             tokio::select! {
                 chunk_result = stream.next() => {
                     match chunk_result {
@@ -305,31 +395,31 @@ where
                             let chunk_size = chunk.len() as u64;
                             
                             // 实时记录 chunk
-                            stats.record_chunk(chunk_size);
+                            self.stats.record_chunk(chunk_size);
                             
                             buffer.extend_from_slice(&chunk);
+                            downloaded_bytes += chunk_size;
                         }
-                        None => break, // 流结束
+                        None => {
+                            // 流结束，下载完成
+                            return Ok(FetchRangeResult::Complete(buffer.freeze()));
+                        }
                     }
                 }
-                _ = cancel_rx.as_mut().unwrap() => {
-                    // 收到取消信号
-                    debug!(
-                        "Range {}..{} 下载被取消，已下载: {} bytes",
-                        range.start(), range.end(), buffer.len()
-                    );
-                    return Ok(FetchRangeResult::Cancelled(buffer.freeze()));
+                _ = &mut cancel_rx => {
+                    // 收到取消信号，计算剩余需要下载的 range
+                    let (start, end) = self.range.as_file_range();
+                    let new_start = start + downloaded_bytes;
+                    let remaining_range = AllocatedRange::from_file_range(new_start, end);
+                    
+                    return Ok(FetchRangeResult::Cancelled {
+                        data: buffer.freeze(),
+                        remaining_range,
+                    });
                 }
             }
         }
     }
-
-    debug!(
-        "Range {}..{} 下载完成: {} bytes",
-        range.start(), range.end(), buffer.len()
-    );
-
-    Ok(FetchRangeResult::Complete(buffer.freeze()))
 }
 
 /// 文件元数据获取器
@@ -670,15 +760,11 @@ mod tests {
             Bytes::copy_from_slice(expected_data),
         );
 
-        // 执行下载
-        let result = fetch_range(&client, test_url, range, &stats, None).await;
+        // 执行下载（不可取消版本）
+        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch().await;
         assert!(result.is_ok(), "Range 下载应该成功: {:?}", result);
 
-        let fetch_result = result.unwrap();
-        let data = match fetch_result {
-            FetchRangeResult::Complete(data) => data,
-            FetchRangeResult::Cancelled(_) => panic!("不应该被取消"),
-        };
+        let data = result.unwrap();
         assert_eq!(data.as_ref(), expected_data, "下载的数据应该匹配");
 
         // 验证统计信息（只验证字节数，不验证 range 计数，因为 fetch_range 不负责调用 record_range_complete）
@@ -705,8 +791,8 @@ mod tests {
             Bytes::new(),
         );
 
-        // 执行下载
-        let result = fetch_range(&client, test_url, range, &stats, None).await;
+        // 执行下载（不可取消版本）
+        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch().await;
         assert!(result.is_err(), "应该返回错误");
     }
 
@@ -814,15 +900,11 @@ mod tests {
             Bytes::from(large_data.clone()),
         );
 
-        // 执行下载
-        let result = fetch_range(&client, test_url, range, &stats, None).await;
+        // 执行下载（不可取消版本）
+        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch().await;
         assert!(result.is_ok(), "大数据 Range 下载应该成功");
 
-        let fetch_result = result.unwrap();
-        let data = match fetch_result {
-            FetchRangeResult::Complete(data) => data,
-            FetchRangeResult::Cancelled(_) => panic!("不应该被取消"),
-        };
+        let data = result.unwrap();
         assert_eq!(data.len(), large_data.len(), "下载的数据大小应该匹配");
         assert_eq!(data.as_ref(), &large_data[..], "下载的数据内容应该匹配");
 
@@ -865,15 +947,21 @@ mod tests {
             let _ = cancel_tx.send(());
         });
 
-        // 执行下载
-        let result = fetch_range(&client, test_url, range, &stats, Some(cancel_rx)).await;
+        // 执行下载（可取消版本）
+        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch_with_cancel(cancel_rx).await;
         assert!(result.is_ok(), "调用应该成功");
 
         // 验证返回的是 Cancelled 变体（注意：由于 Mock 实现可能一次性返回所有数据，可能会返回 Complete）
         match result.unwrap() {
-            FetchRangeResult::Cancelled(data) => {
+            FetchRangeResult::Cancelled { data, remaining_range } => {
                 // 应该有部分数据（或可能没有，取决于取消的时机）
                 assert!(data.len() <= test_data.len(), "取消时的数据不应该超过总大小");
+                // 验证剩余 range 的正确性
+                let expected_start = data.len() as u64;
+                let expected_end = test_data.len() as u64;
+                let (remaining_start, remaining_end) = remaining_range.as_file_range();
+                assert_eq!(remaining_start, expected_start, "剩余 range 的起始位置应该匹配");
+                assert_eq!(remaining_end, expected_end, "剩余 range 的结束位置应该匹配");
             }
             FetchRangeResult::Complete(data) => {
                 // 如果 Mock 一次性返回了所有数据，在取消信号到达之前就完成了

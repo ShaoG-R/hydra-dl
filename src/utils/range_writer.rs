@@ -90,11 +90,45 @@ pub type Result<T> = std::result::Result<T, RangeWriterError>;
 /// 这个类型只能通过 [`RangeAllocator::allocate`] 方法创建，
 /// 保证了所有 Range 都是有效的且不重叠的
 /// 
+/// # Range 格式说明
+/// 
+/// 内部使用 **左闭右开** 区间 `[start, end)`：
+/// - `start`: 包含的起始位置
+/// - `end`: **不包含**的结束位置
+/// 
+/// 例如：`AllocatedRange { start: 0, end: 10 }` 表示字节 0-9（共 10 字节）
+/// 
+/// ## 文件操作 vs HTTP Range 请求
+/// 
+/// - **文件操作**：使用 `start()` 和 `end()`，直接对应 `[start, end)` 格式
+/// - **HTTP Range 请求**：需要转换为 `[start, end_inclusive]` 格式，使用 `as_http_range()`
+/// 
 /// # 安全性保证
 /// 
 /// - start 总是小于等于 end
 /// - 只能通过分配器创建，防止重叠
 /// - 提供不可变访问，防止修改
+/// 
+/// # Examples
+/// 
+/// ```
+/// # use hydra_dl::utils::range_writer::RangeAllocator;
+/// let mut allocator = RangeAllocator::new(100);
+/// let range = allocator.allocate(10).unwrap();
+/// 
+/// // 文件操作格式 [start, end)
+/// assert_eq!(range.start(), 0);      // 起始位置：0
+/// let (start, end) = range.as_file_range();
+/// assert_eq!(start, 0);              // 起始位置：0
+/// assert_eq!(end, 10);               // 结束位置：10（不包含）
+/// assert_eq!(range.len(), 10);       // 长度：10 字节
+/// 
+/// // HTTP Range 格式 [start, end_inclusive]
+/// let (http_start, http_end) = range.as_http_range();
+/// assert_eq!(http_start, 0);         // HTTP Range start: 0
+/// assert_eq!(http_end, 9);           // HTTP Range end: 9（包含）
+/// // 对应 HTTP header: "Range: bytes=0-9"
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocatedRange {
     start: u64,
@@ -102,22 +136,135 @@ pub struct AllocatedRange {
 }
 
 impl AllocatedRange {
-    /// 创建新的 AllocatedRange（仅供 RangeAllocator 使用）
+    /// 从文件操作范围创建新的 AllocatedRange（内部使用）
+    /// 
+    /// 使用左闭右开区间 `[start, end)` 创建 Range
     /// 
     /// 这个方法是 crate 内部可见的，外部用户无法直接创建
-    pub(crate) fn new(start: u64, end: u64) -> Self {
+    /// 
+    /// # Arguments
+    /// 
+    /// * `start` - 起始位置（包含）
+    /// * `end` - 结束位置（不包含）
+    /// 
+    /// # Panics
+    /// 
+    /// 在 debug 模式下，如果 `start > end` 会 panic
+    /// 
+    /// # Example
+    /// 
+    /// ```ignore
+    /// // 内部使用示例
+    /// let range = AllocatedRange::from_file_range(0, 10);
+    /// // 表示字节 0-9（共 10 字节）
+    /// ```
+    pub(crate) fn from_file_range(start: u64, end: u64) -> Self {
         debug_assert!(start <= end, "start 必须小于等于 end");
         Self { start, end }
     }
+
+    /// 从 HTTP Range 格式创建新的 AllocatedRange（内部使用）
+    /// 
+    /// 将 HTTP Range 的左闭右闭区间 `[start, end]` 转换为内部的左闭右开格式
+    /// 
+    /// 这个方法是 crate 内部可见的，外部用户无法直接创建
+    /// 
+    /// # Arguments
+    /// 
+    /// * `start` - HTTP Range 起始位置（包含）
+    /// * `end` - HTTP Range 结束位置（包含）
+    /// 
+    /// # Example
+    /// 
+    /// ```ignore
+    /// // 从 HTTP Range "bytes=0-9" 创建
+    /// let range = AllocatedRange::from_http_range(0, 9);
+    /// // 内部存储为 [0, 10)，表示 10 字节
+    /// assert_eq!(range.len(), 10);
+    /// ```
+    #[allow(unused)]
+    pub(crate) fn from_http_range(start: u64, end: u64) -> Self {
+        Self { start, end: end + 1 }
+    }
     
+    /// 获取文件操作格式的 Range
+    /// 
+    /// 返回左闭右开区间 `(start, end)`，用于：
+    /// - 文件 seek 操作
+    /// - 切片索引
+    /// - Range 计算
+    /// 
+    /// # Returns
+    /// 
+    /// `(start, end)` - 起始位置（包含）和结束位置（不包含）
+    /// 
+    /// # Example
+    /// 
+    /// ```
+    /// # use hydra_dl::utils::range_writer::RangeAllocator;
+    /// let mut allocator = RangeAllocator::new(100);
+    /// let range = allocator.allocate(10).unwrap();
+    /// 
+    /// let (start, end) = range.as_file_range();
+    /// assert_eq!(start, 0);   // 起始：0
+    /// assert_eq!(end, 10);    // 结束：10（不包含）
+    /// // 表示字节 0-9（共 10 字节）
+    /// ```
+    pub fn as_file_range(&self) -> (u64, u64) {
+        (self.start, self.end)
+    }
+
     /// 获取起始位置
+    /// 
+    /// 这是一个便捷方法，等价于 `as_file_range().0`
+    /// 
+    /// # Returns
+    /// 
+    /// 返回 Range 的起始位置（包含）
+    /// 
+    /// # Example
+    /// 
+    /// ```
+    /// # use hydra_dl::utils::range_writer::RangeAllocator;
+    /// let mut allocator = RangeAllocator::new(100);
+    /// let range = allocator.allocate(10).unwrap();
+    /// 
+    /// assert_eq!(range.start(), 0);
+    /// ```
     pub fn start(&self) -> u64 {
         self.start
     }
     
-    /// 获取结束位置
-    pub fn end(&self) -> u64 {
-        self.end
+    /// 转换为 HTTP Range 格式
+    /// 
+    /// 返回 `(start, end_inclusive)` 元组，用于 HTTP Range 请求
+    /// 
+    /// HTTP Range header 使用左闭右闭区间 `[start, end]`，
+    /// 例如 `bytes=0-9` 表示字节 0-9（共 10 字节，包含第 9 字节）
+    /// 
+    /// # Returns
+    /// 
+    /// `(start, end_inclusive)` - 可直接用于 HTTP Range 请求
+    /// 
+    /// # Panics
+    /// 
+    /// 如果 Range 为空（`start == end`），调用此方法会导致下溢（end - 1）
+    /// 
+    /// # Example
+    /// 
+    /// ```
+    /// # use hydra_dl::utils::range_writer::RangeAllocator;
+    /// let mut allocator = RangeAllocator::new(100);
+    /// let range = allocator.allocate(10).unwrap();
+    /// 
+    /// let (start, end_inclusive) = range.as_http_range();
+    /// // 用于 HTTP 请求: Range: bytes=0-9
+    /// assert_eq!(start, 0);
+    /// assert_eq!(end_inclusive, 9);
+    /// ```
+    pub fn as_http_range(&self) -> (u64, u64) {
+        debug_assert!(!self.is_empty(), "不能对空 Range 调用 as_http_range()");
+        (self.start, self.end - 1)
     }
     
     /// 获取 Range 的长度（字节数）
@@ -130,7 +277,9 @@ impl AllocatedRange {
         self.start == self.end
     }
     
-    /// 转换为标准 Range<u64>
+    /// 转换为标准 Range<u64>（文件操作格式）
+    /// 
+    /// 返回左闭右开区间 `start..end`
     pub fn as_range(&self) -> Range<u64> {
         self.start..self.end
     }
@@ -157,11 +306,15 @@ impl From<AllocatedRange> for Range<u64> {
 /// // 分配 100 字节
 /// let range1 = allocator.allocate(100).unwrap();
 /// assert_eq!(range1.start(), 0);
-/// assert_eq!(range1.end(), 100);
+/// let (start, end) = range1.as_file_range();
+/// assert_eq!(start, 0);
+/// assert_eq!(end, 100);
 ///
 /// let range2 = allocator.allocate(150).unwrap();
 /// assert_eq!(range2.start(), 100);
-/// assert_eq!(range2.end(), 250);
+/// let (start2, end2) = range2.as_file_range();
+/// assert_eq!(start2, 100);
+/// assert_eq!(end2, 250);
 ///
 /// assert_eq!(allocator.remaining(), 750);
 /// ```
@@ -201,7 +354,7 @@ impl RangeAllocator {
         let end = start + size;
         self.next_pos = end;
         
-        Some(AllocatedRange::new(start, end))
+        Some(AllocatedRange::from_file_range(start, end))
     }
     
     /// 获取剩余可分配字节数
@@ -339,13 +492,15 @@ impl<F: AsyncFile> RangeWriter<F> {
         if data_len != range_size {
             return Err(RangeWriterError::SizeMismatch { data_len, range_size });
         }
+
+        let (start, end) = range.as_file_range();
         
         // 锁定文件进行写入
         {
             let mut file = self.file.lock().await;
             
             // 定位到文件指定位置
-            file.seek(SeekFrom::Start(range.start())).await?;
+            file.seek(SeekFrom::Start(start)).await?;
             
             // 写入数据
             file.write_all(&data).await?;
@@ -357,7 +512,7 @@ impl<F: AsyncFile> RangeWriter<F> {
         let progress = (written as f64 / self.total_bytes as f64) * 100.0;
         info!(
             "Range {}..{} 已写入 ({} bytes), 总进度: {:.1}% ({}/{} bytes)",
-            range.start(), range.end(), data_len, progress, 
+            start, end, data_len, progress, 
             written, self.total_bytes
         );
         
@@ -624,17 +779,23 @@ mod tests {
         // 分配多个 Range
         let range1 = allocator.allocate(100).unwrap();
         assert_eq!(range1.start(), 0);
-        assert_eq!(range1.end(), 100);
+        let (start1, end1) = range1.as_file_range();
+        assert_eq!(start1, 0);
+        assert_eq!(end1, 100);
         assert_eq!(range1.len(), 100);
         
         let range2 = allocator.allocate(150).unwrap();
         assert_eq!(range2.start(), 100);
-        assert_eq!(range2.end(), 250);
+        let (start2, end2) = range2.as_file_range();
+        assert_eq!(start2, 100);
+        assert_eq!(end2, 250);
         assert_eq!(range2.len(), 150);
         
         let range3 = allocator.allocate(50).unwrap();
         assert_eq!(range3.start(), 250);
-        assert_eq!(range3.end(), 300);
+        let (start3, end3) = range3.as_file_range();
+        assert_eq!(start3, 250);
+        assert_eq!(end3, 300);
         assert_eq!(range3.len(), 50);
         
         // 空间不足，应该返回 None
