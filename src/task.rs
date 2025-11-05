@@ -30,7 +30,8 @@ pub(crate) enum WorkerTask {
 /// 
 /// 不包含数据本身，只包含完成状态：
 /// - `Complete`: 成功下载并写入
-/// - `Failed`: 下载或写入失败，包含错误信息
+/// - `DownloadFailed`: 下载失败（网络错误、服务器错误等）
+/// - `WriteFailed`: 写入文件失败（磁盘错误、权限问题等）
 #[derive(Debug)]
 pub(crate) enum RangeResult {
     /// Range 成功完成
@@ -38,8 +39,8 @@ pub(crate) enum RangeResult {
         /// 完成此任务的 worker ID
         worker_id: usize,
     },
-    /// Range 失败
-    Failed {
+    /// 下载失败
+    DownloadFailed {
         /// 失败的 worker ID
         worker_id: usize,
         /// 失败的 range
@@ -48,5 +49,14 @@ pub(crate) enum RangeResult {
         error: String,
         /// 当前的重试次数
         retry_count: usize,
+    },
+    /// 写入失败
+    WriteFailed {
+        /// 失败的 worker ID
+        worker_id: usize,
+        /// 失败的 range
+        range: AllocatedRange,
+        /// 错误信息
+        error: String,
     },
 }

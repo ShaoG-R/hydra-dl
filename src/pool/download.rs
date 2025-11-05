@@ -130,11 +130,10 @@ where
                                 // 写入失败
                                 let error_msg = format!("写入失败: {:?}", e);
                                 error!("Worker #{} {}", worker_id, error_msg);
-                                RangeResult::Failed {
+                                RangeResult::WriteFailed {
                                     worker_id,
                                     range,
                                     error: error_msg,
-                                    retry_count,
                                 }
                             }
                         }
@@ -155,7 +154,7 @@ where
                         let (remaining_start, remaining_end) = remaining_range.as_file_range();
                         let error_msg = format!("下载被取消，剩余 range: {}..{}", remaining_start, remaining_end);
                         debug!("Worker #{} {}", worker_id, error_msg);
-                        RangeResult::Failed {
+                        RangeResult::DownloadFailed {
                             worker_id,
                             range: remaining_range,
                             error: error_msg,
@@ -172,7 +171,7 @@ where
                             end,
                             error_msg
                         );
-                        RangeResult::Failed {
+                        RangeResult::DownloadFailed {
                             worker_id,
                             range,
                             error: error_msg,
@@ -588,7 +587,7 @@ mod tests {
             RangeResult::Complete { worker_id } => {
                 assert_eq!(worker_id, 0);
             }
-            RangeResult::Failed { error, .. } => {
+            RangeResult::DownloadFailed { error, .. } | RangeResult::WriteFailed { error, .. } => {
                 panic!("任务不应该失败: {}", error);
             }
         }
@@ -642,9 +641,12 @@ mod tests {
 
         // 验证结果
         match result {
-            RangeResult::Failed { worker_id, error, .. } => {
+            RangeResult::DownloadFailed { worker_id, error, .. } => {
                 assert_eq!(worker_id, 0);
                 assert!(error.contains("下载失败"));
+            }
+            RangeResult::WriteFailed { .. } => {
+                panic!("应该是下载失败，而不是写入失败");
             }
             RangeResult::Complete { .. } => {
                 panic!("任务应该失败");

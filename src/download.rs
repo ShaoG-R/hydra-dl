@@ -363,8 +363,17 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         
         match result {
             RangeResult::Complete { worker_id } => self.handle_complete(worker_id).await,
-            RangeResult::Failed { worker_id, range, error, retry_count } => {
+            RangeResult::DownloadFailed { worker_id, range, error, retry_count } => {
                 self.handle_failed(worker_id, range, error, retry_count).await
+            }
+            RangeResult::WriteFailed { worker_id, range, error, .. } => {
+                // 写入失败通常是致命的（磁盘满、权限问题等），直接终止下载
+                let (start, end) = range.as_file_range();
+                error!(
+                    "Worker #{} 写入失败，终止下载 (range: {}..{}): {}",
+                    worker_id, start, end, error
+                );
+                LoopControl::Break
             }
         }
     }
