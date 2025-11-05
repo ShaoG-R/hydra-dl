@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use kestrel_timer::{TimerService, TaskId};
 use crate::pool::download::DownloadWorkerPool;
-use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient};
+use crate::utils::io_traits::{HttpClient};
 use crate::utils::range_writer::{RangeAllocator, RangeWriter, AllocatedRange};
 use crate::task::RangeResult;
 use std::collections::HashMap;
@@ -194,13 +194,13 @@ impl DownloadHandle {
 /// 下载任务执行器
 /// 
 /// 封装了下载任务的执行逻辑，使用辅助结构体管理任务分配和进度报告
-struct DownloadTask<C: HttpClient, F: AsyncFile> {
+struct DownloadTask<C: HttpClient> {
     /// HTTP 客户端（用于动态添加 worker）
     client: C,
     /// Worker 协程池
-    pool: DownloadWorkerPool<F>,
+    pool: DownloadWorkerPool,
     /// 文件写入器
-    writer: Arc<RangeWriter<F>>,
+    writer: Arc<RangeWriter>,
     /// 任务分配器
     task_allocator: TaskAllocator,
     /// 进度报告器
@@ -218,12 +218,12 @@ struct DownloadTask<C: HttpClient, F: AsyncFile> {
     cancel_senders: HashMap<usize, tokio::sync::oneshot::Sender<()>>,
 }
 
-impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
+impl<C: HttpClient + Clone> DownloadTask<C> {
     /// 创建新的下载任务
     fn new(
         client: C,
         progress_sender: Option<Sender<DownloadProgress>>,
-        writer: Arc<RangeWriter<F>>,
+        writer: Arc<RangeWriter>,
         allocator: RangeAllocator,
         url: String,
         total_size: u64,
@@ -854,7 +854,7 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
 /// 为 DownloadTask 实现 WorkerLaunchExecutor trait
 /// 
 /// 提供渐进式启动所需的外部能力接口
-impl<C: HttpClient + Clone, F: AsyncFile> WorkerLaunchExecutor for DownloadTask<C, F> {
+impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
     fn current_worker_count(&self) -> usize {
         self.pool.worker_count()
     }
@@ -931,9 +931,8 @@ impl<C: HttpClient + Clone, F: AsyncFile> WorkerLaunchExecutor for DownloadTask<
 /// 
 /// * `config` - 下载配置，包含动态分块策略和并发控制参数
 /// * `progress_sender` - 可选的进度更新发送器，通过 channel 发送进度信息
-async fn download_ranged_generic<C, FS>(
+async fn download_ranged_generic<C>(
     client: C,
-    fs: FS,
     url: &str,
     save_path: PathBuf,
     config: &crate::config::DownloadConfig,
@@ -942,8 +941,6 @@ async fn download_ranged_generic<C, FS>(
 ) -> Result<()>
 where
     C: HttpClient + Clone + Send + 'static,
-    FS: FileSystem,
-    FS::File: Send + 'static,
 {
     let worker_count = config.concurrency().worker_count();
     
@@ -958,7 +955,7 @@ where
             url: url.to_string(),
             save_path: save_path.clone(),
         };
-        return Ok(crate::utils::fetch::fetch_file(&client, task, &fs).await?);
+        return Ok(crate::utils::fetch::fetch_file(&client, task).await?);
     }
 
     let content_length = metadata.content_length.ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
@@ -971,7 +968,7 @@ where
     );
 
     // 创建 RangeWriter 和 RangeAllocator（会预分配文件）
-    let (writer, allocator) = RangeWriter::new(&fs, save_path.clone(), content_length).await?;
+    let (writer, allocator) = RangeWriter::new(save_path.clone(), content_length).await?;
 
     // 将 writer 包装在 Arc 中
     let writer = Arc::new(writer);
@@ -1089,7 +1086,6 @@ pub async fn download_ranged(
     config: crate::config::DownloadConfig,
     timer_service: TimerService,
 ) -> Result<(DownloadHandle, std::path::PathBuf)> {
-    use crate::utils::io_traits::TokioFileSystem;
     use reqwest::Client;
     
     // 创建带超时设置的 HTTP 客户端
@@ -1097,8 +1093,6 @@ pub async fn download_ranged(
         .timeout(config.network().timeout())
         .connect_timeout(config.network().connect_timeout())
         .build()?;
-    
-    let fs = TokioFileSystem::default();
     
     // 获取文件元数据以确定文件名
     info!("正在获取文件元数据: {}", url);
@@ -1125,7 +1119,6 @@ pub async fn download_ranged(
     let completion_handle = tokio::spawn(async move {
         download_ranged_generic(
             client, 
-            fs, 
             &url, 
             save_path_clone, 
             &config,
@@ -1146,10 +1139,9 @@ pub async fn download_ranged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::io_traits::mock::{MockHttpClient, MockFileSystem};
+    use crate::utils::io_traits::mock::MockHttpClient;
     use reqwest::{header::HeaderMap, StatusCode};
     use bytes::Bytes;
-    use std::path::PathBuf;
     use kestrel_timer::{TimerWheel, config::ServiceConfig};
 
     fn create_timer_service() -> (TimerWheel, TimerService) {
@@ -1164,10 +1156,10 @@ mod tests {
 
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
-        let save_path = PathBuf::from("/tmp/test_download.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_download.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应（检查 Range 支持）
         let mut head_headers = HeaderMap::new();
@@ -1224,7 +1216,6 @@ mod tests {
         
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1234,10 +1225,6 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "下载应该成功: {:?}", result);
-
-        // 验证文件已创建
-        let file = fs.get_file(&save_path);
-        assert!(file.is_some(), "文件应该已创建");
 
         // 注意：由于 MockFileSystem 的限制，我们无法直接验证文件内容
         // 但可以验证请求日志
@@ -1250,10 +1237,10 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data = b"Test data without range support";
-        let save_path = PathBuf::from("/tmp/test_fallback.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_fallback.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应（不支持 Range）
         let mut head_headers = HeaderMap::new();
@@ -1287,7 +1274,6 @@ mod tests {
         
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1310,10 +1296,10 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data: Vec<u8> = (0..100).collect(); // 100 bytes
-        let save_path = PathBuf::from("/tmp/test_multi_workers.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_multi_workers.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
@@ -1369,7 +1355,6 @@ mod tests {
         
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1387,10 +1372,10 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/small_file.bin";
         let test_data: Vec<u8> = vec![0; 1024 * 1024]; // 1 MB 文件
-        let save_path = PathBuf::from("/tmp/test_small_file.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_small_file.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
@@ -1431,7 +1416,6 @@ mod tests {
 
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1450,10 +1434,10 @@ mod tests {
         let test_url = "http://example.com/medium_file.bin";
         let file_size = 10 * 1024 * 1024; // 10 MB 文件
         let test_data: Vec<u8> = vec![0; file_size];
-        let save_path = PathBuf::from("/tmp/test_medium_file.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_medium_file.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
@@ -1507,7 +1491,6 @@ mod tests {
 
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1525,10 +1508,10 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/large_file.bin";
         let file_size = 100 * 1024 * 1024; // 100 MB 文件
-        let save_path = PathBuf::from("/tmp/test_large_file.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_large_file.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
@@ -1582,7 +1565,6 @@ mod tests {
 
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1600,10 +1582,10 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data: Vec<u8> = (0..100).collect(); // 100 bytes
-        let save_path = PathBuf::from("/tmp/test_progressive.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_progressive.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
@@ -1661,7 +1643,6 @@ mod tests {
 
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1744,10 +1725,10 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
-        let save_path = PathBuf::from("/tmp/test_retry_success.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_retry_success.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
@@ -1828,7 +1809,6 @@ mod tests {
 
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,
@@ -1846,10 +1826,10 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
-        let save_path = PathBuf::from("/tmp/test_retry_failure.bin");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_retry_failure.bin");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
@@ -1920,7 +1900,6 @@ mod tests {
 
         let result = download_ranged_generic(
             client.clone(),
-            fs.clone(),
             test_url,
             save_path.clone(),
             &config,

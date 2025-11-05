@@ -5,11 +5,8 @@
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::{header::HeaderMap, StatusCode};
-use std::io::SeekFrom;
 use async_trait::async_trait;
-use std::path::Path;
 use std::pin::Pin;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use thiserror::Error;
 
 /// IO 操作错误类型
@@ -96,36 +93,6 @@ pub trait HttpResponse: Send {
     fn url(&self) -> &str;
 }
 
-/// 文件系统trait
-///
-/// 抽象文件系统操作，支持文件创建
-#[async_trait]
-pub trait FileSystem: Send + Sync {
-    /// 异步文件类型
-    type File: AsyncFile;
-
-    /// 创建文件
-    async fn create(&self, path: &Path) -> Result<Self::File>;
-}
-
-/// 异步文件trait
-///
-/// 抽象异步文件操作
-#[async_trait]
-pub trait AsyncFile: Send + 'static {
-    /// 写入所有数据
-    async fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Result<()>;
-
-    /// 刷新缓冲区
-    async fn flush(&mut self) -> Result<()>;
-
-    /// 设置文件大小（预分配）
-    async fn set_len(&self, size: u64) -> Result<()>;
-
-    /// 文件定位
-    async fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
-}
-
 // ============================================================================
 // 为真实类型实现trait
 // ============================================================================
@@ -203,49 +170,6 @@ impl HttpResponse for reqwest::Response {
     }
 }
 
-/// Tokio文件系统实现
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TokioFileSystem;
-
-#[async_trait]
-impl FileSystem for TokioFileSystem {
-    type File = tokio::fs::File;
-
-    async fn create(&self, path: &Path) -> Result<Self::File> {
-        let path = path.to_path_buf();
-        tokio::fs::File::create(&path)
-            .await
-            .map_err(IoError::FileCreate)
-    }
-}
-
-/// 为tokio::fs::File实现AsyncFile
-#[async_trait]
-impl AsyncFile for tokio::fs::File {
-    async fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Result<()> {
-        AsyncWriteExt::write_all(self, buf)
-            .await
-            .map_err(IoError::FileWrite)
-    }
-
-    async fn flush(&mut self) -> Result<()> {
-        AsyncWriteExt::flush(self)
-            .await
-            .map_err(IoError::FileFlush)
-    }
-
-    async fn set_len(&self, size: u64) -> Result<()> {
-        self.set_len(size)
-            .await
-            .map_err(IoError::FileSetLen)
-    }
-
-    async fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-        AsyncSeekExt::seek(self, pos)
-            .await
-            .map_err(IoError::FileSeek)
-    }
-}
 
 // ============================================================================
 // 测试用的 Mock 实现
@@ -256,7 +180,6 @@ pub mod mock {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use futures::stream;
     
@@ -405,146 +328,5 @@ pub mod mock {
         }
     }
     
-    /// Mock 文件
-    pub struct MockFile {
-        /// 文件内容（内存缓冲区）
-        buffer: Mutex<Vec<u8>>,
-        /// 当前位置
-        position: Mutex<u64>,
-        /// 文件大小
-        size: Mutex<u64>,
-    }
-    
-    impl MockFile {
-        pub fn new() -> Self {
-            Self {
-                buffer: Mutex::new(Vec::new()),
-                position: Mutex::new(0),
-                size: Mutex::new(0),
-            }
-        }
-        
-        /// 获取文件内容
-        pub fn get_contents(&self) -> Vec<u8> {
-            self.buffer.lock().unwrap().clone()
-        }
-        
-        /// 获取文件大小
-        pub fn len(&self) -> u64 {
-            *self.size.lock().unwrap()
-        }
-    }
-    
-    impl Default for MockFile {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-    
-    #[async_trait]
-    impl AsyncFile for MockFile {
-        async fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Result<()> {
-            let mut buffer = self.buffer.lock().unwrap();
-            let mut position = self.position.lock().unwrap();
-            
-            let pos = *position as usize;
-            let end_pos = pos + buf.len();
-            
-            // 扩展缓冲区（如果需要）
-            if end_pos > buffer.len() {
-                buffer.resize(end_pos, 0);
-            }
-            
-            // 写入数据
-            buffer[pos..end_pos].copy_from_slice(buf);
-            *position = end_pos as u64;
-            
-            Ok(())
-        }
-        
-        async fn flush(&mut self) -> Result<()> {
-            // Mock 实现无需实际刷新
-            Ok(())
-        }
-        
-        async fn set_len(&self, size: u64) -> Result<()> {
-            let mut buffer = self.buffer.lock().unwrap();
-            let mut file_size = self.size.lock().unwrap();
-            
-            buffer.resize(size as usize, 0);
-            *file_size = size;
-            
-            Ok(())
-        }
-        
-        async fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-            let mut position = self.position.lock().unwrap();
-            let size = *self.size.lock().unwrap();
-            
-            let new_pos = match pos {
-                SeekFrom::Start(offset) => offset as i64,
-                SeekFrom::End(offset) => size as i64 + offset,
-                SeekFrom::Current(offset) => *position as i64 + offset,
-            };
-            
-            if new_pos < 0 {
-                return Err(IoError::FileSeek(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Seek 位置无效: {}", new_pos)
-                )));
-            }
-            
-            *position = new_pos as u64;
-            Ok(*position)
-        }
-    }
-    
-    /// Mock 文件系统
-    #[derive(Clone)]
-    pub struct MockFileSystem {
-        /// 已创建的文件：路径 -> 文件
-        files: Arc<Mutex<HashMap<PathBuf, Arc<MockFile>>>>,
-    }
-    
-    impl MockFileSystem {
-        pub fn new() -> Self {
-            Self {
-                files: Arc::new(Mutex::new(HashMap::new())),
-            }
-        }
-        
-        /// 获取已创建的文件
-        pub fn get_file(&self, path: &Path) -> Option<Arc<MockFile>> {
-            self.files.lock().unwrap().get(path).cloned()
-        }
-        
-        /// 获取所有文件路径
-        pub fn get_file_paths(&self) -> Vec<PathBuf> {
-            self.files.lock().unwrap().keys().cloned().collect()
-        }
-    }
-    
-    impl Default for MockFileSystem {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-    
-    #[async_trait]
-    impl FileSystem for MockFileSystem {
-        type File = MockFile;
-        
-        async fn create(&self, path: &Path) -> Result<Self::File> {
-            let file = MockFile::new();
-            let arc_file = Arc::new(file);
-            
-            // 克隆一份用于返回（不能直接返回 Arc）
-            let return_file = MockFile::new();
-            
-            self.files.lock().unwrap().insert(path.to_path_buf(), arc_file);
-            
-            Ok(return_file)
-        }
-    }
 }
 

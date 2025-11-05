@@ -3,15 +3,24 @@
 //! 提供高效的文件分段写入功能，支持：
 //! - Range 单向分配，防止重叠
 //! - 乱序数据写入
-//! - 实时定位写入
+//! - 原子定位写入（利用 OS 原生 API）
 //! - 进度追踪
 //! - 内存优化（不缓存所有数据）
+//! - 真正的并发写入（无锁设计）
 //! 
 //! # 核心组件
 //! 
 //! - [`AllocatedRange`] - 已分配的 Range，确保类型安全和不可变性
 //! - [`RangeAllocator`] - Range 分配器，从文件开头向结尾单向分配
 //! - [`RangeWriter`] - Range 写入器，管理文件的分段写入
+//! 
+//! # 性能优化
+//! 
+//! 相比传统的 seek + write 方式，使用了以下优化：
+//! - Windows: 使用 `seek_write` 原子操作，一次系统调用完成定位+写入
+//! - Unix/Linux: 使用 `write_at` (pwrite)，无需改变文件位置指针
+//! - 无锁并发：多个 worker 可以同时写入不同位置，无需互斥锁
+//! - 零拷贝：直接在 blocking 线程池中处理，避免额外的数据拷贝
 //! 
 //! # 安全性保证
 //! 
@@ -25,15 +34,12 @@
 //! 
 //! ```no_run
 //! # use hydra_dl::utils::range_writer::RangeWriter;
-//! # use hydra_dl::utils::io_traits::TokioFileSystem;
 //! # use bytes::Bytes;
 //! # use std::path::PathBuf;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let fs = TokioFileSystem::default();
 //! // 创建写入器和分配器
 //! let (writer, mut allocator) = RangeWriter::new(
-//!     &fs,
 //!     PathBuf::from("download.bin"),
 //!     1024 * 1024  // 1MB
 //! ).await?;
@@ -42,9 +48,19 @@
 //! let range1 = allocator.allocate(100).unwrap();
 //! let range2 = allocator.allocate(200).unwrap();
 //!
-//! // 可以乱序写入
-//! writer.write_range(range2, Bytes::from(vec![2; 200])).await?;
-//! writer.write_range(range1, Bytes::from(vec![1; 100])).await?;
+//! // 可以乱序并发写入（无需锁）
+//! let w1 = writer.clone();
+//! let w2 = writer.clone();
+//! 
+//! let t1 = tokio::spawn(async move {
+//!     w1.write_range(range1, Bytes::from(vec![1; 100])).await
+//! });
+//! let t2 = tokio::spawn(async move {
+//!     w2.write_range(range2, Bytes::from(vec![2; 200])).await
+//! });
+//!
+//! t1.await??;
+//! t2.await??;
 //!
 //! // 检查完成并刷新
 //! if writer.is_complete() {
@@ -56,22 +72,20 @@
 
 use bytes::Bytes;
 use log::info;
-use std::io::SeekFrom;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::Mutex;
 
-use crate::utils::io_traits::{AsyncFile, FileSystem, IoError};
+use crate::utils::async_file::AsyncFile;
 
 /// Range Writer 错误类型
 #[derive(Error, Debug)]
 pub enum RangeWriterError {
     /// IO 错误
-    #[error(transparent)]
-    Io(#[from] IoError),
+    #[error("IO 错误: {0}")]
+    Io(#[from] std::io::Error),
     
     /// 数据大小与 Range 大小不匹配
     #[error("数据大小 ({data_len} bytes) 与 Range 大小 ({range_size} bytes) 不匹配")]
@@ -393,38 +407,45 @@ impl RangeAllocator {
 
 /// Range 数据流式写入器
 /// 
-/// 管理 Range 数据的分配和定位写入
+/// 管理 Range 数据的分配和定位写入，使用高性能异步文件实现
 /// 
-/// 支持多个 worker 并发写入，使用细粒度锁：
-/// - `file` 使用 `Arc<Mutex<F>>` 保护文件访问
-/// - `written_bytes` 使用 `Arc<AtomicU64>` 无锁更新进度
+/// # 性能特性
 /// 
-/// 支持乱序写入，实时定位写入，减少内存占用
+/// - **真正的并发写入**：使用 `AsyncFile::write_all_at`，无需互斥锁
+/// - **原子操作**：Windows 使用 `seek_write`，Unix 使用 `pwrite`
+/// - **零拷贝**：数据直接在 blocking 线程池中写入
+/// - **无锁进度追踪**：使用 `AtomicU64` 记录已写入字节数
 /// 
-/// 通过已写入字节数与文件总大小比较来判断完成状态
+/// # 并发安全
+/// 
+/// `RangeWriter` 可以安全地在多个 task 间共享（`Clone`），
+/// 多个 worker 可以同时写入不同的 Range，无需额外同步。
 /// 
 /// # Example
 /// 
 /// ```no_run
 /// # use hydra_dl::utils::range_writer::RangeWriter;
-/// # use hydra_dl::utils::io_traits::TokioFileSystem;
 /// # use std::path::PathBuf;
 /// # use bytes::Bytes;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let fs = TokioFileSystem::default();
 /// let (writer, mut allocator) = RangeWriter::new(
-///     &fs,
 ///     PathBuf::from("output.dat"),
 ///     1000  // 总大小 1000 bytes
 /// ).await?;
 ///
 /// // 使用 allocator 分配 Range（保证不重叠且有效）
 /// let range1 = allocator.allocate(100).unwrap();
-/// writer.write_range(range1, Bytes::from(vec![1; 100])).await?;
-///
 /// let range2 = allocator.allocate(100).unwrap();
-/// writer.write_range(range2, Bytes::from(vec![2; 100])).await?;
+///
+/// // 并发写入（无需锁）
+/// let w1 = writer.clone();
+/// let w2 = writer.clone();
+/// 
+/// tokio::join!(
+///     w1.write_range(range1, Bytes::from(vec![1; 100])),
+///     w2.write_range(range2, Bytes::from(vec![2; 100]))
+/// );
 ///
 /// // 当所有字节都写入后，自动判断完成
 /// if writer.is_complete() {
@@ -434,13 +455,20 @@ impl RangeAllocator {
 /// # }
 /// ```
 #[derive(Clone)]
-pub struct RangeWriter<F: AsyncFile> {
-    file: Arc<Mutex<F>>,
+pub struct RangeWriter {
+    /// 异步文件句柄
+    /// 
+    /// `AsyncFile` 内部使用 `Arc<StdFile>`，支持安全的并发定位写入
+    file: AsyncFile,
+    
+    /// 文件总大小
     total_bytes: u64,
+    
+    /// 已写入的字节数（原子计数器）
     written_bytes: Arc<AtomicU64>,
 }
 
-impl<F: AsyncFile> RangeWriter<F> {
+impl RangeWriter {
     /// 创建新的 writer，预分配文件大小
     /// 
     /// 返回 `(RangeWriter, RangeAllocator)` 元组，分离写入和分配职责：
@@ -448,7 +476,6 @@ impl<F: AsyncFile> RangeWriter<F> {
     /// - `RangeAllocator` 在主线程中使用，用于预分配所有 Range
     /// 
     /// # Arguments
-    /// * `fs` - 文件系统抽象
     /// * `path` - 文件路径
     /// * `total_size` - 文件总大小（字节）
     /// 
@@ -459,19 +486,30 @@ impl<F: AsyncFile> RangeWriter<F> {
     /// # Errors
     /// 
     /// 如果文件创建或预分配失败，返回错误
-    pub async fn new<FS>(fs: &FS, path: PathBuf, total_size: u64) -> Result<(Self, RangeAllocator)>
-    where
-        FS: FileSystem<File = F>,
-    {
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// # use hydra_dl::utils::range_writer::RangeWriter;
+    /// # use std::path::PathBuf;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let (writer, allocator) = RangeWriter::new(
+    ///     PathBuf::from("download.bin"),
+    ///     10 * 1024 * 1024  // 10 MB
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn new(path: PathBuf, total_size: u64) -> Result<(Self, RangeAllocator)> {
         info!("创建 RangeWriter: {:?} ({} bytes)", path, total_size);
         
-        let file = fs.create(&path).await?;
-        
-        // 预分配文件大小
+        // 创建文件并预分配空间
+        let file = AsyncFile::create(&path).await?;
         file.set_len(total_size).await?;
         
         let writer = Self {
-            file: Arc::new(Mutex::new(file)),
+            file,
             total_bytes: total_size,
             written_bytes: Arc::new(AtomicU64::new(0)),
         };
@@ -483,13 +521,15 @@ impl<F: AsyncFile> RangeWriter<F> {
     
     /// 写入单个 Range 数据到指定位置
     /// 
-    /// 使用文件定位（seek）将数据写入到指定位置，支持乱序写入
+    /// 使用原子定位写入（`write_all_at`），支持真正的并发乱序写入
     /// 
     /// 接受 [`AllocatedRange`] 参数，确保所有写入的 Range 都是有效且不重叠的
     /// 
-    /// 使用细粒度锁实现并发写入：
-    /// - 文件访问使用 `Mutex` 保护
-    /// - 进度更新使用 `AtomicU64` 无锁操作
+    /// # 性能特性
+    /// 
+    /// - **无锁并发**：多个 task 可以同时调用此方法写入不同位置
+    /// - **原子操作**：一次系统调用完成定位+写入
+    /// - **零拷贝**：数据直接在 blocking 线程池中处理
     /// 
     /// # Arguments
     /// * `range` - 已分配的文件范围
@@ -497,8 +537,23 @@ impl<F: AsyncFile> RangeWriter<F> {
     /// 
     /// # Errors
     /// 
-    /// 如果文件定位或写入失败，返回错误
+    /// 如果文件写入失败，返回错误
     /// 如果数据大小与 Range 大小不匹配，返回错误
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// # use hydra_dl::utils::range_writer::RangeWriter;
+    /// # use bytes::Bytes;
+    /// # use std::path::PathBuf;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (writer, mut allocator) = RangeWriter::new(PathBuf::from("test.bin"), 1000).await?;
+    /// let range = allocator.allocate(100).unwrap();
+    /// writer.write_range(range, Bytes::from(vec![0u8; 100])).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn write_range(&self, range: AllocatedRange, data: Bytes) -> Result<()> {
         let range_size = range.len();
         let data_len = data.len() as u64;
@@ -509,16 +564,8 @@ impl<F: AsyncFile> RangeWriter<F> {
 
         let (start, end) = range.as_file_range();
         
-        // 锁定文件进行写入
-        {
-            let mut file = self.file.lock().await;
-            
-            // 定位到文件指定位置
-            file.seek(SeekFrom::Start(start)).await?;
-            
-            // 写入数据
-            file.write_all(&data).await?;
-        }
+        // 原子定位写入（无需锁）
+        self.file.write_all_at(start, &data).await?;
         
         // 无锁更新已写入字节数
         let written = self.written_bytes.fetch_add(data_len, Ordering::SeqCst) + data_len;
@@ -559,14 +606,13 @@ impl<F: AsyncFile> RangeWriter<F> {
     
     /// 刷新并关闭文件
     /// 
-    /// 将所有缓冲数据写入磁盘并关闭文件句柄
+    /// 将所有缓冲数据同步到磁盘
     /// 
     /// # Errors
     /// 
     /// 如果刷新失败，返回错误
     pub async fn finalize(self) -> Result<()> {
-        let mut file = self.file.lock().await;
-        file.flush().await?;
+        self.file.sync_all().await?;
         
         let written = self.written_bytes.load(Ordering::SeqCst);
         info!(
@@ -581,7 +627,6 @@ impl<F: AsyncFile> RangeWriter<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::io_traits::TokioFileSystem;
     use tempfile::tempdir;
     use tokio::fs;
     use tokio::io::AsyncReadExt;
@@ -590,9 +635,8 @@ mod tests {
     async fn test_new_creates_file_with_correct_size() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.dat");
-        let fs = TokioFileSystem::default();
         
-        let (writer, _allocator) = RangeWriter::new(&fs, file_path.clone(), 1000).await.unwrap();
+        let (writer, _allocator) = RangeWriter::new(file_path.clone(), 1000).await.unwrap();
         
         // 检查文件是否创建
         assert!(file_path.exists());
@@ -609,9 +653,8 @@ mod tests {
     async fn test_write_range_sequential() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_seq.dat");
-        let fs = TokioFileSystem::default();
         
-        let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), 300).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(file_path.clone(), 300).await.unwrap();
         
         // 顺序分配并写入 3 个 Range
         let range1 = allocator.allocate(100).unwrap();
@@ -644,9 +687,8 @@ mod tests {
     async fn test_write_range_out_of_order() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_ooo.dat");
-        let fs = TokioFileSystem::default();
         
-        let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), 300).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(file_path.clone(), 300).await.unwrap();
         
         // 分配 3 个 Range
         let range1 = allocator.allocate(100).unwrap();
@@ -677,9 +719,8 @@ mod tests {
     async fn test_is_complete() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_complete.dat");
-        let fs = TokioFileSystem::default();
         
-        let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), 200).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(file_path.clone(), 200).await.unwrap();
         
         assert!(!writer.is_complete());
         
@@ -698,9 +739,8 @@ mod tests {
     async fn test_progress() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_progress.dat");
-        let fs = TokioFileSystem::default();
         
-        let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), 500).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(file_path.clone(), 500).await.unwrap();
         
         let (written, total_bytes) = writer.progress();
         assert_eq!(written, 0);
@@ -723,14 +763,13 @@ mod tests {
     async fn test_large_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_large.dat");
-        let fs = TokioFileSystem::default();
         
         // 模拟 10MB 文件，分成 100 个 Range
         let total_size = 10 * 1024 * 1024u64;
         let range_count = 100usize;
         let range_size = total_size / range_count as u64;
         
-        let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), total_size).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(file_path.clone(), total_size).await.unwrap();
         
         // 分配并写入所有 Range
         for i in 0..range_count {
@@ -758,9 +797,8 @@ mod tests {
     async fn test_duplicate_range_write() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_dup.dat");
-        let fs = TokioFileSystem::default();
         
-        let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), 200).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(file_path.clone(), 200).await.unwrap();
         
         // 分配一个 Range，写入两次（模拟重试）
         let range = allocator.allocate(100).unwrap();
@@ -786,9 +824,8 @@ mod tests {
     async fn test_allocate_range() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_allocate.dat");
-        let fs = TokioFileSystem::default();
         
-        let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), 300).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(file_path.clone(), 300).await.unwrap();
         
         // 分配多个 Range
         let range1 = allocator.allocate(100).unwrap();

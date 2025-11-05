@@ -142,6 +142,7 @@ pub mod utils {
     pub(crate) mod stats;
     pub mod io_traits;
     pub mod range_writer;
+    pub mod async_file;
 }
 
 /// 常用单位常量
@@ -278,7 +279,6 @@ pub type Result<T> = std::result::Result<T, DownloadError>;
 pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std::path::PathBuf> {
     use reqwest::Client;
     use utils::fetch;
-    use utils::io_traits::TokioFileSystem;
 
     // 创建带超时设置的 HTTP 客户端（使用默认超时配置）
     let default_config = DownloadConfig::default();
@@ -286,8 +286,6 @@ pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std:
         .timeout(default_config.network().timeout())
         .connect_timeout(default_config.network().connect_timeout())
         .build()?;
-    
-    let fs = TokioFileSystem::default();
     
     // 获取文件元数据以确定文件名
     let metadata = fetch::fetch_file_metadata(&client, url).await?;
@@ -304,7 +302,7 @@ pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std:
         save_path: save_path.clone(),
     };
 
-    fetch::fetch_file(&client, task, &fs).await?;
+    fetch::fetch_file(&client, task).await?;
 
     Ok(save_path)
 }

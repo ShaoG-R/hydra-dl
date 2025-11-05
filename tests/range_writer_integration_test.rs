@@ -4,7 +4,6 @@
 
 use bytes::Bytes;
 use hydra_dl::utils::range_writer::RangeWriter;
-use hydra_dl::utils::io_traits::TokioFileSystem;
 use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::fs;
@@ -21,9 +20,7 @@ async fn test_concurrent_writes_simulation() {
     let range_count = 10;
     let range_size = total_size / range_count as u64;
 
-    let fs = TokioFileSystem::default();
-    
-    let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), total_size).await.unwrap();
+    let (writer, mut allocator) = RangeWriter::new(file_path.clone(), total_size).await.unwrap();
     
     // 预先分配所有 Range
     let mut ranges = Vec::new();
@@ -77,8 +74,7 @@ async fn test_partial_completion() {
     let total_size = 500u64;
     let range_size = 100u64;
     
-    let fs = TokioFileSystem::default();
-    let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), total_size).await.unwrap();
+    let (writer, mut allocator) = RangeWriter::new(file_path.clone(), total_size).await.unwrap();
     
     // 分配 5 个 Range
     let range0 = allocator.allocate(range_size).unwrap();
@@ -113,8 +109,7 @@ async fn test_single_range() {
     let file_path = dir.path().join("single_range.dat");
     
     let total_size = 1000u64;
-    let fs = TokioFileSystem::default();
-    let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), total_size).await.unwrap();
+    let (writer, mut allocator) = RangeWriter::new(file_path.clone(), total_size).await.unwrap();
     
     let range = allocator.allocate(total_size).unwrap();
     let data = Bytes::from(vec![42u8; total_size as usize]);
@@ -138,9 +133,7 @@ async fn test_uneven_ranges() {
     // 总大小不能被 Range 数量整除
     let total_size = 1000u64;
 
-    let fs = TokioFileSystem::default();
-    
-    let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), total_size).await.unwrap();
+    let (writer, mut allocator) = RangeWriter::new(file_path.clone(), total_size).await.unwrap();
     
     // 分配不均匀的 Range
     let range0 = allocator.allocate(333).unwrap();  // 0-332 (333 bytes)
@@ -167,8 +160,7 @@ async fn test_uneven_ranges() {
 async fn test_empty_file() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("empty.dat");
-    let fs = TokioFileSystem::default();
-    let (writer, _allocator) = RangeWriter::new(&fs, file_path.clone(), 0).await.unwrap();
+    let (writer, _allocator) = RangeWriter::new(file_path.clone(), 0).await.unwrap();
     
     assert!(writer.is_complete());
     writer.finalize().await.unwrap();
@@ -187,9 +179,7 @@ async fn test_many_small_ranges() {
     let range_size = 100u64;
     let total_size = range_count as u64 * range_size;
 
-    let fs = TokioFileSystem::default();
-    
-    let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), total_size).await.unwrap();
+    let (writer, mut allocator) = RangeWriter::new(file_path.clone(), total_size).await.unwrap();
     
     // 分配并写入所有 Range
     for i in 0..range_count {
@@ -210,15 +200,13 @@ async fn test_many_small_ranges() {
 async fn test_invalid_path() {
     // 尝试在不存在的目录中创建文件
     let invalid_path = PathBuf::from("/nonexistent/path/file.dat");
-    let fs = TokioFileSystem::default();
-    let result = RangeWriter::new(&fs, invalid_path, 1000).await;
+    let result = RangeWriter::new(invalid_path, 1000).await;
     assert!(result.is_err());
 }
 
 /// 测试进度追踪的准确性
 #[tokio::test]
 async fn test_progress_tracking() {
-    let fs = TokioFileSystem::default();
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("progress.dat");
     
@@ -226,7 +214,7 @@ async fn test_progress_tracking() {
     let range_count = 10;
     let range_size = total_size / range_count as u64;
     
-    let (writer, mut allocator) = RangeWriter::new(&fs, file_path.clone(), total_size).await.unwrap();
+    let (writer, mut allocator) = RangeWriter::new(file_path.clone(), total_size).await.unwrap();
     
     // 逐步写入并检查进度
     for i in 0..range_count {

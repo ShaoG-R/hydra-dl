@@ -12,13 +12,12 @@ use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, Wor
 use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::utils::fetch::{RangeFetcher, FetchRangeResult};
-use crate::utils::io_traits::{AsyncFile, HttpClient};
+use crate::utils::io_traits::HttpClient;
 use crate::utils::range_writer::{AllocatedRange, RangeWriter};
 use crate::utils::stats::TaskStats;
 use crate::Result;
 use async_trait::async_trait;
 use log::{debug, error, info};
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 // ==================== Task 和 Result 实现 ====================
@@ -50,37 +49,29 @@ impl WorkerContext for DownloadWorkerContext {}
 /// # 泛型参数
 ///
 /// - `C`: HTTP 客户端类型
-/// - `F`: 异步文件类型
-pub(crate) struct DownloadWorkerExecutor<C, F>
-where
-    F: AsyncFile,
-{
+pub(crate) struct DownloadWorkerExecutor<C> {
     /// HTTP 客户端
     client: C,
     /// 共享的文件写入器
-    writer: Arc<RangeWriter<F>>,
+    writer: Arc<RangeWriter>,
 }
 
-impl<C, F> DownloadWorkerExecutor<C, F>
-where
-    F: AsyncFile,
-{
+impl<C> DownloadWorkerExecutor<C> {
     /// 创建新的下载任务执行器
     ///
     /// # Arguments
     ///
     /// - `client`: HTTP 客户端
     /// - `writer`: 共享的文件写入器
-    pub(crate) fn new(client: C, writer: Arc<RangeWriter<F>>) -> Self {
+    pub(crate) fn new(client: C, writer: Arc<RangeWriter>) -> Self {
         Self { client, writer }
     }
 }
 
 #[async_trait]
-impl<C, F> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats> for DownloadWorkerExecutor<C, F>
+impl<C> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats> for DownloadWorkerExecutor<C>
 where
     C: HttpClient,
-    F: AsyncFile,
 {
     async fn execute(
         &self,
@@ -187,22 +178,16 @@ where
 /// 下载 Worker 协程池
 ///
 /// 封装通用 WorkerPool，提供下载特定的便捷方法
-///
-/// # 泛型参数
-///
-/// - `F`: 异步文件类型
-pub(crate) struct DownloadWorkerPool<F: AsyncFile> {
+pub(crate) struct DownloadWorkerPool {
     /// 底层通用协程池
     pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats>,
     /// 全局统计管理器（聚合所有 worker 的数据）
     global_stats: TaskStats,
     /// 下载配置（用于创建新 worker 的分块策略）
     config: Arc<crate::config::DownloadConfig>,
-    /// Phantom data 用于类型参数
-    _phantom: PhantomData<F>,
 }
 
-impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
+impl DownloadWorkerPool {
     /// 创建新的下载协程池
     ///
     /// # Arguments
@@ -218,7 +203,7 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
     pub(crate) fn new<C>(
         client: C,
         initial_worker_count: usize,
-        writer: Arc<RangeWriter<F>>,
+        writer: Arc<RangeWriter>,
         config: Arc<crate::config::DownloadConfig>,
     ) -> Result<Self>
     where
@@ -257,7 +242,6 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
             pool,
             global_stats,
             config,
-            _phantom: PhantomData,
         })
     }
 
@@ -453,23 +437,22 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::io_traits::mock::{MockFile, MockFileSystem, MockHttpClient};
+    use crate::utils::io_traits::mock::MockHttpClient;
     use bytes::Bytes;
     use reqwest::{header::HeaderMap, StatusCode};
-    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_download_worker_pool_creation() {
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
-        let save_path = PathBuf::from("/tmp/test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
 
-        let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
+        let (writer, _) = RangeWriter::new(save_path, 1000).await.unwrap();
         let writer = Arc::new(writer);
 
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config).unwrap();
+        let pool = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
 
         assert_eq!(pool.worker_count(), 4);
     }
@@ -477,14 +460,14 @@ mod tests {
     #[tokio::test]
     async fn test_download_worker_pool_send_task() {
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
-        let save_path = PathBuf::from("/tmp/test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = RangeWriter::new(&fs, save_path, 100).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(save_path, 100).await.unwrap();
         let writer = Arc::new(writer);
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::<MockFile>::new(client, 2, writer, config).unwrap();
+        let pool = DownloadWorkerPool::new(client, 2, writer, config).unwrap();
 
         // 分配一个 range
         let range = allocator.allocate(10).unwrap();
@@ -505,15 +488,15 @@ mod tests {
     #[tokio::test]
     async fn test_download_worker_pool_stats() {
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
-        let save_path = PathBuf::from("/tmp/test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
 
-        let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
+        let (writer, _) = RangeWriter::new(save_path, 1000).await.unwrap();
         let writer = Arc::new(writer);
 
         let worker_count = 3;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::<MockFile>::new(client, worker_count, writer, config).unwrap();
+        let pool = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
 
         // 初始统计应该都是 0
         let (total_bytes, total_secs, ranges) = pool.get_total_stats();
@@ -528,14 +511,14 @@ mod tests {
     #[tokio::test]
     async fn test_download_worker_pool_shutdown() {
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
-        let save_path = PathBuf::from("/tmp/test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
 
-        let (writer, _) = RangeWriter::new(&fs, save_path, 1000).await.unwrap();
+        let (writer, _) = RangeWriter::new(save_path, 1000).await.unwrap();
         let writer = Arc::new(writer);
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let mut pool = DownloadWorkerPool::<MockFile>::new(client.clone(), 2, writer, config).unwrap();
+        let mut pool = DownloadWorkerPool::new(client.clone(), 2, writer, config).unwrap();
 
         // 关闭 workers
         pool.shutdown();
@@ -555,10 +538,10 @@ mod tests {
         let test_data = b"0123456789ABCDEFGHIJ"; // 20 bytes
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
-        let save_path = PathBuf::from("/tmp/test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = RangeWriter::new(&fs, save_path, test_data.len() as u64)
+        let (writer, mut allocator) = RangeWriter::new(save_path, test_data.len() as u64)
             .await
             .unwrap();
         let writer = Arc::new(writer);
@@ -624,10 +607,10 @@ mod tests {
         let test_url = "http://example.com/file.bin";
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
-        let save_path = PathBuf::from("/tmp/test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = RangeWriter::new(&fs, save_path, 100).await.unwrap();
+        let (writer, mut allocator) = RangeWriter::new(save_path, 100).await.unwrap();
         let writer = Arc::new(writer);
 
         let range = allocator.allocate(10).unwrap();

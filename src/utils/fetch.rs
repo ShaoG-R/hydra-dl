@@ -4,9 +4,10 @@ use log::{debug, info};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient, HttpResponse, IoError};
+use crate::utils::io_traits::{HttpClient, HttpResponse, IoError};
 use crate::utils::range_writer::AllocatedRange;
 use crate::task::FileTask;
+use crate::utils::async_file::AsyncFile;
 use crate::utils::stats::WorkerStats;
 
 /// Fetch 操作错误类型
@@ -203,14 +204,12 @@ pub fn generate_timestamp_filename() -> String {
 }
 
 /// 获取并保存完整文件
-pub async fn fetch_file<C, FS>(
+pub async fn fetch_file<C>(
     client: &C,
     task: FileTask,
-    fs: &FS,
 ) -> Result<()>
 where
     C: HttpClient,
-    FS: FileSystem,
 {
     info!("开始下载: {} -> {:?}", task.url, task.save_path);
 
@@ -221,19 +220,29 @@ where
     }
 
     // 创建文件
-    let mut file = fs.create(&task.save_path).await?;
+    let file = AsyncFile::create(&task.save_path).await
+        .map_err(IoError::FileCreate)?;
 
     // 流式下载
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
+    let mut offset: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
+        let chunk_len = chunk.len() as u64;
+        
+        // 使用 write_all_at 写入数据
+        file.write_all_at(offset, &chunk).await
+            .map_err(IoError::FileWrite)?;
+        
+        downloaded += chunk_len;
+        offset += chunk_len;
     }
 
-    file.flush().await?;
+    // 刷新到磁盘
+    file.sync_data().await
+        .map_err(IoError::FileFlush)?;
 
     info!(
         "下载完成: {} ({} bytes) -> {:?}",
@@ -660,7 +669,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::io_traits::mock::{MockHttpClient, MockFileSystem, MockHttpResponse};
+    use crate::utils::io_traits::mock::{MockHttpClient, MockHttpResponse};
     use crate::utils::range_writer::RangeAllocator;
     use reqwest::header::HeaderMap;
     use reqwest::StatusCode;
@@ -671,11 +680,11 @@ mod tests {
         // 准备测试数据
         let test_data = b"Hello, World! This is test data.";
         let test_url = "http://example.com/file.txt";
-        let save_path = PathBuf::from("/tmp/test_file.txt");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("test_file.txt");
 
-        // 创建 mock 客户端和文件系统
+        // 创建 mock 客户端
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 GET 请求的响应
         let mut headers = HeaderMap::new();
@@ -694,7 +703,7 @@ mod tests {
         };
 
         // 执行下载
-        let result = fetch_file(&client, task, &fs).await;
+        let result = fetch_file(&client, task).await;
         assert!(result.is_ok(), "下载应该成功");
 
         // 验证请求日志
@@ -702,8 +711,8 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0], format!("GET {}", test_url));
 
-        // 注意：MockFileSystem 的实现有问题，暂时无法验证文件内容
-        // 需要修复 MockFileSystem 以支持获取文件内容
+        // 注意：由于使用了真实的 AsyncFile，文件会实际创建在磁盘上
+        // 这里我们只验证下载逻辑是否正常
     }
 
     #[tokio::test]
@@ -712,7 +721,6 @@ mod tests {
         let save_path = PathBuf::from("/tmp/test_file.txt");
 
         let client = MockHttpClient::new();
-        let fs = MockFileSystem::new();
 
         // 设置 404 响应
         client.set_response(
@@ -728,7 +736,7 @@ mod tests {
         };
 
         // 执行下载
-        let result = fetch_file(&client, task, &fs).await;
+        let result = fetch_file(&client, task).await;
         assert!(result.is_err(), "应该返回错误");
     }
 

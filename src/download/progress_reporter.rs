@@ -3,7 +3,6 @@
 //! 负责管理进度报告和统计信息收集
 
 use crate::pool::download::DownloadWorkerPool;
-use crate::utils::io_traits::AsyncFile;
 use super::DownloadProgress;
 use tokio::sync::mpsc::Sender;
 
@@ -44,9 +43,9 @@ impl ProgressReporter {
     }
     
     /// 发送进度更新
-    pub(super) async fn send_progress_update<F: AsyncFile>(
+    pub(super) async fn send_progress_update(
         &self,
-        pool: &DownloadWorkerPool<F>,
+        pool: &DownloadWorkerPool,
     ) {
         if let Some(ref sender) = self.progress_sender {
             let total_avg_speed = pool.get_total_speed();
@@ -76,7 +75,7 @@ impl ProgressReporter {
     }
     
     /// 发送完成统计
-    pub(super) async fn send_completion_stats<F: AsyncFile>(&self, pool: &DownloadWorkerPool<F>) {
+    pub(super) async fn send_completion_stats(&self, pool: &DownloadWorkerPool) {
         if let Some(ref sender) = self.progress_sender {
             let (total_bytes, total_secs, _) = pool.get_total_stats();
             let avg_speed = pool.get_total_speed();
