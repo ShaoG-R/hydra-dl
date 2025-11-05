@@ -782,11 +782,12 @@ dependencies = [
 
 [[package]]
 name = "kestrel-timer"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f6fbc0f21d529f8b1092433b762f24fb132f3464e92bdef544d9808436030f"
+checksum = "37cbdc0edb9324bf2e02c7a61e093d70d8d49b59cab3d9c106ecb919d80ab8b9"
 dependencies = [
  "futures",
+ "lite-sync",
  "parking_lot",
  "rustc-hash",
  "tokio",
@@ -803,6 +804,15 @@ name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
+
+[[package]]
+name = "lite-sync"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e1c0c43ed73e7503ec2169bf3936933be7de7057c758c829b537ec6dd9278c6"
+dependencies = [
+ "smallring",
+]
 
 [[package]]
 name = "litemap"
@@ -1279,6 +1289,12 @@ name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
+
+[[package]]
+name = "smallring"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1f9ca2dea8a538d7375a5ae1c2daa7e8ec272043b7f136ec24b4b971a8b5af7"
 
 [[package]]
 name = "smallvec"
