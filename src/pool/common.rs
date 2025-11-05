@@ -20,7 +20,7 @@
 //!
 //! ```ignore
 //! // 1. 定义任务类型
-//! #[derive(Debug, Clone)]
+//! #[derive(Debug)]
 //! struct MyTask {
 //!     data: String,
 //! }
@@ -91,9 +91,8 @@ use super::worker_mask::WorkerMask;
 /// # 要求
 ///
 /// - `Send`: 任务可以在线程间传递
-/// - `Clone`: 任务可以被克隆（用于重试等场景）
 /// - `Debug`: 任务可以被调试输出
-pub trait WorkerTask: Send + Clone + Debug + 'static {}
+pub trait WorkerTask: Send + Debug + 'static {}
 
 /// Worker 结果 trait
 ///

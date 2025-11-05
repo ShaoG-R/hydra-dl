@@ -11,7 +11,7 @@ pub struct FileTask {
 /// Worker 内部任务类型
 /// 
 /// 用于在 Worker 协程之间传递任务
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum WorkerTask {
     /// Range 下载任务
     /// 
@@ -21,6 +21,10 @@ pub(crate) enum WorkerTask {
         range: AllocatedRange,
         /// 当前任务的重试次数（首次为 0）
         retry_count: usize,
+        /// 取消信号接收器
+        /// 
+        /// 当接收到信号时，worker 将中止当前下载任务
+        cancel_rx: tokio::sync::oneshot::Receiver<()>,
     },
 }
 

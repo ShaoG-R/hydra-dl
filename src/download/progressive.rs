@@ -141,7 +141,8 @@ impl ProgressiveLauncher {
                         
                         let chunk_size = pool.get_worker_chunk_size(worker_id);
                         
-                        if let Some((task, assigned_worker)) = task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+                        if let Some(allocated) = task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+                            let (task, assigned_worker, _cancel_tx) = allocated.into_parts();
                             info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", assigned_worker, chunk_size);
                             if let Err(e) = pool.send_task(task, assigned_worker).await {
                                 error!("为新 worker 分配任务失败: {:?}", e);

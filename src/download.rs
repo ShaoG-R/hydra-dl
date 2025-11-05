@@ -9,6 +9,7 @@ use crate::pool::download::DownloadWorkerPool;
 use crate::utils::io_traits::{AsyncFile, FileSystem, HttpClient};
 use crate::utils::range_writer::{RangeAllocator, RangeWriter, AllocatedRange};
 use crate::task::RangeResult;
+use std::collections::HashMap;
 
 mod progressive;
 mod task_allocator;
@@ -210,6 +211,11 @@ struct DownloadTask<C: HttpClient, F: AsyncFile> {
     progressive_launcher: ProgressiveLauncher,
     /// 定时器服务（用于管理失败任务的重试定时器）
     timer_service: TimerService,
+    /// 任务取消 sender（worker_id -> cancel_sender）
+    /// 
+    /// 用于内部管理每个 worker 当前任务的取消功能
+    /// 当需要中止某个 worker 的任务时，可以通过发送取消信号来实现
+    cancel_senders: HashMap<usize, tokio::sync::oneshot::Sender<()>>,
 }
 
 impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
@@ -257,6 +263,7 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
             config,
             progressive_launcher,
             timer_service,
+            cancel_senders: HashMap::new(),
         })
     }
     
@@ -331,11 +338,13 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         
         // 从空闲队列获取 worker
         if let Some(worker_id) = self.task_allocator.idle_workers.pop_front() {
-            // 有空闲 worker，立即分配任务
+            // 有空闲 worker，创建任务和取消通道
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
             let task = crate::task::WorkerTask::Range {
                 url: self.task_allocator.url().to_string(),
                 range: info.range,
                 retry_count: info.retry_count,
+                cancel_rx,
             };
             
             if let Err(e) = self.pool.send_task(task, worker_id).await {
@@ -343,6 +352,9 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
                 self.task_allocator.mark_worker_idle(worker_id);
                 // 任务发送失败，放回就绪队列
                 self.task_allocator.push_ready_retry_task(info);
+            } else {
+                // 保存取消 sender
+                self.cancel_senders.insert(worker_id, cancel_tx);
             }
         } else {
             // 没有空闲 worker，推入就绪队列等待下次分配
@@ -382,6 +394,9 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
     async fn handle_complete(&mut self, worker_id: usize) -> LoopControl {
         self.progress_reporter.record_range_complete();
         
+        // 移除该 worker 的取消 sender（任务已完成）
+        self.cancel_senders.remove(&worker_id);
+        
         // 将完成的 worker 标记为空闲
         self.task_allocator.mark_worker_idle(worker_id);
         
@@ -409,6 +424,9 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
             retry_count,
             error
         );
+        
+        // 移除该 worker 的取消 sender（任务已失败）
+        self.cancel_senders.remove(&worker_id);
         
         // 将失败的 worker 标记为空闲
         self.task_allocator.mark_worker_idle(worker_id);
@@ -442,12 +460,17 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         while let Some(&worker_id) = self.task_allocator.idle_workers.front() {
             let chunk_size = self.pool.get_worker_chunk_size(worker_id);
             
-            if let Some((task, assigned_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
-                info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", assigned_worker, chunk_size);
-                if let Err(e) = self.pool.send_task(task, assigned_worker).await {
+            if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+                let (task, worker_id, cancel_tx) = allocated.into_parts();
+                info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
+                
+                if let Err(e) = self.pool.send_task(task, worker_id).await {
                     error!("初始任务分配失败: {:?}", e);
                     // 失败了，将 worker 放回队列
-                    self.task_allocator.mark_worker_idle(assigned_worker);
+                    self.task_allocator.mark_worker_idle(worker_id);
+                } else {
+                    // 保存取消 sender
+                    self.cancel_senders.insert(worker_id, cancel_tx);
                 }
             } else {
                 info!("没有足够的数据为空闲 workers 分配更多任务");
@@ -464,15 +487,20 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
     async fn try_allocate_next_task(&mut self, worker_id: usize) {
         let chunk_size = self.pool.get_worker_chunk_size(worker_id);
         
-        if let Some((task, target_worker)) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+        if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+            let (task, target_worker, cancel_tx) = allocated.into_parts();
             debug!(
                 "Worker #{} 分配新任务到空闲 Worker #{}，分块大小 {} bytes",
                 worker_id, target_worker, chunk_size
             );
+            
             if let Err(e) = self.pool.send_task(task, target_worker).await {
                 error!("分配新任务失败: {:?}", e);
                 // 失败了，将 worker 放回队列
                 self.task_allocator.mark_worker_idle(target_worker);
+            } else {
+                // 保存取消 sender
+                self.cancel_senders.insert(target_worker, cancel_tx);
             }
         } else {
             debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
@@ -593,6 +621,9 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
             self.progress_reporter.send_error(msg).await;
         }
         
+        // 清理所有取消 sender
+        self.cancel_senders.clear();
+        
         // 关闭 workers（发送关闭信号，workers 会异步自动清理）
         self.pool.shutdown();
         
@@ -606,10 +637,37 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         Ok(())
     }
     
+    /// 取消指定 worker 的当前任务（内部方法，不暴露给外部）
+    /// 
+    /// 通过发送取消信号来中止 worker 正在执行的下载任务
+    /// 
+    /// # Arguments
+    /// 
+    /// * `worker_id` - 要取消任务的 worker ID
+    /// 
+    /// # Returns
+    /// 
+    /// 如果成功发送取消信号返回 `true`，否则返回 `false`（worker 可能没有正在执行的任务）
+    #[allow(dead_code)]
+    fn cancel_worker_task(&mut self, worker_id: usize) -> bool {
+        if let Some(cancel_tx) = self.cancel_senders.remove(&worker_id) {
+            // 发送取消信号（忽略发送失败，因为接收端可能已关闭）
+            let _ = cancel_tx.send(());
+            debug!("已向 Worker #{} 发送取消信号", worker_id);
+            true
+        } else {
+            debug!("Worker #{} 没有正在执行的任务", worker_id);
+            false
+        }
+    }
+    
     /// 完成并清理资源
-    async fn finalize_and_cleanup(self, save_path: PathBuf) -> Result<()> {
+    async fn finalize_and_cleanup(mut self, save_path: PathBuf) -> Result<()> {
         // 发送完成统计
         self.progress_reporter.send_completion_stats(&self.pool).await;
+        
+        // 清理所有取消 sender
+        self.cancel_senders.clear();
         
         // 优雅关闭所有 workers（发送关闭信号，workers 会异步自动清理）
         let mut pool = self.pool;

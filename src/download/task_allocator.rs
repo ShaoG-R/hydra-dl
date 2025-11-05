@@ -13,6 +13,23 @@ use log::{debug, error};
 /// 失败的 Range 信息
 pub(super) type FailedRange = (AllocatedRange, String);
 
+/// 已分配的任务（封装任务和取消通道）
+pub(super) struct AllocatedTask {
+    /// 任务本身
+    task: WorkerTask,
+    /// 分配到的 worker ID
+    worker_id: usize,
+    /// 取消信号发送器
+    cancel_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl AllocatedTask {
+    /// 解构为独立部分
+    pub(super) fn into_parts(self) -> (WorkerTask, usize, tokio::sync::oneshot::Sender<()>) {
+        (self.task, self.worker_id, self.cancel_tx)
+    }
+}
+
 /// 失败任务信息
 /// 
 /// 用于跟踪待重试的失败任务
@@ -68,8 +85,8 @@ impl TaskAllocator {
     /// 
     /// # Returns
     /// 
-    /// 返回 (任务, worker_id)，如果没有空闲 worker 或没有剩余空间则返回 None
-    pub(super) fn try_allocate_task_to_idle_worker(&mut self, chunk_size: u64) -> Option<(WorkerTask, usize)> {
+    /// 返回 AllocatedTask（封装了任务、worker_id 和取消发送器），如果没有空闲 worker 或没有剩余空间则返回 None
+    pub(super) fn try_allocate_task_to_idle_worker(&mut self, chunk_size: u64) -> Option<AllocatedTask> {
         // 从队列中获取空闲 worker
         let worker_id = self.idle_workers.pop_front()?;
         
@@ -83,13 +100,21 @@ impl TaskAllocator {
                 retry_info.retry_count
             );
             
+            // 创建取消通道
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            
             let task = WorkerTask::Range {
                 url: self.url.clone(),
                 range: retry_info.range,
                 retry_count: retry_info.retry_count,
+                cancel_rx,
             };
             
-            return Some((task, worker_id));
+            return Some(AllocatedTask {
+                task,
+                worker_id,
+                cancel_tx,
+            });
         }
         
         // 重试队列为空，分配新任务
@@ -106,14 +131,22 @@ impl TaskAllocator {
         // 分配 range
         let range = self.allocator.allocate(alloc_size)?;
         
+        // 创建取消通道
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        
         // 创建任务（首次分配，重试次数为 0）
         let task = WorkerTask::Range {
             url: self.url.clone(),
             range,
             retry_count: 0,
+            cancel_rx,
         };
         
-        Some((task, worker_id))
+        Some(AllocatedTask {
+            task,
+            worker_id,
+            cancel_tx,
+        })
     }
     
     /// 获取剩余待分配的字节数
@@ -279,12 +312,13 @@ mod tests {
         let result = task_allocator.try_allocate_task_to_idle_worker(100);
         assert!(result.is_some());
         
-        let (task, worker_id) = result.unwrap();
+        let allocated = result.unwrap();
+        let (task, worker_id, _cancel_tx) = allocated.into_parts();
         assert_eq!(worker_id, 0); // 应该分配给第一个空闲的 worker
         
         // 验证任务
         match task {
-            WorkerTask::Range { url, range, retry_count } => {
+            WorkerTask::Range { url, range, retry_count, .. } => {
                 assert_eq!(url, "http://example.com/file");
                 let (start, end) = range.as_file_range();
                 assert_eq!(start, 0);
@@ -336,7 +370,8 @@ mod tests {
         let result = task_allocator.try_allocate_task_to_idle_worker(250);
         assert!(result.is_some());
         
-        let (task, _) = result.unwrap();
+        let allocated = result.unwrap();
+        let (task, _, _cancel_tx) = allocated.into_parts();
         match task {
             WorkerTask::Range { range, .. } => {
                 assert_eq!(range.len(), 250);
@@ -357,7 +392,8 @@ mod tests {
         let result = task_allocator.try_allocate_task_to_idle_worker(500);
         assert!(result.is_some());
         
-        let (task, _) = result.unwrap();
+        let allocated = result.unwrap();
+        let (task, _, _cancel_tx) = allocated.into_parts();
         match task {
             WorkerTask::Range { range, .. } => {
                 assert_eq!(range.len(), 100); // 应该被限制在剩余空间
@@ -378,7 +414,8 @@ mod tests {
         
         // 分配一个 range 来模拟失败
         task_allocator.mark_worker_idle(0);
-        let (task, _) = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let allocated = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let (task, _, _cancel_tx) = allocated.into_parts();
         let range = match task {
             WorkerTask::Range { range, .. } => range,
         };
@@ -425,7 +462,8 @@ mod tests {
         
         // 分配一个 range
         task_allocator.mark_worker_idle(0);
-        let (task, _) = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let allocated = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let (task, _, _cancel_tx) = allocated.into_parts();
         let range = match task {
             WorkerTask::Range { range, .. } => range,
         };
@@ -453,10 +491,12 @@ mod tests {
         task_allocator.mark_worker_idle(1);
         
         // 分配并失败两个任务
-        let (task1, _) = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let allocated1 = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let (task1, _, _cancel_tx1) = allocated1.into_parts();
         let range1 = match task1 { WorkerTask::Range { range, .. } => range };
         
-        let (task2, _) = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let allocated2 = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
+        let (task2, _, _cancel_tx2) = allocated2.into_parts();
         let range2 = match task2 { WorkerTask::Range { range, .. } => range };
         
         task_allocator.record_permanent_failure(range1, "Error 1".to_string());

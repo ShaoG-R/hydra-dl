@@ -83,6 +83,18 @@ impl RetryDefaults {
     pub const RETRY_DELAYS_SECS: &'static [u64] = &[1, 2, 3];
 }
 
+/// 健康检查配置常量
+pub struct HealthCheckDefaults;
+
+impl HealthCheckDefaults {
+    /// 绝对速度阈值：100 KB/s
+    pub const ABSOLUTE_SPEED_THRESHOLD: u64 = 100 * 1024;
+    /// 是否启用健康检查
+    pub const ENABLED: bool = true;
+    /// 最小worker数量阈值（低于此数量不执行健康检查）
+    pub const MIN_WORKERS_FOR_CHECK: usize = 3;
+}
+
 // ==================== 构建配置错误 ====================
 
 /// 构建配置错误
@@ -355,6 +367,46 @@ impl RetryConfig {
     }
 }
 
+/// 健康检查配置
+///
+/// 控制异常下载线程的检测和处理策略
+#[derive(Debug, Clone)]
+pub struct HealthCheckConfig {
+    /// 是否启用健康检查
+    pub enabled: bool,
+    /// 绝对速度阈值（bytes/s）
+    pub absolute_speed_threshold: u64,
+    /// 最小worker数量阈值（低于此数量不执行健康检查）
+    pub min_workers_for_check: usize,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: HealthCheckDefaults::ENABLED,
+            absolute_speed_threshold: HealthCheckDefaults::ABSOLUTE_SPEED_THRESHOLD,
+            min_workers_for_check: HealthCheckDefaults::MIN_WORKERS_FOR_CHECK,
+        }
+    }
+}
+
+impl HealthCheckConfig {
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
+    pub fn absolute_speed_threshold(&self) -> u64 {
+        self.absolute_speed_threshold
+    }
+
+    #[inline]
+    pub fn min_workers_for_check(&self) -> usize {
+        self.min_workers_for_check
+    }
+}
+
 // ==================== 主配置结构体 ====================
 
 /// 下载配置
@@ -374,6 +426,8 @@ pub struct DownloadConfig {
     progressive: ProgressiveConfig,
     /// 重试配置
     retry: RetryConfig,
+    /// 健康检查配置
+    health_check: HealthCheckConfig,
 }
 
 impl DownloadConfig {
@@ -401,6 +455,7 @@ impl DownloadConfig {
             speed: SpeedConfig::default(),
             progressive: ProgressiveConfig::default(),
             retry: RetryConfig::default(),
+            health_check: HealthCheckConfig::default(),
         }
     }
     
@@ -432,6 +487,11 @@ impl DownloadConfig {
     #[inline]
     pub fn retry(&self) -> &RetryConfig {
         &self.retry
+    }
+
+    #[inline]
+    pub fn health_check(&self) -> &HealthCheckConfig {
+        &self.health_check
     }
 }
 
@@ -785,6 +845,58 @@ impl Default for RetryConfigBuilder {
     }
 }
 
+/// 健康检查配置构建器
+#[derive(Debug, Clone)]
+pub struct HealthCheckConfigBuilder {
+    enabled: bool,
+    absolute_speed_threshold: u64,
+    min_workers_for_check: usize,
+}
+
+impl HealthCheckConfigBuilder {
+    /// 创建新的健康检查配置构建器（使用默认值）
+    pub fn new() -> Self {
+        Self {
+            enabled: HealthCheckDefaults::ENABLED,
+            absolute_speed_threshold: HealthCheckDefaults::ABSOLUTE_SPEED_THRESHOLD,
+            min_workers_for_check: HealthCheckDefaults::MIN_WORKERS_FOR_CHECK,
+        }
+    }
+
+    /// 设置是否启用健康检查
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// 设置绝对速度阈值（bytes/s）
+    pub fn absolute_speed_threshold(mut self, threshold: u64) -> Self {
+        self.absolute_speed_threshold = threshold;
+        self
+    }
+
+    /// 设置最小worker数量阈值
+    pub fn min_workers_for_check(mut self, count: usize) -> Self {
+        self.min_workers_for_check = count.max(2); // 至少需要2个worker才能比较
+        self
+    }
+
+    /// 构建健康检查配置
+    pub fn build(self) -> HealthCheckConfig {
+        HealthCheckConfig {
+            enabled: self.enabled,
+            absolute_speed_threshold: self.absolute_speed_threshold,
+            min_workers_for_check: self.min_workers_for_check,
+        }
+    }
+}
+
+impl Default for HealthCheckConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ==================== 主配置构建器 ====================
 
 /// 下载配置构建器
@@ -808,6 +920,7 @@ pub struct DownloadConfigBuilder {
     speed: SpeedConfig,
     progressive: ProgressiveConfig,
     retry: RetryConfig,
+    health_check: HealthCheckConfig,
 }
 
 impl DownloadConfigBuilder {
@@ -820,6 +933,7 @@ impl DownloadConfigBuilder {
             speed: SpeedConfig::default(),
             progressive: ProgressiveConfig::default(),
             retry: RetryConfig::default(),
+            health_check: HealthCheckConfig::default(),
         }
     }
     
@@ -965,6 +1079,29 @@ impl DownloadConfigBuilder {
         self
     }
     
+    /// 配置健康检查设置
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use hydra_dl::DownloadConfig;
+    /// let config = DownloadConfig::builder()
+    ///     .health_check(|h| h.enabled(true).absolute_speed_threshold(100 * 1024))
+    ///     .build();
+    /// ```
+    pub fn health_check<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(HealthCheckConfigBuilder) -> HealthCheckConfigBuilder,
+    {
+        let builder = HealthCheckConfigBuilder {
+            enabled: self.health_check.enabled,
+            absolute_speed_threshold: self.health_check.absolute_speed_threshold,
+            min_workers_for_check: self.health_check.min_workers_for_check,
+        };
+        self.health_check = f(builder).build();
+        self
+    }
+    
     // ==================== 构建方法 ====================
     
     /// 构建配置对象
@@ -989,6 +1126,7 @@ impl DownloadConfigBuilder {
             speed: self.speed,
             progressive: self.progressive,
             retry: self.retry,
+            health_check: self.health_check,
         })
     }
 }

@@ -90,7 +90,7 @@ where
         stats: &crate::utils::stats::WorkerStats,
     ) -> RangeResult {
         match task {
-            RangeTask::Range { url, range, retry_count } => {
+            RangeTask::Range { url, range, retry_count, cancel_rx } => {
                 let (start, end) = range.as_file_range();
                 debug!(
                     "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
@@ -102,8 +102,6 @@ where
                 );
 
                 // 下载数据（在下载过程中会实时更新 stats）
-                // 创建一个永远不会被触发的取消通道
-                let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
                 let fetch_result = RangeFetcher::new(&self.client, &url, range, stats).fetch_with_cancel(cancel_rx).await;
 
                 match fetch_result {
@@ -472,10 +470,12 @@ mod tests {
         // 分配一个 range
         let range = allocator.allocate(10).unwrap();
 
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let task = RangeTask::Range {
             url: "http://example.com/file.bin".to_string(),
             range,
             retry_count: 0,
+            cancel_rx,
         };
 
         // 发送任务到 worker 0
@@ -574,10 +574,12 @@ mod tests {
         };
 
         // 执行任务
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let task = RangeTask::Range {
             url: test_url.to_string(),
             range,
             retry_count: 0,
+            cancel_rx,
         };
 
         let result = executor.execute(0, task, &mut context, &stats).await;
@@ -631,10 +633,12 @@ mod tests {
             chunk_strategy,
         };
 
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let task = RangeTask::Range {
             url: test_url.to_string(),
             range,
             retry_count: 0,
+            cancel_rx,
         };
 
         let result = executor.execute(0, task, &mut context, &stats).await;
