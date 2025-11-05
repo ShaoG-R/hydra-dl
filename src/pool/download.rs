@@ -337,6 +337,15 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         self.global_stats.get_instant_speed()
     }
 
+    /// 获取所有 worker 的总体窗口平均速度（O(1)，无需遍历）
+    ///
+    /// # Returns
+    ///
+    /// `(窗口平均速度 bytes/s, 是否有效)`
+    pub(crate) fn get_total_window_avg_speed(&self) -> (f64, bool) {
+        self.global_stats.get_window_avg_speed()
+    }
+
     /// 获取指定 worker 的当前分块大小
     ///
     /// # Arguments

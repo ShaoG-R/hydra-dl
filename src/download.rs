@@ -313,6 +313,7 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
                 self.client.clone(),
                 &self.config,
                 &mut self.task_allocator,
+                self.writer.as_ref(),
             ).await {
                 error!("渐进式启动下一批 worker 失败: {:?}", e);
             }

@@ -76,12 +76,17 @@ impl ProgressiveLauncher {
     /// 此方法会检查所有已启动 Worker 的实时速度，如果都达到配置的阈值，
     /// 则启动下一批 Worker 并为其分配初始任务
     /// 
+    /// 此方法还会：
+    /// - 检测 worker 数量变化并自动降级批次
+    /// - 检测预期剩余下载时间，避免在下载即将结束时启动新 worker
+    /// 
     /// # Arguments
     /// 
     /// * `pool` - Worker 协程池
     /// * `client` - HTTP 客户端（用于创建新 Worker）
     /// * `config` - 下载配置
     /// * `task_allocator` - 任务分配器（用于为新 Worker 分配任务）
+    /// * `writer` - 文件写入器（用于检查下载进度）
     /// 
     /// # Returns
     /// 
@@ -92,12 +97,40 @@ impl ProgressiveLauncher {
         client: C,
         config: &DownloadConfig,
         task_allocator: &mut TaskAllocator,
+        writer: &crate::utils::range_writer::RangeWriter<F>,
     ) -> Result<()>
     where
         C: HttpClient + Clone + Send + 'static,
         F: AsyncFile + 'static,
     {
         let current_worker_count = pool.worker_count();
+        
+        // 检测 worker 数量变化并降级批次（应对部分 worker 被手动关闭的情况）
+        if self.next_launch_stage > 0 {
+            let current_target = self.worker_launch_stages[self.next_launch_stage - 1];
+            if current_worker_count < current_target {
+                // Worker 数量少于预期，需要降级批次
+                // 找到当前 worker 数量对应的合适阶段
+                let mut new_stage = 0;
+                for (idx, &stage_target) in self.worker_launch_stages.iter().enumerate() {
+                    if current_worker_count <= stage_target {
+                        new_stage = idx + 1;
+                        break;
+                    }
+                }
+                
+                if new_stage != self.next_launch_stage {
+                    info!(
+                        "渐进式启动 - Worker 数量降级: 当前 {} workers < 预期 {} workers，从第 {} 批降级到第 {} 批",
+                        current_worker_count,
+                        current_target,
+                        self.next_launch_stage + 1,
+                        new_stage + 1
+                    );
+                    self.next_launch_stage = new_stage;
+                }
+            }
+        }
         
         // 检查所有已启动 Worker 的速度是否达到阈值
         let mut all_ready = true;
@@ -115,6 +148,32 @@ impl ProgressiveLauncher {
         }
         
         if all_ready {
+            // 检查预期剩余下载时间，避免在即将完成时启动新 worker
+            let (window_avg_speed, speed_valid) = pool.get_total_window_avg_speed();
+            if speed_valid && window_avg_speed > 0.0 {
+                let (written_bytes, total_bytes) = writer.progress();
+                let remaining_bytes = total_bytes.saturating_sub(written_bytes);
+                let estimated_time_left = remaining_bytes as f64 / window_avg_speed;
+                let threshold = config.progressive().min_time_before_finish().as_secs_f64();
+                
+                debug!(
+                    "渐进式启动 - 剩余时间检测: 剩余 {} bytes, 窗口平均速度 {:.2} MB/s, 预期剩余 {:.1}s, 阈值 {:.1}s",
+                    remaining_bytes,
+                    window_avg_speed / 1024.0 / 1024.0,
+                    estimated_time_left,
+                    threshold
+                );
+                
+                if estimated_time_left < threshold {
+                    info!(
+                        "渐进式启动 - 预期剩余时间 {:.1}s < 阈值 {:.1}s，不启动新 workers",
+                        estimated_time_left,
+                        threshold
+                    );
+                    return Ok(());
+                }
+            }
+            
             // 启动下一批worker
             let next_target = self.worker_launch_stages[self.next_launch_stage];
             let workers_to_add = next_target - current_worker_count;

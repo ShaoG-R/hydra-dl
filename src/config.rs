@@ -71,6 +71,8 @@ impl ProgressiveDefaults {
     pub const WORKER_RATIOS: &'static [f64] = &[0.25, 0.5, 0.75, 1.0];
     /// 最小速度阈值：1 MB/s
     pub const MIN_SPEED_THRESHOLD: u64 = 1 * MB;
+    /// 预期下载结束前最小时间（秒）：20 秒
+    pub const MIN_TIME_BEFORE_FINISH_SECS: u64 = 20;
 }
 
 /// 重试配置常量
@@ -309,6 +311,8 @@ pub struct ProgressiveConfig {
     pub worker_ratios: Vec<f64>,
     /// 最小速度阈值（bytes/s）
     pub min_speed_threshold: u64,
+    /// 预期下载结束前最小时间（在此时间内不启动新 worker）
+    pub min_time_before_finish: Duration,
 }
 
 impl Default for ProgressiveConfig {
@@ -316,6 +320,7 @@ impl Default for ProgressiveConfig {
         Self {
             worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: ProgressiveDefaults::MIN_SPEED_THRESHOLD,
+            min_time_before_finish: Duration::from_secs(ProgressiveDefaults::MIN_TIME_BEFORE_FINISH_SECS),
         }
     }
 }
@@ -329,6 +334,11 @@ impl ProgressiveConfig {
     #[inline]
     pub fn min_speed_threshold(&self) -> u64 {
         self.min_speed_threshold
+    }
+
+    #[inline]
+    pub fn min_time_before_finish(&self) -> Duration {
+        self.min_time_before_finish
     }
 }
 
@@ -737,6 +747,7 @@ impl Default for SpeedConfigBuilder {
 pub struct ProgressiveConfigBuilder {
     worker_ratios: Vec<f64>,
     min_speed_threshold: u64,
+    min_time_before_finish: Duration,
 }
 
 impl ProgressiveConfigBuilder {
@@ -745,6 +756,7 @@ impl ProgressiveConfigBuilder {
         Self {
             worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: ProgressiveDefaults::MIN_SPEED_THRESHOLD,
+            min_time_before_finish: Duration::from_secs(ProgressiveDefaults::MIN_TIME_BEFORE_FINISH_SECS),
         }
     }
 
@@ -776,11 +788,18 @@ impl ProgressiveConfigBuilder {
         self
     }
 
+    /// 设置预期下载结束前最小时间
+    pub fn min_time_before_finish(mut self, duration: Duration) -> Self {
+        self.min_time_before_finish = duration;
+        self
+    }
+
     /// 构建渐进式配置
     pub fn build(self) -> ProgressiveConfig {
         ProgressiveConfig {
             worker_ratios: self.worker_ratios,
             min_speed_threshold: self.min_speed_threshold,
+            min_time_before_finish: self.min_time_before_finish,
         }
     }
 }
@@ -1052,6 +1071,7 @@ impl DownloadConfigBuilder {
         let builder = ProgressiveConfigBuilder {
             worker_ratios: self.progressive.worker_ratios.clone(),
             min_speed_threshold: self.progressive.min_speed_threshold,
+            min_time_before_finish: self.progressive.min_time_before_finish,
         };
         self.progressive = f(builder).build();
         self
