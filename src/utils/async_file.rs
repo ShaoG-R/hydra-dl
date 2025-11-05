@@ -202,7 +202,6 @@ impl AsyncFile {
             // 非 Windows 平台需要手动 seek（不是原子的）
             #[cfg(not(windows))]
             {
-                use std::os::unix::fs::FileExt;
                 file.write_at(&data, offset)
             }
         })

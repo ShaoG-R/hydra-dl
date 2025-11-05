@@ -143,10 +143,10 @@ pub fn extract_filename_from_url(url: &str) -> Option<String> {
     let parsed_url = url::Url::parse(url).ok()?;
     
     // 获取路径段
-    let path_segments = parsed_url.path_segments()?;
+    let mut path_segments = parsed_url.path_segments()?;
     
     // 获取最后一个段作为文件名
-    let filename = path_segments.last()?;
+    let filename = path_segments.next_back()?;
     
     if filename.is_empty() {
         return None;
@@ -595,22 +595,19 @@ impl<'a, C: HttpClient> FileMetadataFetcher<'a, C> {
     /// 4. 时间戳文件名
     fn determine_filename<R: HttpResponse>(response: &R, final_url: &str, original_url: &str) -> Option<String> {
         // 1. 尝试从 Content-Disposition 提取
-        if let Some(content_disp) = response.headers().get("content-disposition") {
-            if let Ok(value) = content_disp.to_str() {
-                if let Some(filename) = extract_filename_from_content_disposition(value) {
-                    debug!("从 Content-Disposition 提取文件名: {}", filename);
-                    return Some(filename);
-                }
+        if let Some(content_disp) = response.headers().get("content-disposition")
+            && let Ok(value) = content_disp.to_str()
+            && let Some(filename) = extract_filename_from_content_disposition(value) {
+                debug!("从 Content-Disposition 提取文件名: {}", filename);
+                return Some(filename);
             }
-        }
         
         // 2. 尝试从重定向后的 URL 提取
-        if final_url != original_url {
-            if let Some(filename) = extract_filename_from_url(final_url) {
+        if final_url != original_url
+            && let Some(filename) = extract_filename_from_url(final_url) {
                 debug!("从重定向后 URL 提取文件名: {}", filename);
                 return Some(filename);
             }
-        }
         
         // 3. 尝试从原始 URL 提取
         if let Some(filename) = extract_filename_from_url(original_url) {

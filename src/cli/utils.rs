@@ -14,13 +14,13 @@ pub fn extract_filename_from_url(url: &str) -> Result<String> {
     let parsed_url = url::Url::parse(url)?;
     
     // 获取路径段
-    let path_segments = parsed_url
+    let mut path_segments = parsed_url
         .path_segments()
         .ok_or_else(|| CliError::Path("无法提取 URL 路径".to_string()))?;
     
     // 获取最后一个段作为文件名
     let filename = path_segments
-        .last()
+        .next_back()
         .ok_or_else(|| CliError::Path("URL 中没有文件名".to_string()))?;
     
     if filename.is_empty() {
@@ -47,12 +47,11 @@ pub fn validate_output_path(path: &str) -> Result<PathBuf> {
     }
     
     // 确保父目录存在
-    if let Some(parent) = path_buf.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
+    if let Some(parent) = path_buf.parent()
+        && !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| CliError::Io(e))?;
+                .map_err(CliError::Io)?;
         }
-    }
     
     Ok(path_buf)
 }

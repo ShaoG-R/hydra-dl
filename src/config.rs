@@ -3,7 +3,7 @@
 //! 提供下载任务的配置选项，按功能域分类组织
 
 use std::{num::NonZeroU32, time::Duration};
-use crate::constants::MB;
+use crate::constants::{KB, MB};
 
 // ==================== 常量结构体 ====================
 
@@ -70,7 +70,7 @@ impl ProgressiveDefaults {
     /// 渐进式启动比例序列：[0.25, 0.5, 0.75, 1.0]
     pub const WORKER_RATIOS: &'static [f64] = &[0.25, 0.5, 0.75, 1.0];
     /// 最小速度阈值：1 MB/s
-    pub const MIN_SPEED_THRESHOLD: u64 = 1 * MB;
+    pub const MIN_SPEED_THRESHOLD: u64 = MB;
     /// 预期下载结束前最小时间（秒）：20 秒
     pub const MIN_TIME_BEFORE_FINISH_SECS: u64 = 20;
 }
@@ -90,7 +90,7 @@ pub struct HealthCheckDefaults;
 
 impl HealthCheckDefaults {
     /// 绝对速度阈值：100 KB/s
-    pub const ABSOLUTE_SPEED_THRESHOLD: u64 = 100 * 1024;
+    pub const ABSOLUTE_SPEED_THRESHOLD: u64 = 100 * KB;
     /// 是否启用健康检查
     pub const ENABLED: bool = true;
     /// 最小worker数量阈值（低于此数量不执行健康检查）
@@ -422,7 +422,7 @@ impl HealthCheckConfig {
 /// 下载配置
 ///
 /// 控制下载任务的所有行为，按功能域分类组织
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DownloadConfig {
     /// 分块配置
     chunk: ChunkConfig,
@@ -454,19 +454,6 @@ impl DownloadConfig {
     /// ```
     pub fn builder() -> DownloadConfigBuilder {
         DownloadConfigBuilder::new()
-    }
-    
-    /// 创建默认配置
-    pub fn default() -> Self {
-        Self {
-            chunk: ChunkConfig::default(),
-            concurrency: ConcurrencyConfig::default(),
-            network: NetworkConfig::default(),
-            speed: SpeedConfig::default(),
-            progressive: ProgressiveConfig::default(),
-            retry: RetryConfig::default(),
-            health_check: HealthCheckConfig::default(),
-        }
     }
     
     #[inline]

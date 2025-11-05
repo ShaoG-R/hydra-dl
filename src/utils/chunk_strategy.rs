@@ -103,9 +103,7 @@ impl ChunkStrategy for SpeedBasedChunkStrategy {
             + (ideal_chunk_size as f64 - current_chunk_size as f64) * self.smoothing_factor;
         
         // 4. 限制在配置范围内
-        let new_size = (smoothed_size as u64).clamp(self.min_chunk_size, self.max_chunk_size);
-        
-        new_size
+        (smoothed_size as u64).clamp(self.min_chunk_size, self.max_chunk_size)
     }
 }
 

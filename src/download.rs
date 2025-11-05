@@ -191,6 +191,28 @@ impl DownloadHandle {
     }
 }
 
+/// 下载任务参数
+/// 
+/// 封装了创建下载任务所需的所有参数
+struct DownloadTaskParams<C: HttpClient> {
+    /// HTTP 客户端
+    client: C,
+    /// 进度更新发送器
+    progress_sender: Option<Sender<DownloadProgress>>,
+    /// 文件写入器
+    writer: Arc<RangeWriter>,
+    /// Range 分配器
+    allocator: RangeAllocator,
+    /// 下载 URL
+    url: String,
+    /// 文件总大小（字节）
+    total_size: u64,
+    /// 定时器服务
+    timer_service: TimerService,
+    /// 下载配置
+    config: Arc<crate::config::DownloadConfig>,
+}
+
 /// 下载任务执行器
 /// 
 /// 封装了下载任务的执行逻辑，使用辅助结构体管理任务分配和进度报告
@@ -220,16 +242,19 @@ struct DownloadTask<C: HttpClient> {
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
     /// 创建新的下载任务
-    fn new(
-        client: C,
-        progress_sender: Option<Sender<DownloadProgress>>,
-        writer: Arc<RangeWriter>,
-        allocator: RangeAllocator,
-        url: String,
-        total_size: u64,
-        timer_service: TimerService,
-        config: Arc<crate::config::DownloadConfig>,
-    ) -> Result<Self> {
+    fn new(params: DownloadTaskParams<C>) -> Result<Self> {
+        // 解构参数
+        let DownloadTaskParams {
+            client,
+            progress_sender,
+            writer,
+            allocator,
+            url,
+            total_size,
+            timer_service,
+            config,
+        } = params;
+        
         // 创建渐进式启动管理器
         let progressive_launcher = ProgressiveLauncher::new(&config);
         
@@ -975,16 +1000,16 @@ where
     let config = Arc::new(config.clone());
 
     // 创建下载任务（内部会创建 WorkerPool 并启动第一批 worker）
-    let mut task = DownloadTask::new(
+    let mut task = DownloadTask::new(DownloadTaskParams {
         client,
         progress_sender,
         writer,
         allocator,
-        url.to_string(),
-        content_length,
+        url: url.to_string(),
+        total_size: content_length,
         timer_service,
-        Arc::clone(&config),
-    )?;
+        config: Arc::clone(&config),
+    })?;
     
     // 发送开始事件（使用第一个 worker 的初始分块大小）
     let current_worker_count = task.pool.worker_count();

@@ -157,7 +157,7 @@ impl WorkerStats {
     /// ```
     pub(crate) fn record_chunk(&self, bytes: u64) {
         // 第一个 chunk 到达时初始化开始时间
-        let start_time = *self.start_time.get_or_init(|| Instant::now());
+        let start_time = *self.start_time.get_or_init(Instant::now);
         
         // 原子增加字节数（使用 Relaxed 顺序，性能最佳）
         let current_total = self.total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
@@ -183,7 +183,7 @@ impl WorkerStats {
         
         // 同步到父级聚合器（如果存在）
         if let Some(parent) = &self.parent_aggregator {
-            parent.start_time.get_or_init(|| Instant::now());
+            parent.start_time.get_or_init(Instant::now);
             parent.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
     }

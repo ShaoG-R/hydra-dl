@@ -65,8 +65,8 @@ impl ProgressManager {
                 ));
 
                 // 详细模式：创建 worker 进度条
-                if self.verbose {
-                    if let Some(ref multi) = self.multi {
+                if self.verbose
+                    && let Some(ref multi) = self.multi {
                         for i in 0..worker_count {
                             let worker_bar = multi.add(ProgressBar::new(0));
                             worker_bar.set_style(
@@ -78,7 +78,6 @@ impl ProgressManager {
                             self.worker_bars.push(worker_bar);
                         }
                     }
-                }
             }
 
             DownloadProgress::Progress {

@@ -84,6 +84,9 @@ use crate::config::ConcurrencyDefaults;
 use crate::{DownloadError, Result};
 use super::worker_mask::WorkerMask;
 
+/// Worker 槽位的包装类型，简化复杂类型定义
+type WorkerSlotArc<T, S> = Arc<ArcSwap<Option<WorkerSlot<T, S>>>>;
+
 /// Worker 任务 trait
 ///
 /// 定义了 worker 处理的任务类型必须满足的约束
@@ -306,7 +309,7 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: Worke
     /// 使用固定大小数组和 ArcSwap 实现无锁并发访问
     /// ArcSwap<T> = ArcSwapAny<Arc<T>>，所以这里是 Arc<Option<WorkerSlot>>
     /// 外层 Arc 允许在 tokio::spawn 闭包中访问（worker 自动清理需要）
-    pub(crate) workers: [Arc<ArcSwap<Option<WorkerSlot<T, S>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT],
+    pub(crate) workers: [WorkerSlotArc<T, S>; ConcurrencyDefaults::MAX_WORKER_COUNT],
     /// 统一的结果接收器（所有 worker 共享）
     result_receiver: Receiver<R>,
     /// 结果发送器的克隆（用于创建新 worker）
@@ -423,7 +426,7 @@ where
         let shutdown_notify = Arc::new(Notify::new());
         
         // 使用 array::from_fn 初始化固定大小数组（暂时全部为 None）
-        let workers: [Arc<ArcSwap<Option<WorkerSlot<T, S>>>>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
+        let workers: [WorkerSlotArc<T, S>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
             std::array::from_fn(|_| Arc::new(ArcSwap::new(Arc::new(None))));
         
         // 创建 pool 实例（先不启动 workers）
@@ -691,9 +694,15 @@ pub mod test_utils {
     }
     impl WorkerContext for TestContext {}
     
+    impl Default for TestContext {
+        fn default() -> Self {
+            Self { processed_count: AtomicUsize::new(0) }
+        }
+    }
+    
     impl TestContext {
         pub fn new() -> Self {
-            Self { processed_count: AtomicUsize::new(0) }
+            Self::default()
         }
     }
     
@@ -703,9 +712,15 @@ pub mod test_utils {
     }
     impl WorkerStats for TestStats {}
     
+    impl Default for TestStats {
+        fn default() -> Self {
+            Self { task_count: AtomicUsize::new(0) }
+        }
+    }
+    
     impl TestStats {
         pub fn new() -> Self {
-            Self { task_count: AtomicUsize::new(0) }
+            Self::default()
         }
     }
 
