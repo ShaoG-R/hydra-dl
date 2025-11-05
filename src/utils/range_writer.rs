@@ -158,6 +158,7 @@ impl AllocatedRange {
     /// let range = AllocatedRange::from_file_range(0, 10);
     /// // 表示字节 0-9（共 10 字节）
     /// ```
+    #[inline]
     pub(crate) fn from_file_range(start: u64, end: u64) -> Self {
         debug_assert!(start <= end, "start 必须小于等于 end");
         Self { start, end }
@@ -183,6 +184,7 @@ impl AllocatedRange {
     /// assert_eq!(range.len(), 10);
     /// ```
     #[allow(unused)]
+    #[inline]
     pub(crate) fn from_http_range(start: u64, end: u64) -> Self {
         Self { start, end: end + 1 }
     }
@@ -210,6 +212,7 @@ impl AllocatedRange {
     /// assert_eq!(end, 10);    // 结束：10（不包含）
     /// // 表示字节 0-9（共 10 字节）
     /// ```
+    #[inline]
     pub fn as_file_range(&self) -> (u64, u64) {
         (self.start, self.end)
     }
@@ -231,6 +234,7 @@ impl AllocatedRange {
     /// 
     /// assert_eq!(range.start(), 0);
     /// ```
+    #[inline]
     pub fn start(&self) -> u64 {
         self.start
     }
@@ -262,17 +266,20 @@ impl AllocatedRange {
     /// assert_eq!(start, 0);
     /// assert_eq!(end_inclusive, 9);
     /// ```
+    #[inline]
     pub fn as_http_range(&self) -> (u64, u64) {
         debug_assert!(!self.is_empty(), "不能对空 Range 调用 as_http_range()");
         (self.start, self.end - 1)
     }
     
     /// 获取 Range 的长度（字节数）
+    #[inline]
     pub fn len(&self) -> u64 {
         self.end - self.start
     }
     
     /// 检查 Range 是否为空
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.start == self.end
     }
@@ -280,12 +287,14 @@ impl AllocatedRange {
     /// 转换为标准 Range<u64>（文件操作格式）
     /// 
     /// 返回左闭右开区间 `start..end`
+    #[inline]
     pub fn as_range(&self) -> Range<u64> {
         self.start..self.end
     }
 }
 
 impl From<AllocatedRange> for Range<u64> {
+    #[inline]
     fn from(range: AllocatedRange) -> Self {
         range.as_range()
     }
@@ -328,6 +337,7 @@ impl RangeAllocator {
     /// 
     /// # Arguments
     /// * `total_size` - 文件总大小（字节）
+    #[inline]
     pub fn new(total_size: u64) -> Self {
         Self {
             next_pos: 0,
@@ -345,6 +355,7 @@ impl RangeAllocator {
     /// # Returns
     /// 
     /// 成功返回 `Some(AllocatedRange)`，空间不足返回 `None`
+    #[inline]
     pub fn allocate(&mut self, size: u64) -> Option<AllocatedRange> {
         if self.next_pos + size > self.total_size {
             return None;
@@ -362,16 +373,19 @@ impl RangeAllocator {
     /// # Returns
     /// 
     /// 返回还未分配的字节数
+    #[inline]
     pub fn remaining(&self) -> u64 {
         self.total_size.saturating_sub(self.next_pos)
     }
     
     /// 获取总大小
+    #[inline]
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
     
     /// 获取下一个分配位置
+    #[inline]
     pub fn next_pos(&self) -> u64 {
         self.next_pos
     }
