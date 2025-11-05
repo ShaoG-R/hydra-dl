@@ -227,8 +227,8 @@ impl<F: AsyncFile + 'static> DownloadWorkerPool<F> {
         // 创建全局统计管理器（使用配置的速度配置）
         let global_stats = TaskStats::from_config(config.speed());
 
-        // 创建执行器
-        let executor = Arc::new(DownloadWorkerExecutor::new(client, Arc::clone(&writer)));
+        // 创建执行器（直接 move writer，避免 Arc 克隆）
+        let executor = Arc::new(DownloadWorkerExecutor::new(client, writer));
 
         // 为每个 worker 创建独立的上下文和统计
         let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..initial_worker_count)
@@ -580,8 +580,8 @@ mod tests {
             Bytes::from_static(test_data),
         );
 
-        // 创建执行器
-        let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
+        // 创建执行器（直接 move writer）
+        let executor = DownloadWorkerExecutor::new(client, writer);
 
         // 创建上下文和统计
         let stats = crate::utils::stats::WorkerStats::default();
@@ -642,7 +642,8 @@ mod tests {
             Bytes::new(),
         );
 
-        let executor = DownloadWorkerExecutor::new(client, Arc::clone(&writer));
+        // 创建执行器（直接 move writer）
+        let executor = DownloadWorkerExecutor::new(client, writer);
 
         let stats = crate::utils::stats::WorkerStats::default();
         let config = crate::config::DownloadConfig::default();

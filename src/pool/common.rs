@@ -242,36 +242,6 @@ pub struct WorkerSlot<T: WorkerTask, S: WorkerStats> {
     pub(crate) shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-/// Worker 共享资源
-/// 
-/// 封装所有 worker 共享的资源，避免重复传递
-pub(crate) struct SharedResources<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats> {
-    /// 执行器（所有 worker 共享）
-    pub executor: Arc<dyn WorkerExecutor<T, R, C, S>>,
-    /// 结果发送器（用于创建新 worker）
-    pub result_sender: Sender<R>,
-    /// Worker 槽位空闲位掩码
-    pub free_mask: Arc<WorkerMask>,
-    /// Worker 全部退出通知器
-    pub shutdown_notify: Arc<Notify>,
-}
-
-impl<T, R, C, S> Clone for SharedResources<T, R, C, S>
-where
-    T: WorkerTask,
-    R: WorkerResult,
-    C: WorkerContext,
-    S: WorkerStats,
-{
-    fn clone(&self) -> Self {
-        Self {
-            executor: Arc::clone(&self.executor),
-            result_sender: self.result_sender.clone(),
-            free_mask: Arc::clone(&self.free_mask),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
-        }
-    }
-}
 
 /// Worker 自动清理器
 /// 
@@ -365,15 +335,14 @@ where
         worker_id: usize,
         context: C,
         stats_arc: Arc<S>,
-        shared: &SharedResources<T, R, C, S>,
     ) {
         // 创建任务和关闭通道
         let (task_sender, task_receiver) = mpsc::channel::<T>(100);
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
         
-        // 克隆 worker 需要的资源
-        let executor_clone = Arc::clone(&shared.executor);
-        let result_sender_clone = shared.result_sender.clone();
+        // 克隆 worker 需要的资源（直接从 self 获取，减少一层克隆）
+        let executor_clone = Arc::clone(&self.executor);
+        let result_sender_clone = self.result_sender.clone();
         let stats_for_worker = Arc::clone(&stats_arc);
         
         // 创建 WorkerSlot 并存入 workers 数组
@@ -389,8 +358,8 @@ where
         let cleanup = WorkerCleanup {
             worker_id,
             slot: slot_ref,
-            free_mask: Arc::clone(&shared.free_mask),
-            shutdown_notify: Arc::clone(&shared.shutdown_notify),
+            free_mask: Arc::clone(&self.free_mask),
+            shutdown_notify: Arc::clone(&self.shutdown_notify),
         };
         
         // 启动 worker 协程（包含自动清理逻辑）
@@ -467,17 +436,9 @@ where
             shutdown_notify: Arc::clone(&shutdown_notify),
         };
         
-        // 准备共享资源
-        let shared = SharedResources {
-            executor: Arc::clone(&pool.executor),
-            result_sender,
-            free_mask,
-            shutdown_notify,
-        };
-        
         // 为每个 worker 创建独立的 task channel、上下文和统计，并启动协程
         for (id, (context, stats_arc)) in contexts_with_stats.into_iter().enumerate() {
-            pool.spawn_worker(id, context, stats_arc, &shared);
+            pool.spawn_worker(id, context, stats_arc);
         }
         
         info!("创建协程池，{} 个初始 workers", worker_count);
@@ -509,20 +470,12 @@ where
         
         info!("动态添加 {} 个新 workers (当前活跃 {} 个)", count, current_active);
         
-        // 准备共享资源
-        let shared = SharedResources {
-            executor: Arc::clone(&self.executor),
-            result_sender: self.result_sender.clone(),
-            free_mask: Arc::clone(&self.free_mask),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
-        };
-        
         for (context, stats_arc) in contexts_with_stats.into_iter() {
             // 使用位掩码快速查找第一个空位
             let worker_id = self.free_mask.allocate()?;
             
             // 启动 worker（使用统一的方法）
-            self.spawn_worker(worker_id, context, stats_arc, &shared);
+            self.spawn_worker(worker_id, context, stats_arc);
             
             debug!("新 worker 添加到位置 #{}", worker_id);
         }
