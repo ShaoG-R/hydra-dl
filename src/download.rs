@@ -15,7 +15,7 @@ mod progressive;
 mod task_allocator;
 mod progress_reporter;
 
-use progressive::ProgressiveLauncher;
+use progressive::{ProgressiveLauncher, WorkerLaunchExecutor};
 use task_allocator::{TaskAllocator, FailedRange};
 use progress_reporter::ProgressReporter;
 
@@ -308,21 +308,32 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         
         // 检查是否可以启动下一批worker（渐进式启动）
         if self.progressive_launcher.should_check_next_stage() {
-            match self.progressive_launcher.check_and_launch_next_stage(
-                &mut self.pool,
-                self.client.clone(),
-                &self.config,
-                &mut self.task_allocator,
-                self.writer.as_ref(),
-            ).await {
-                Ok(new_cancel_senders) => {
-                    // 保存新分配任务的取消通道
-                    for (worker_id, cancel_tx) in new_cancel_senders {
-                        self.cancel_senders.insert(worker_id, cancel_tx);
+            // 检测并调整启动阶段（应对 worker 数量变化）
+            let current_worker_count = self.pool.worker_count();
+            self.progressive_launcher.adjust_stage_for_worker_count(current_worker_count);
+            
+            // 先做决策（只读操作）
+            let decision = self.progressive_launcher.decide_next_launch(self, &self.config);
+            
+            // 根据决策结果执行
+            match decision {
+                progressive::LaunchDecision::Launch { count, stage } => {
+                    match self.execute_worker_launch(count, stage).await {
+                        Ok(new_cancel_senders) => {
+                            // 保存新分配任务的取消通道
+                            for (worker_id, cancel_tx) in new_cancel_senders {
+                                self.cancel_senders.insert(worker_id, cancel_tx);
+                            }
+                            // 更新阶段（只有成功执行后才更新）
+                            self.progressive_launcher.advance_stage();
+                        }
+                        Err(e) => {
+                            error!("渐进式启动失败: {:?}", e);
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("渐进式启动下一批 worker 失败: {:?}", e);
+                progressive::LaunchDecision::Wait { .. } | progressive::LaunchDecision::Complete => {
+                    // 不需要启动
                 }
             }
         }
@@ -697,6 +708,76 @@ impl<C: HttpClient + Clone, F: AsyncFile> DownloadTask<C, F> {
         info!("Range 下载任务完成: {:?}", save_path);
         
         Ok(())
+    }
+}
+
+/// 为 DownloadTask 实现 WorkerLaunchExecutor trait
+/// 
+/// 提供渐进式启动所需的外部能力接口
+impl<C: HttpClient + Clone, F: AsyncFile> WorkerLaunchExecutor for DownloadTask<C, F> {
+    fn current_worker_count(&self) -> usize {
+        self.pool.worker_count()
+    }
+    
+    fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
+        self.pool.get_worker_instant_speed(worker_id)
+    }
+    
+    fn get_total_window_avg_speed(&self) -> (f64, bool) {
+        self.pool.get_total_window_avg_speed()
+    }
+    
+    fn get_download_progress(&self) -> (u64, u64) {
+        self.writer.progress()
+    }
+    
+    async fn execute_worker_launch(
+        &mut self,
+        count: usize,
+        stage: usize,
+    ) -> Result<Vec<(usize, tokio::sync::oneshot::Sender<()>)>> {
+        let current_worker_count = self.pool.worker_count();
+        let next_target = current_worker_count + count;
+        let mut new_cancel_senders = Vec::new();
+        
+        info!(
+            "渐进式启动 - 第{}批: 启动 {} 个新 workers (总计 {} 个)",
+            stage + 1,
+            count,
+            next_target
+        );
+        
+        // 动态添加新 worker
+        if let Err(e) = self.pool.add_workers(self.client.clone(), count).await {
+            error!("添加新 workers 失败: {:?}", e);
+            return Err(e);
+        }
+        
+        // 为新启动的worker加入队列并分配任务
+        for worker_id in current_worker_count..next_target {
+            // 将新 worker 加入空闲队列
+            self.task_allocator.mark_worker_idle(worker_id);
+            
+            let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+            
+            if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
+                let (task, assigned_worker, cancel_tx) = allocated.into_parts();
+                info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", assigned_worker, chunk_size);
+                if let Err(e) = self.pool.send_task(task, assigned_worker).await {
+                    error!("为新 worker 分配任务失败: {:?}", e);
+                    // 失败了，将 worker 放回队列
+                    self.task_allocator.mark_worker_idle(assigned_worker);
+                } else {
+                    // 收集取消通道，稍后由调用者保存
+                    new_cancel_senders.push((assigned_worker, cancel_tx));
+                }
+            } else {
+                debug!("没有足够的数据为新 worker #{} 分配任务", worker_id);
+                break;
+            }
+        }
+        
+        Ok(new_cancel_senders)
     }
 }
 

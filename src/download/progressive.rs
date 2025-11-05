@@ -4,10 +4,74 @@
 
 use crate::Result;
 use crate::config::DownloadConfig;
-use crate::pool::download::DownloadWorkerPool;
-use crate::utils::io_traits::{AsyncFile, HttpClient};
-use super::task_allocator::TaskAllocator;
-use log::{debug, error, info};
+use log::{debug, info};
+
+/// 渐进式启动决策结果
+/// 
+/// 表示是否应该启动下一批 worker 的决策结果
+#[derive(Debug, Clone)]
+pub(super) enum LaunchDecision {
+    /// 等待，不启动新 worker
+    Wait { 
+        /// 等待原因
+        #[allow(dead_code)]
+        reason: String 
+    },
+    /// 启动新 worker
+    Launch { 
+        /// 要启动的 worker 数量
+        count: usize,
+        /// 当前阶段索引
+        stage: usize,
+    },
+    /// 渐进式启动已完成（所有阶段都已启动）
+    Complete,
+}
+
+/// Worker 启动执行器 Trait
+/// 
+/// 定义渐进式启动器所需的外部能力接口，实现决策逻辑与执行逻辑的解耦
+pub(super) trait WorkerLaunchExecutor {
+    /// 获取当前 worker 数量
+    fn current_worker_count(&self) -> usize;
+    
+    /// 获取指定 worker 的瞬时速度
+    /// 
+    /// # Returns
+    /// 
+    /// 返回 `Some((速度, 是否有效))`，如果 worker 不存在则返回 None
+    fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)>;
+    
+    /// 获取总体窗口平均速度
+    /// 
+    /// # Returns
+    /// 
+    /// 返回 `(速度, 是否有效)`
+    fn get_total_window_avg_speed(&self) -> (f64, bool);
+    
+    /// 获取下载进度
+    /// 
+    /// # Returns
+    /// 
+    /// 返回 `(已写入字节, 总字节)`
+    fn get_download_progress(&self) -> (u64, u64);
+    
+    /// 执行 worker 启动
+    /// 
+    /// # Arguments
+    /// 
+    /// * `count` - 要启动的 worker 数量
+    /// * `stage` - 当前阶段索引
+    /// 
+    /// # Returns
+    /// 
+    /// 成功返回新分配任务的取消通道列表 `Vec<(worker_id, cancel_tx)>`
+    async fn execute_worker_launch(
+        &mut self, 
+        count: usize, 
+        stage: usize,
+    ) -> Result<Vec<(usize, tokio::sync::oneshot::Sender<()>)>>;
+}
 
 /// 渐进式启动管理器
 /// 
@@ -71,45 +135,124 @@ impl ProgressiveLauncher {
         self.next_launch_stage < self.worker_launch_stages.len()
     }
     
-    /// 检查当前 Worker 速度并决定是否启动下一批
+    /// 推进到下一个启动阶段
     /// 
-    /// 此方法会检查所有已启动 Worker 的实时速度，如果都达到配置的阈值，
-    /// 则启动下一批 Worker 并为其分配初始任务
+    /// 此方法应在成功执行 worker 启动后调用
+    pub(super) fn advance_stage(&mut self) {
+        self.next_launch_stage += 1;
+    }
+    
+    /// 决策是否启动下一批 worker（纯决策逻辑，不执行）
     /// 
-    /// 此方法还会：
-    /// - 检测 worker 数量变化并自动降级批次
+    /// 检查所有已启动 Worker 的实时速度，并决定是否应该启动下一批
+    /// 
+    /// 此方法会：
+    /// - 检测 worker 数量变化并建议降级批次
+    /// - 检查速度是否达标
     /// - 检测预期剩余下载时间，避免在下载即将结束时启动新 worker
     /// 
     /// # Arguments
     /// 
-    /// * `pool` - Worker 协程池
-    /// * `client` - HTTP 客户端（用于创建新 Worker）
+    /// * `executor` - 实现了 WorkerLaunchExecutor trait 的执行器
     /// * `config` - 下载配置
-    /// * `task_allocator` - 任务分配器（用于为新 Worker 分配任务）
-    /// * `writer` - 文件写入器（用于检查下载进度）
     /// 
     /// # Returns
     /// 
-    /// 成功返回 `Ok(Vec<(worker_id, cancel_tx)>)`，包含新分配任务的取消通道列表
-    /// 失败返回错误
-    pub(super) async fn check_and_launch_next_stage<C, F>(
-        &mut self,
-        pool: &mut DownloadWorkerPool<F>,
-        client: C,
+    /// 返回 LaunchDecision 表示决策结果
+    pub(super) fn decide_next_launch<E: WorkerLaunchExecutor>(
+        &self,
+        executor: &E,
         config: &DownloadConfig,
-        task_allocator: &mut TaskAllocator,
-        writer: &crate::utils::range_writer::RangeWriter<F>,
-    ) -> Result<Vec<(usize, tokio::sync::oneshot::Sender<()>)>>
-    where
-        C: HttpClient + Clone + Send + 'static,
-        F: AsyncFile + 'static,
-    {
-        // 用于收集新分配任务的取消通道
-        let mut new_cancel_senders = Vec::new();
+    ) -> LaunchDecision {
+        let current_worker_count = executor.current_worker_count();
         
-        let current_worker_count = pool.worker_count();
+        // 检查是否所有阶段已完成
+        if self.next_launch_stage >= self.worker_launch_stages.len() {
+            return LaunchDecision::Complete;
+        }
         
-        // 检测 worker 数量变化并降级批次（应对部分 worker 被手动关闭的情况）
+        // 检查所有已启动 Worker 的速度是否达到阈值
+        let mut all_ready = true;
+        let mut speeds = Vec::with_capacity(current_worker_count);
+        
+        for worker_id in 0..current_worker_count {
+            let (instant_speed, valid) = executor.get_worker_instant_speed(worker_id)
+                .unwrap_or((0.0, false));
+            speeds.push(instant_speed);
+            
+            // 所有worker的速度都必须有效且达到阈值
+            if !valid || instant_speed < config.progressive().min_speed_threshold() as f64 {
+                all_ready = false;
+            }
+        }
+        
+        if !all_ready {
+            let reason = format!(
+                "等待第{}批worker速度达标 (当前速度: {:?} bytes/s, 阈值: {} bytes/s)",
+                self.next_launch_stage + 1,
+                speeds,
+                config.progressive().min_speed_threshold()
+            );
+            debug!("渐进式启动 - {}", reason);
+            return LaunchDecision::Wait { reason };
+        }
+        
+        // 检查预期剩余下载时间，避免在即将完成时启动新 worker
+        let (window_avg_speed, speed_valid) = executor.get_total_window_avg_speed();
+        if speed_valid && window_avg_speed > 0.0 {
+            let (written_bytes, total_bytes) = executor.get_download_progress();
+            let remaining_bytes = total_bytes.saturating_sub(written_bytes);
+            let estimated_time_left = remaining_bytes as f64 / window_avg_speed;
+            let threshold = config.progressive().min_time_before_finish().as_secs_f64();
+            
+            debug!(
+                "渐进式启动 - 剩余时间检测: 剩余 {} bytes, 窗口平均速度 {:.2} MB/s, 预期剩余 {:.1}s, 阈值 {:.1}s",
+                remaining_bytes,
+                window_avg_speed / 1024.0 / 1024.0,
+                estimated_time_left,
+                threshold
+            );
+            
+            if estimated_time_left < threshold {
+                let reason = format!(
+                    "预期剩余时间 {:.1}s < 阈值 {:.1}s",
+                    estimated_time_left,
+                    threshold
+                );
+                info!("渐进式启动 - {}，不启动新 workers", reason);
+                return LaunchDecision::Wait { reason };
+            }
+        }
+        
+        // 决定启动下一批
+        let next_target = self.worker_launch_stages[self.next_launch_stage];
+        let workers_to_add = next_target - current_worker_count;
+        
+        if workers_to_add > 0 {
+            info!(
+                "渐进式启动 - 第{}批: 所有已启动worker速度达标 ({:?} bytes/s >= {} bytes/s)，准备启动 {} 个新 workers (总计 {} 个)",
+                self.next_launch_stage + 1,
+                speeds,
+                config.progressive().min_speed_threshold(),
+                workers_to_add,
+                next_target
+            );
+            
+            LaunchDecision::Launch {
+                count: workers_to_add,
+                stage: self.next_launch_stage,
+            }
+        } else {
+            LaunchDecision::Wait {
+                reason: "没有需要启动的新 worker".to_string(),
+            }
+        }
+    }
+    
+    /// 检测并调整启动阶段（应对 worker 数量变化）
+    /// 
+    /// 当 worker 数量少于预期时（如部分 worker 被手动关闭），自动降级到合适的阶段
+    pub(super) fn adjust_stage_for_worker_count(&mut self, current_worker_count: usize) {
         if self.next_launch_stage > 0 {
             let current_target = self.worker_launch_stages[self.next_launch_stage - 1];
             if current_worker_count < current_target {
@@ -135,105 +278,6 @@ impl ProgressiveLauncher {
                 }
             }
         }
-        
-        // 检查所有已启动 Worker 的速度是否达到阈值
-        let mut all_ready = true;
-        let mut speeds = Vec::with_capacity(current_worker_count);
-        
-        for worker_id in 0..current_worker_count {
-            let (instant_speed, valid) = pool.get_worker_instant_speed(worker_id)
-                .unwrap_or((0.0, false));
-            speeds.push(instant_speed);
-            
-            // 所有worker的速度都必须有效且达到阈值
-            if !valid || instant_speed < config.progressive().min_speed_threshold() as f64 {
-                all_ready = false;
-            }
-        }
-        
-        if all_ready {
-            // 检查预期剩余下载时间，避免在即将完成时启动新 worker
-            let (window_avg_speed, speed_valid) = pool.get_total_window_avg_speed();
-            if speed_valid && window_avg_speed > 0.0 {
-                let (written_bytes, total_bytes) = writer.progress();
-                let remaining_bytes = total_bytes.saturating_sub(written_bytes);
-                let estimated_time_left = remaining_bytes as f64 / window_avg_speed;
-                let threshold = config.progressive().min_time_before_finish().as_secs_f64();
-                
-                debug!(
-                    "渐进式启动 - 剩余时间检测: 剩余 {} bytes, 窗口平均速度 {:.2} MB/s, 预期剩余 {:.1}s, 阈值 {:.1}s",
-                    remaining_bytes,
-                    window_avg_speed / 1024.0 / 1024.0,
-                    estimated_time_left,
-                    threshold
-                );
-                
-                if estimated_time_left < threshold {
-                    info!(
-                        "渐进式启动 - 预期剩余时间 {:.1}s < 阈值 {:.1}s，不启动新 workers",
-                        estimated_time_left,
-                        threshold
-                    );
-                    return Ok(new_cancel_senders);
-                }
-            }
-            
-            // 启动下一批worker
-            let next_target = self.worker_launch_stages[self.next_launch_stage];
-            let workers_to_add = next_target - current_worker_count;
-            
-            if workers_to_add > 0 {
-                info!(
-                    "渐进式启动 - 第{}批: 所有已启动worker速度达标 ({:?} bytes/s >= {} bytes/s)，启动 {} 个新 workers (总计 {} 个)",
-                    self.next_launch_stage + 1,
-                    speeds,
-                    config.progressive().min_speed_threshold(),
-                    workers_to_add,
-                    next_target
-                );
-                
-                // 动态添加新 worker
-                if let Err(e) = pool.add_workers(client.clone(), workers_to_add).await {
-                    error!("添加新 workers 失败: {:?}", e);
-                    // 继续执行，不影响已启动的 worker
-                } else {
-                    // 为新启动的worker加入队列并分配任务
-                    for worker_id in current_worker_count..next_target {
-                        // 将新 worker 加入空闲队列
-                        task_allocator.mark_worker_idle(worker_id);
-                        
-                        let chunk_size = pool.get_worker_chunk_size(worker_id);
-                        
-                        if let Some(allocated) = task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
-                            let (task, assigned_worker, cancel_tx) = allocated.into_parts();
-                            info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", assigned_worker, chunk_size);
-                            if let Err(e) = pool.send_task(task, assigned_worker).await {
-                                error!("为新 worker 分配任务失败: {:?}", e);
-                                // 失败了，将 worker 放回队列
-                                task_allocator.mark_worker_idle(assigned_worker);
-                            } else {
-                                // 收集取消通道，稍后由调用者保存
-                                new_cancel_senders.push((assigned_worker, cancel_tx));
-                            }
-                        } else {
-                            debug!("没有足够的数据为新 worker #{} 分配任务", worker_id);
-                            break;
-                        }
-                    }
-                    
-                    self.next_launch_stage += 1;
-                }
-            }
-        } else {
-            debug!(
-                "渐进式启动 - 等待第{}批worker速度达标 (当前速度: {:?} bytes/s, 阈值: {} bytes/s)",
-                self.next_launch_stage + 1,
-                speeds,
-                config.progressive().min_speed_threshold()
-            );
-        }
-        
-        Ok(new_cancel_senders)
     }
 }
 
