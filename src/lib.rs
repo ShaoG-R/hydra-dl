@@ -125,14 +125,15 @@
 //! }
 //! ```
 
-mod config;
+pub mod config;
 mod download;
 mod task;
 pub mod cli;
-pub(crate) mod pool {
-    pub(crate) mod common;
-    pub(crate) mod download;
-    pub(crate) mod worker_mask;
+
+pub mod pool {
+    pub mod common;
+    pub mod download;
+    pub mod worker_mask;
 }
 pub mod utils {
     pub(crate) mod chunk_strategy;

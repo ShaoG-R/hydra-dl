@@ -706,45 +706,58 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
+pub mod test_utils {
+    //! 公共测试套件
+    //! 
+    //! 提供可复用的测试类型、执行器和辅助函数，供 common.rs 的单元测试
+    //! 和 tests/ 目录下的集成测试使用
+    
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{sleep, Duration};
 
-    // 测试用的任务类型
+    /// 测试用的任务类型
     #[derive(Debug, Clone)]
-    #[allow(dead_code)]
-    struct TestTask {
-        id: usize,
-        data: String,
+    pub struct TestTask {
+        pub id: usize,
+        pub data: String,
     }
     impl WorkerTask for TestTask {}
 
-    // 测试用的结果类型
+    /// 测试用的结果类型
     #[derive(Debug)]
-    #[allow(dead_code)]
-    enum TestResult {
+    pub enum TestResult {
         Success { worker_id: usize, task_id: usize },
         Failed { worker_id: usize, error: String },
     }
-    
     impl WorkerResult for TestResult {}
 
-    // 测试用的上下文
-    struct TestContext {
-        processed_count: AtomicUsize,
+    /// 测试用的上下文
+    pub struct TestContext {
+        pub processed_count: AtomicUsize,
     }
     impl WorkerContext for TestContext {}
     
-    // 测试用的统计
-    struct TestStats {
-        task_count: AtomicUsize,
+    impl TestContext {
+        pub fn new() -> Self {
+            Self { processed_count: AtomicUsize::new(0) }
+        }
+    }
+    
+    /// 测试用的统计
+    pub struct TestStats {
+        pub task_count: AtomicUsize,
     }
     impl WorkerStats for TestStats {}
+    
+    impl TestStats {
+        pub fn new() -> Self {
+            Self { task_count: AtomicUsize::new(0) }
+        }
+    }
 
-    // 测试用的执行器
-    struct TestExecutor;
+    /// 测试用的成功执行器
+    pub struct TestExecutor;
     
     #[async_trait]
     impl WorkerExecutor<TestTask, TestResult, TestContext, TestStats> for TestExecutor {
@@ -760,35 +773,56 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_worker_pool_creation() {
-        let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
-        let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
+    /// 测试用的失败执行器
+    pub struct FailingExecutor;
+    
+    #[async_trait]
+    impl WorkerExecutor<TestTask, TestResult, TestContext, TestStats> for FailingExecutor {
+        async fn execute(&self, worker_id: usize, _task: TestTask, _context: &mut TestContext, _stats: &TestStats) -> TestResult {
+            TestResult::Failed {
+                worker_id,
+                error: "intentional failure".to_string(),
+            }
+        }
+    }
+    
+    /// 创建测试用的上下文和统计数据
+    pub fn create_context_with_stats() -> (TestContext, Arc<TestStats>) {
+        (TestContext::new(), Arc::new(TestStats::new()))
+    }
+    
+    /// 创建指定数量的测试用上下文和统计数据
+    pub fn create_contexts_with_stats(count: usize) -> Vec<(TestContext, Arc<TestStats>)> {
+        (0..count).map(|_| create_context_with_stats()).collect()
+    }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_utils::*;
+    use std::sync::atomic::Ordering;
+
+    // ==================== 基础单元测试 ====================
+    // 这些测试验证 WorkerPool 的核心功能
+    
+    #[tokio::test]
+    async fn test_create_pool() {
+        let executor = Arc::new(TestExecutor);
+        let contexts_with_stats = create_contexts_with_stats(2);
+        let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
         assert_eq!(pool.worker_count(), 2);
     }
 
     #[tokio::test]
-    async fn test_worker_pool_send_and_receive() {
+    async fn test_send_and_receive_task() {
         let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
+        let contexts_with_stats = create_contexts_with_stats(1);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
-        let task = TestTask {
-            id: 1,
-            data: "test".to_string(),
-        };
-
-        // 发送任务
+        let task = TestTask { id: 1, data: "test".to_string() };
         pool.send_task(task, 0).await.unwrap();
 
-        // 接收结果
         let result = pool.result_receiver().recv().await;
         assert!(result.is_some());
         
@@ -802,159 +836,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_pool_add_workers() {
+    async fn test_add_workers() {
         let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
+        let contexts_with_stats = create_contexts_with_stats(1);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
         assert_eq!(pool.worker_count(), 1);
 
-        // 添加新 worker
-        let new_contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
+        let new_contexts_with_stats = create_contexts_with_stats(2);
         pool.add_workers(new_contexts_with_stats).await.unwrap();
 
         assert_eq!(pool.worker_count(), 3);
     }
 
     #[tokio::test]
-    async fn test_worker_pool_shutdown() {
+    async fn test_shutdown() {
         let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
+        let contexts_with_stats = create_contexts_with_stats(2);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
-        // 关闭 workers
         pool.shutdown();
-
-        // 等待 workers 完成清理（使用事件通知，非轮询）
         pool.wait_for_shutdown().await;
 
-        // 验证所有 worker 都已被移除（slot 为 None）
+        // 验证所有 worker 都已被移除
         for worker_slot in pool.workers.iter() {
             assert!(worker_slot.load().is_none());
         }
     }
 
     #[tokio::test]
-    async fn test_worker_stats_access() {
+    async fn test_worker_stats() {
         let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
+        let contexts_with_stats = create_contexts_with_stats(1);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
-        // 发送任务
         let task = TestTask { id: 1, data: "test".to_string() };
         pool.send_task(task, 0).await.unwrap();
-
-        // 等待处理
         let _ = pool.result_receiver().recv().await;
 
-        // 验证统计数据
         let stats = pool.worker_stats(0).unwrap();
         assert_eq!(stats.task_count.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn test_shutdown_single_worker() {
-        let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
-        let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
-
-        // 验证初始 worker 数量
-        assert_eq!(pool.worker_count(), 3);
-
-        // 关闭 worker #1
-        pool.shutdown_worker(1).unwrap();
-
-        // 等待 worker 异步清理完成（使用小的 sleep 因为单个 worker 很快）
-        sleep(Duration::from_millis(50)).await;
-
-        // 验证 worker 数量减少
-        assert_eq!(pool.worker_count(), 2);
-
-        // 验证该 worker 不可用
-        let task = TestTask { id: 1, data: "test".to_string() };
-        let result = pool.send_task(task, 1).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), crate::DownloadError::WorkerNotFound(1)));
-
-        // 验证其他 worker 仍然正常工作
-        let task = TestTask { id: 2, data: "test".to_string() };
-        assert!(pool.send_task(task, 0).await.is_ok());
-        
-        let task = TestTask { id: 3, data: "test".to_string() };
-        assert!(pool.send_task(task, 2).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_add_workers_fills_gaps() {
-        let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
-        let mut pool = WorkerPool::new(executor.clone(), contexts_with_stats).unwrap();
-
-        // 验证初始状态
-        assert_eq!(pool.worker_count(), 3);
-
-        // 关闭 worker #1
-        pool.shutdown_worker(1).unwrap();
-        // 等待异步清理（单个 worker 快速清理）
-        sleep(Duration::from_millis(50)).await;
-        assert_eq!(pool.worker_count(), 2);
-
-        // 关闭 worker #0
-        pool.shutdown_worker(0).unwrap();
-        // 等待异步清理
-        sleep(Duration::from_millis(50)).await;
-        assert_eq!(pool.worker_count(), 1);
-
-        // 添加 2 个新 worker，应该填充到 #0 和 #1
-        let new_contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
-        pool.add_workers(new_contexts_with_stats).await.unwrap();
-        assert_eq!(pool.worker_count(), 3);
-
-        // 验证所有位置都可用
-        let task0 = TestTask { id: 1, data: "test".to_string() };
-        assert!(pool.send_task(task0, 0).await.is_ok());
-
-        let task1 = TestTask { id: 2, data: "test".to_string() };
-        assert!(pool.send_task(task1, 1).await.is_ok());
-
-        let task2 = TestTask { id: 3, data: "test".to_string() };
-        assert!(pool.send_task(task2, 2).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_nonexistent_worker() {
-        let executor = Arc::new(TestExecutor);
-        let contexts_with_stats = vec![
-            (TestContext { processed_count: AtomicUsize::new(0) }, Arc::new(TestStats { task_count: AtomicUsize::new(0) })),
-        ];
-        let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
-
-        // 尝试关闭不存在的 worker（不再是 async）
-        let result = pool.shutdown_worker(5);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), crate::DownloadError::WorkerNotFound(5)));
-    }
 }
 
