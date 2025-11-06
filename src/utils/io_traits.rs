@@ -36,14 +36,6 @@ pub enum IoError {
     #[error("刷新文件缓冲区失败: {0}")]
     FileFlush(#[source] std::io::Error),
     
-    /// 设置文件大小失败
-    #[error("设置文件大小失败: {0}")]
-    FileSetLen(#[source] std::io::Error),
-    
-    /// 文件定位失败
-    #[error("文件定位失败: {0}")]
-    FileSeek(#[source] std::io::Error),
-    
     /// 流式读取数据块失败
     #[error("读取数据块失败: {0}")]
     StreamRead(String),
