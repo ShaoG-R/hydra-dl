@@ -416,39 +416,6 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
         Self { client, url, range, stats }
     }
     
-    /// 下载指定范围的数据（不可取消）
-    /// 
-    /// # Returns
-    /// 
-    /// 返回下载的完整数据
-    #[allow(unused)]
-    pub async fn fetch(self) -> Result<Bytes> {
-        let (http_start, http_end) = self.range.as_http_range();
-        debug!(
-            "开始下载 Range: {} (bytes {}-{})",
-            self.url, http_start, http_end
-        );
-
-        let response = self.client
-            .get_with_range(self.url, http_start, http_end)
-            .await?;
-
-        if !response.status().is_success() && response.status().as_u16() != 206 {
-            return Err(FetchError::HttpStatus(response.status().as_u16()));
-        }
-
-        let data = self.download_stream(response.bytes_stream()).await?;
-        
-
-        let (start, end) = self.range.as_file_range();
-        debug!(
-            "Range {}..{} 下载完成: {} bytes",
-            start, end, data.len()
-        );
-        
-        Ok(data)
-    }
-    
     /// 下载指定范围的数据（可取消）
     /// 
     /// # Arguments
@@ -496,26 +463,6 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
         }
         
         Ok(result)
-    }
-    
-    /// 下载数据流（不可取消版本）
-    async fn download_stream<S>(&self, mut stream: S) -> Result<Bytes>
-    where
-        S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
-    {
-        let mut buffer = BytesMut::new();
-        
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result?;
-            let chunk_size = chunk.len() as u64;
-            
-            // 实时记录 chunk
-            self.stats.record_chunk(chunk_size);
-            
-            buffer.extend_from_slice(&chunk);
-        }
-        
-        Ok(buffer.freeze())
     }
     
     /// 下载数据流（可取消版本）
@@ -869,10 +816,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_range_success() {
+    async fn test_fetch_with_cancel_complete_download() {
         use std::num::NonZeroU64;
         use tempfile::tempdir;
         
+        // 测试完整下载（不触发取消）
         let test_url = "http://example.com/file.bin";
         let full_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         
@@ -885,39 +833,52 @@ mod tests {
         let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(full_data.len() as u64).unwrap()).unwrap();
         let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap(); // 分配 10 bytes，范围是 0-9
         
-        // range.start() = 0, range.end() = 10
         let expected_data = &full_data[0..10]; // "0123456789"
 
-        // 设置 Range 响应（注意：HTTP Range 的 end 是包含的，所以是 0-9）
+        // 设置 Range 响应
         let mut headers = HeaderMap::new();
         headers.insert("content-range", format!("bytes 0-9/{}", full_data.len()).parse().unwrap());
         client.set_range_response(
             test_url,
             0,
-            9, // HTTP Range 的 end 是包含的
+            9,
             reqwest::StatusCode::PARTIAL_CONTENT,
             headers,
             Bytes::copy_from_slice(expected_data),
         );
 
-        // 执行下载（不可取消版本）
+        // 创建一个永远不会发送的取消信号
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+
+        // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch().await;
-        assert!(result.is_ok(), "Range 下载应该成功: {:?}", result);
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats)
+            .fetch_with_cancel(cancel_rx)
+            .await;
+        
+        assert!(result.is_ok(), "下载应该成功: {:?}", result);
 
-        let data = result.unwrap();
-        assert_eq!(data.as_ref(), expected_data, "下载的数据应该匹配");
+        // 验证返回完整数据
+        match result.unwrap() {
+            FetchRangeResult::Complete(data) => {
+                assert_eq!(data.as_ref(), expected_data, "下载的数据应该匹配");
+            }
+            FetchRangeResult::Cancelled { .. } => {
+                panic!("不应该被取消");
+            }
+        }
 
-        // 验证统计信息（只验证字节数，不验证 range 计数，因为 fetch_range 不负责调用 record_range_complete）
+        // 验证统计信息
         let (total_bytes, _, _) = stats.get_summary();
         assert_eq!(total_bytes, expected_data.len() as u64, "统计的字节数应该匹配");
     }
 
     #[tokio::test]
-    async fn test_fetch_range_http_error() {
+    async fn test_fetch_with_cancel_http_error() {
         use std::num::NonZeroU64;
         use tempfile::tempdir;
         
+        // 测试 HTTP 错误
         let test_url = "http://example.com/file.bin";
         let client = MockHttpClient::new();
         let stats = WorkerStats::default();
@@ -937,9 +898,15 @@ mod tests {
             Bytes::new(),
         );
 
-        // 执行下载（不可取消版本）
+        // 创建取消通道（虽然不会用到）
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+
+        // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch().await;
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats)
+            .fetch_with_cancel(cancel_rx)
+            .await;
+        
         assert!(result.is_err(), "应该返回错误");
     }
 
@@ -1020,11 +987,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_range_chunked_stream() {
+    async fn test_fetch_with_cancel_large_stream() {
         use std::num::NonZeroU64;
         use tempfile::tempdir;
         
-        // 测试流式传输，确保大数据被正确分块处理
+        // 测试流式传输大数据（不触发取消）
         let test_url = "http://example.com/large_file.bin";
         
         // 创建一个较大的数据（大于默认 chunk size 8192）
@@ -1052,14 +1019,27 @@ mod tests {
             Bytes::from(large_data.clone()),
         );
 
-        // 执行下载（不可取消版本）
-        let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch().await;
-        assert!(result.is_ok(), "大数据 Range 下载应该成功");
+        // 创建取消通道（不发送取消信号）
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
 
-        let data = result.unwrap();
-        assert_eq!(data.len(), large_data.len(), "下载的数据大小应该匹配");
-        assert_eq!(data.as_ref(), &large_data[..], "下载的数据内容应该匹配");
+        // 执行下载
+        let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats)
+            .fetch_with_cancel(cancel_rx)
+            .await;
+        
+        assert!(result.is_ok(), "大数据下载应该成功");
+
+        // 验证返回完整数据
+        match result.unwrap() {
+            FetchRangeResult::Complete(data) => {
+                assert_eq!(data.len(), large_data.len(), "下载的数据大小应该匹配");
+                assert_eq!(data.as_ref(), &large_data[..], "下载的数据内容应该匹配");
+            }
+            FetchRangeResult::Cancelled { .. } => {
+                panic!("不应该被取消");
+            }
+        }
 
         // 验证统计信息（应该记录了多个 chunk）
         let (total_bytes, _, _) = stats.get_summary();
@@ -1067,11 +1047,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_range_with_cancel() {
+    async fn test_fetch_with_cancel_cancelled_midway() {
         use std::num::NonZeroU64;
         use tempfile::tempdir;
         
-        // 测试取消功能
+        // 测试中途取消下载
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
         
@@ -1095,32 +1075,86 @@ mod tests {
             Bytes::from_static(test_data),
         );
 
-        // 创建一个 oneshot channel，立即发送取消信号
+        // 创建取消通道，在稍后发送取消信号
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         
-        // 在一个单独的任务中稍后发送取消信号
         tokio::spawn(async move {
             // 给予一点时间让下载开始
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             let _ = cancel_tx.send(());
         });
 
-        // 执行下载（可取消版本）
+        // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch_with_cancel(cancel_rx).await;
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats)
+            .fetch_with_cancel(cancel_rx)
+            .await;
+        
         assert!(result.is_ok(), "调用应该成功");
 
-        // 验证返回的是 Cancelled 变体（注意：由于 Mock 实现可能一次性返回所有数据，可能会返回 Complete）
+        // 验证结果（注意：Mock 实现可能一次性返回所有数据，在取消前就完成）
         match result.unwrap() {
             FetchRangeResult::Cancelled { data, bytes_downloaded } => {
-                // 应该有部分数据（或可能没有，取决于取消的时机）
+                // 下载被取消，验证部分数据
                 assert!(data.len() <= test_data.len(), "取消时的数据不应该超过总大小");
-                // 验证已下载字节数的正确性
                 assert_eq!(bytes_downloaded, data.len() as u64, "已下载字节数应该匹配数据长度");
             }
             FetchRangeResult::Complete(data) => {
-                // 如果 Mock 一次性返回了所有数据，在取消信号到达之前就完成了
+                // Mock 在取消信号到达前就返回了所有数据
                 assert_eq!(data.len(), test_data.len(), "完整数据应该匹配");
+            }
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_fetch_with_cancel_immediate_cancel() {
+        use std::num::NonZeroU64;
+        use tempfile::tempdir;
+        
+        // 测试立即取消（在下载开始前就发送取消信号）
+        let test_url = "http://example.com/file.bin";
+        let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        
+        let client = MockHttpClient::new();
+        let stats = WorkerStats::default();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+
+        // 设置 Range 响应
+        let mut headers = HeaderMap::new();
+        headers.insert("content-range", format!("bytes 0-35/{}", test_data.len()).parse().unwrap());
+        client.set_range_response(
+            test_url,
+            0,
+            35,
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            headers,
+            Bytes::from_static(test_data),
+        );
+
+        // 立即发送取消信号
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let _ = cancel_tx.send(()); // 立即取消
+
+        // 执行下载
+        let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats)
+            .fetch_with_cancel(cancel_rx)
+            .await;
+        
+        // 应该成功（可能完成也可能取消，取决于执行时机）
+        assert!(result.is_ok(), "调用应该成功");
+        
+        match result.unwrap() {
+            FetchRangeResult::Cancelled { data, bytes_downloaded } => {
+                // 被立即取消，可能没有下载任何数据
+                assert_eq!(bytes_downloaded, data.len() as u64);
+            }
+            FetchRangeResult::Complete(_) => {
+                // 在取消信号处理前就完成了
             }
         }
     }
