@@ -14,7 +14,7 @@ use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn test_create_pool_with_zero_workers() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(0);
     let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -28,7 +28,7 @@ async fn test_create_pool_with_zero_workers() {
 
 #[tokio::test]
 async fn test_create_pool_with_max_workers() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(ConcurrencyDefaults::MAX_WORKER_COUNT);
     
     let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
@@ -37,7 +37,7 @@ async fn test_create_pool_with_max_workers() {
 
 #[tokio::test]
 async fn test_create_pool_exceeds_max_workers() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(ConcurrencyDefaults::MAX_WORKER_COUNT + 1);
     
     let result = WorkerPool::new(executor, contexts_with_stats);
@@ -49,7 +49,7 @@ async fn test_create_pool_exceeds_max_workers() {
 
 #[tokio::test]
 async fn test_send_task_to_invalid_worker_id() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -68,7 +68,7 @@ async fn test_send_task_to_invalid_worker_id() {
 
 #[tokio::test]
 async fn test_access_stats_of_invalid_worker() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -81,7 +81,7 @@ async fn test_access_stats_of_invalid_worker() {
 
 #[tokio::test]
 async fn test_shutdown_worker_out_of_bounds() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -94,7 +94,7 @@ async fn test_shutdown_worker_out_of_bounds() {
 
 #[tokio::test]
 async fn test_shutdown_single_worker() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(3);
     let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -123,7 +123,7 @@ async fn test_shutdown_single_worker() {
 
 #[tokio::test]
 async fn test_shutdown_nonexistent_worker() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -136,7 +136,7 @@ async fn test_shutdown_nonexistent_worker() {
 
 #[tokio::test]
 async fn test_add_workers_fills_gaps() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(3);
     let mut pool = WorkerPool::new(executor.clone(), contexts_with_stats).unwrap();
 
@@ -170,7 +170,7 @@ async fn test_add_workers_fills_gaps() {
 
 #[tokio::test]
 async fn test_add_workers_when_slots_full() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(ConcurrencyDefaults::MAX_WORKER_COUNT);
     
     let mut pool = WorkerPool::new(executor.clone(), contexts_with_stats).unwrap();
@@ -185,7 +185,7 @@ async fn test_add_workers_when_slots_full() {
 
 #[tokio::test]
 async fn test_concurrent_task_sending() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -213,7 +213,7 @@ async fn test_concurrent_task_sending() {
 
 #[tokio::test]
 async fn test_multiple_workers_processing_concurrently() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(3);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -248,7 +248,7 @@ async fn test_multiple_workers_processing_concurrently() {
 async fn test_concurrent_stats_access() {
     use tokio::task::JoinSet;
     
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let pool = Arc::new(WorkerPool::new(executor, contexts_with_stats).unwrap());
 
@@ -272,7 +272,7 @@ async fn test_concurrent_stats_access() {
 
 #[tokio::test]
 async fn test_executor_returns_failure() {
-    let executor = Arc::new(FailingExecutor);
+    let executor = FailingExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -294,7 +294,7 @@ async fn test_executor_returns_failure() {
 
 #[tokio::test]
 async fn test_round_robin_task_distribution() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let worker_count = 3;
     let contexts_with_stats = create_contexts_with_stats(worker_count);
     
@@ -327,7 +327,7 @@ async fn test_round_robin_task_distribution() {
 
 #[tokio::test]
 async fn test_sequential_tasks_to_single_worker() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -362,7 +362,7 @@ async fn test_sequential_tasks_to_single_worker() {
 
 #[tokio::test]
 async fn test_partial_shutdown_and_continue() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(3);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -391,7 +391,7 @@ async fn test_partial_shutdown_and_continue() {
 
 #[tokio::test]
 async fn test_immediate_shutdown_after_creation() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(2);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -407,7 +407,7 @@ async fn test_immediate_shutdown_after_creation() {
 
 #[tokio::test]
 async fn test_context_isolation_between_workers() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(2);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -438,7 +438,7 @@ async fn test_context_isolation_between_workers() {
 
 #[tokio::test]
 async fn test_stats_accumulation() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -462,7 +462,7 @@ async fn test_stats_accumulation() {
 
 #[tokio::test]
 async fn test_worker_stats_persist_after_task_completion() {
-    let executor = Arc::new(TestExecutor);
+    let executor = TestExecutor;
     let contexts_with_stats = create_contexts_with_stats(1);
     let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 

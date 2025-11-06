@@ -76,6 +76,7 @@ use async_trait::async_trait;
 use arc_swap::ArcSwap;
 use log::{debug, error, info};
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Notify;
@@ -141,7 +142,7 @@ pub trait WorkerContext: Send + 'static {}
 ///
 /// - `Send + Sync`: 执行器可以在多个 worker 间共享
 #[async_trait]
-pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats>: Send + Sync + 'static {
+pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats>: Send + Sync + Clone + 'static {
     /// 执行任务
     ///
     /// # Arguments
@@ -160,9 +161,9 @@ pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: Wo
 /// Worker 配置
 ///
 /// 封装启动单个 worker 所需的所有参数
-pub(crate) struct WorkerConfig<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats, E: WorkerExecutor<T, R, C, S> + ?Sized> {
+pub(crate) struct WorkerConfig<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats, E: WorkerExecutor<T, R, C, S>> {
     pub id: usize,
-    pub executor: Arc<E>,
+    pub executor: E,
     pub task_receiver: Receiver<T>,
     pub result_sender: Sender<R>,
     pub context: C,
@@ -189,7 +190,7 @@ where
     R: WorkerResult,
     C: WorkerContext,
     S: WorkerStats,
-    E: WorkerExecutor<T, R, C, S> + ?Sized,
+    E: WorkerExecutor<T, R, C, S>,
 {
     let WorkerConfig {
         id,
@@ -304,7 +305,7 @@ impl<T: WorkerTask, S: WorkerStats> WorkerCleanup<T, S> {
 /// - 动态添加 worker
 /// - 访问 worker 统计数据
 /// - Worker 自动清理（退出时自动释放资源）
-pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats> {
+pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats, E: WorkerExecutor<T, R, C, S>> {
     /// Worker 槽位数组（索引即为 worker_id，None 表示该位置空闲）
     /// 使用固定大小数组和 ArcSwap 实现无锁并发访问
     /// ArcSwap<T> = ArcSwapAny<Arc<T>>，所以这里是 Arc<Option<WorkerSlot>>
@@ -314,21 +315,23 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: Worke
     result_receiver: Receiver<R>,
     /// 结果发送器的克隆（用于创建新 worker）
     result_sender: Sender<R>,
-    /// 执行器（所有 worker 共享）
-    pub(crate) executor: Arc<dyn WorkerExecutor<T, R, C, S>>,
+    /// 执行器
+    pub(crate) executor: E,
     /// Worker 槽位空闲位掩码（1 表示已占用，0 表示空闲）
     /// 用于快速查找空闲槽位和判断是否所有 worker 都已退出
     free_mask: Arc<WorkerMask>,
     /// Worker 全部退出通知器
     shutdown_notify: Arc<Notify>,
+    marker: PhantomData<C>,
 }
 
-impl<T, R, C, S> WorkerPool<T, R, C, S>
+impl<T, R, C, S, E> WorkerPool<T, R, C, S, E>
 where
     T: WorkerTask,
     R: WorkerResult,
     C: WorkerContext,
     S: WorkerStats,
+    E: WorkerExecutor<T, R, C, S>,
 {
     /// 启动单个 worker（内部辅助方法）
     /// 
@@ -344,9 +347,9 @@ where
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
         
         // 克隆 worker 需要的资源（直接从 self 获取，减少一层克隆）
-        let executor_clone = Arc::clone(&self.executor);
         let result_sender_clone = self.result_sender.clone();
         let stats_for_worker = Arc::clone(&stats_arc);
+        let executor_clone = self.executor.clone();
         
         // 创建 WorkerSlot 并存入 workers 数组
         let slot = WorkerSlot {
@@ -402,7 +405,7 @@ where
     /// let contexts_with_stats = vec![(MyContext::new(), Arc::new(MyStats::new())); 4];
     /// let pool = WorkerPool::new(executor, contexts_with_stats);
     /// ```
-    pub fn new<E>(executor: Arc<E>, contexts_with_stats: Vec<(C, Arc<S>)>) -> Result<Self>
+    pub fn new(executor: E, contexts_with_stats: Vec<(C, Arc<S>)>) -> Result<Self>
     where
         E: WorkerExecutor<T, R, C, S>,
     {
@@ -415,9 +418,6 @@ where
         
         // 创建统一的 result channel（所有 worker 共享同一个 sender）
         let (result_sender, result_receiver) = mpsc::channel::<R>(100);
-        
-        // 将具体类型的 executor 转换为 trait object
-        let executor_trait_obj: Arc<dyn WorkerExecutor<T, R, C, S>> = executor;
         
         // 初始化空闲位掩码
         let free_mask = Arc::new(WorkerMask::new(worker_count)?);
@@ -434,7 +434,8 @@ where
             workers,
             result_receiver,
             result_sender: result_sender.clone(),
-            executor: executor_trait_obj,
+            executor: executor,
+            marker: PhantomData,
             free_mask: Arc::clone(&free_mask),
             shutdown_notify: Arc::clone(&shutdown_notify),
         };
@@ -725,6 +726,7 @@ pub mod test_utils {
     }
 
     /// 测试用的成功执行器
+    #[derive(Clone)]
     pub struct TestExecutor;
     
     #[async_trait]
@@ -742,6 +744,7 @@ pub mod test_utils {
     }
 
     /// 测试用的失败执行器
+    #[derive(Clone)]
     pub struct FailingExecutor;
     
     #[async_trait]
@@ -776,7 +779,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_create_pool() {
-        let executor = Arc::new(TestExecutor);
+        let executor = TestExecutor;
         let contexts_with_stats = create_contexts_with_stats(2);
         let pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
         assert_eq!(pool.worker_count(), 2);
@@ -784,7 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_and_receive_task() {
-        let executor = Arc::new(TestExecutor);
+        let executor = TestExecutor;
         let contexts_with_stats = create_contexts_with_stats(1);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -805,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_workers() {
-        let executor = Arc::new(TestExecutor);
+        let executor = TestExecutor;
         let contexts_with_stats = create_contexts_with_stats(1);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -819,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown() {
-        let executor = Arc::new(TestExecutor);
+        let executor = TestExecutor;
         let contexts_with_stats = create_contexts_with_stats(2);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 
@@ -834,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_stats() {
-        let executor = Arc::new(TestExecutor);
+        let executor = TestExecutor;
         let contexts_with_stats = create_contexts_with_stats(1);
         let mut pool = WorkerPool::new(executor, contexts_with_stats).unwrap();
 

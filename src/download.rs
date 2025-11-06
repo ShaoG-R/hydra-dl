@@ -197,7 +197,7 @@ impl DownloadHandle {
 /// 
 /// 封装了创建下载任务所需的所有参数
 struct DownloadTaskParams<C: HttpClient> {
-    /// HTTP 客户端
+    /// HTTP 客户端（用于动态添加 worker）
     client: C,
     /// 进度更新发送器
     progress_sender: Option<Sender<DownloadProgress>>,
@@ -219,10 +219,8 @@ struct DownloadTaskParams<C: HttpClient> {
 /// 
 /// 封装了下载任务的执行逻辑，使用辅助结构体管理任务分配和进度报告
 struct DownloadTask<C: HttpClient> {
-    /// HTTP 客户端（用于动态添加 worker）
-    client: C,
     /// Worker 协程池
-    pool: DownloadWorkerPool,
+    pool: DownloadWorkerPool<C>,
     /// 文件写入器
     writer: MmapWriter,
     /// 任务分配器
@@ -282,7 +280,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         }
         
         Ok(Self {
-            client,
             pool,
             writer,
             task_allocator,
@@ -913,7 +910,7 @@ impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
         );
         
         // 动态添加新 worker
-        if let Err(e) = self.pool.add_workers(self.client.clone(), count).await {
+        if let Err(e) = self.pool.add_workers(count).await {
             error!("添加新 workers 失败: {:?}", e);
             return Err(e);
         }

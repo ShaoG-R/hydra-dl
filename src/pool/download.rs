@@ -49,6 +49,7 @@ impl WorkerContext for DownloadWorkerContext {}
 /// # 泛型参数
 ///
 /// - `C`: HTTP 客户端类型
+#[derive(Clone)]
 pub(crate) struct DownloadWorkerExecutor<C> {
     /// HTTP 客户端
     client: C,
@@ -216,16 +217,19 @@ where
 /// 下载 Worker 协程池
 ///
 /// 封装通用 WorkerPool，提供下载特定的便捷方法
-pub(crate) struct DownloadWorkerPool {
+pub(crate) struct DownloadWorkerPool<C: HttpClient> {
     /// 底层通用协程池
-    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats>,
+    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats, DownloadWorkerExecutor<C>>,
     /// 全局统计管理器（聚合所有 worker 的数据）
     global_stats: TaskStats,
     /// 下载配置（用于创建新 worker 的分块策略）
     config: Arc<crate::config::DownloadConfig>,
 }
 
-impl DownloadWorkerPool {
+impl<C> DownloadWorkerPool<C>
+where
+    C: HttpClient,
+{
     /// 创建新的下载协程池
     ///
     /// # Arguments
@@ -238,15 +242,12 @@ impl DownloadWorkerPool {
     /// # Returns
     ///
     /// 新创建的 DownloadWorkerPool
-    pub(crate) fn new<C>(
+    pub(crate) fn new(
         client: C,
         initial_worker_count: usize,
         writer: MmapWriter,
         config: Arc<crate::config::DownloadConfig>,
-    ) -> Result<Self>
-    where
-        C: HttpClient + Clone + Send + Sync + 'static,
-    {
+    ) -> Result<Self> {
         // 创建全局统计管理器（使用配置的速度配置）
         let global_stats = TaskStats::from_config(config.speed());
 
@@ -272,7 +273,7 @@ impl DownloadWorkerPool {
             .collect();
 
         // 创建通用协程池
-        let pool = WorkerPool::new(Arc::new(executor), contexts_with_stats)?;
+        let pool = WorkerPool::new(executor, contexts_with_stats)?;
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
@@ -287,17 +288,12 @@ impl DownloadWorkerPool {
     ///
     /// # Arguments
     ///
-    /// - `_client`: HTTP客户端（暂未使用，因为使用现有的执行器）
     /// - `count`: 要添加的 worker 数量
     ///
     /// # Returns
     ///
     /// 成功时返回 `Ok(())`，失败时返回错误信息
-    pub(crate) async fn add_workers<C>(&mut self, client: C, count: usize) -> Result<()>
-    where
-        C: HttpClient + Clone + Send + Sync + 'static,
-    {
-        let _ = client; // 当前实现使用现有的 executor，此参数保留以备将来使用
+    pub(crate) async fn add_workers(&mut self, count: usize) -> Result<()> {
         // 创建新的 worker 上下文和统计
         let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..count)
             .map(|_| {
