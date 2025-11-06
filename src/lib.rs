@@ -55,7 +55,7 @@
 //!         match progress {
 //!             DownloadProgress::Started { total_size, initial_chunk_size, .. } => {
 //!                 println!("开始下载，总大小: {:.2} MB, 初始分块: {:.2} MB", 
-//!                     total_size as f64 / 1024.0 / 1024.0,
+//!                     total_size.get() as f64 / 1024.0 / 1024.0,
 //!                     initial_chunk_size as f64 / 1024.0 / 1024.0);
 //!             }
 //!             DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
@@ -137,12 +137,11 @@ pub mod pool {
 }
 pub mod utils {
     pub(crate) mod chunk_strategy;
-    pub(crate) mod fetch;
+    pub mod fetch;
     pub(crate) mod speed_calculator;
     pub(crate) mod stats;
     pub mod io_traits;
-    pub mod range_writer;
-    pub mod async_file;
+    pub mod writer;
 }
 
 /// 常用单位常量
@@ -197,13 +196,13 @@ pub enum DownloadError {
     #[error(transparent)]
     Fetch(#[from] utils::fetch::FetchError),
     
-    /// Range Writer 错误
-    #[error(transparent)]
-    RangeWriter(#[from] utils::range_writer::RangeWriterError),
-    
     /// HTTP 客户端构建错误
     #[error("创建 HTTP 客户端失败: {0}")]
     BuildClient(#[from] reqwest::Error),
+
+    /// Mmap 写入错误
+    #[error(transparent)]
+    MmapWrite(#[from] utils::writer::MmapWriterError),
     
     /// 任务发送错误
     #[error("任务发送失败: {0}")]
@@ -216,10 +215,6 @@ pub enum DownloadError {
     /// Worker 退出失败
     #[error("等待 Worker #{0} 退出失败")]
     WorkerExit(usize),
-    
-    /// Range Writer 所有权错误
-    #[error("无法获取 RangeWriter 的所有权（仍有其他引用）")]
-    WriterOwnership,
     
     /// Worker 不存在或已被移除
     #[error("Worker #{0} 不存在或已被移除")]

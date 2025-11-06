@@ -5,6 +5,7 @@
 use crate::pool::download::DownloadWorkerPool;
 use super::DownloadProgress;
 use tokio::sync::mpsc::Sender;
+use std::num::NonZeroU64;
 
 /// 进度报告器
 /// 
@@ -15,14 +16,14 @@ pub(super) struct ProgressReporter {
     /// 已完成的 range 总数
     total_ranges_completed: usize,
     /// 文件总大小
-    total_size: u64,
+    total_size: NonZeroU64,
 }
 
 impl ProgressReporter {
     /// 创建新的进度报告器
     pub(super) fn new(
         progress_sender: Option<Sender<DownloadProgress>>,
-        total_size: u64,
+        total_size: NonZeroU64,
     ) -> Self {
         Self {
             progress_sender,
@@ -53,8 +54,8 @@ impl ProgressReporter {
             let (total_bytes, _, _) = pool.get_total_stats();
             
             // 计算百分比
-            let percentage = if self.total_size > 0 {
-                (total_bytes as f64 / self.total_size as f64) * 100.0
+            let percentage = if self.total_size.get() > 0 {
+                (total_bytes as f64 / self.total_size.get() as f64) * 100.0
             } else {
                 0.0
             };
@@ -121,24 +122,24 @@ mod tests {
     #[tokio::test]
     async fn test_progress_reporter_creation() {
         let (tx, _rx) = mpsc::channel(10);
-        let reporter = ProgressReporter::new(Some(tx), 1000);
+        let reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
         
         assert_eq!(reporter.total_ranges_completed(), 0);
-        assert_eq!(reporter.total_size, 1000);
+        assert_eq!(reporter.total_size.get(), 1000);
     }
 
     #[tokio::test]
     async fn test_progress_reporter_without_sender() {
-        let reporter = ProgressReporter::new(None, 1000);
+        let reporter = ProgressReporter::new(None, NonZeroU64::new(1000).unwrap());
         
         assert_eq!(reporter.total_ranges_completed(), 0);
-        assert_eq!(reporter.total_size, 1000);
+        assert_eq!(reporter.total_size.get(), 1000);
     }
 
     #[tokio::test]
     async fn test_record_range_complete() {
         let (tx, _rx) = mpsc::channel(10);
-        let mut reporter = ProgressReporter::new(Some(tx), 1000);
+        let mut reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
         
         assert_eq!(reporter.total_ranges_completed(), 0);
         
@@ -153,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_started_event() {
         let (tx, mut rx) = mpsc::channel(10);
-        let reporter = ProgressReporter::new(Some(tx), 1000);
+        let reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
         
         reporter.send_started_event(4, 256).await;
         
@@ -161,7 +162,7 @@ mod tests {
         if let Some(progress) = rx.recv().await {
             match progress {
                 DownloadProgress::Started { total_size, worker_count, initial_chunk_size } => {
-                    assert_eq!(total_size, 1000);
+                    assert_eq!(total_size.get(), 1000);
                     assert_eq!(worker_count, 4);
                     assert_eq!(initial_chunk_size, 256);
                 }
@@ -175,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_error() {
         let (tx, mut rx) = mpsc::channel(10);
-        let reporter = ProgressReporter::new(Some(tx), 1000);
+        let reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
         
         reporter.send_error("Test error").await;
         
@@ -194,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_events_without_sender() {
-        let reporter = ProgressReporter::new(None, 1000);
+        let reporter = ProgressReporter::new(None, NonZeroU64::new(1000).unwrap());
         
         // 这些调用不应该 panic
         reporter.send_started_event(4, 256).await;
@@ -204,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_range_completions() {
         let (tx, _rx) = mpsc::channel(10);
-        let mut reporter = ProgressReporter::new(Some(tx), 10000);
+        let mut reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(10000).unwrap());
         
         for i in 1..=100 {
             reporter.record_range_complete();

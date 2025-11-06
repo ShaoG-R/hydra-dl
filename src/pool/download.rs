@@ -13,9 +13,9 @@ use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::utils::fetch::{RangeFetcher, FetchRangeResult};
 use crate::utils::io_traits::HttpClient;
-use crate::utils::range_writer::{AllocatedRange, RangeWriter};
 use crate::utils::stats::TaskStats;
 use crate::Result;
+use crate::utils::writer::MmapWriter;
 use async_trait::async_trait;
 use log::{debug, error, info};
 use std::sync::Arc;
@@ -53,7 +53,7 @@ pub(crate) struct DownloadWorkerExecutor<C> {
     /// HTTP 客户端
     client: C,
     /// 共享的文件写入器
-    writer: Arc<RangeWriter>,
+    writer: MmapWriter,
 }
 
 impl<C> DownloadWorkerExecutor<C> {
@@ -63,7 +63,7 @@ impl<C> DownloadWorkerExecutor<C> {
     ///
     /// - `client`: HTTP 客户端
     /// - `writer`: 共享的文件写入器
-    pub(crate) fn new(client: C, writer: Arc<RangeWriter>) -> Self {
+    pub(crate) fn new(client: C, writer: MmapWriter) -> Self {
         Self { client, writer }
     }
 }
@@ -82,7 +82,7 @@ where
     ) -> RangeResult {
         match task {
             RangeTask::Range { url, range, retry_count, cancel_rx } => {
-                let (start, end) = range.as_file_range();
+                let (start, end) = range.as_range_tuple();
                 debug!(
                     "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
                     worker_id,
@@ -93,13 +93,17 @@ where
                 );
 
                 // 下载数据（在下载过程中会实时更新 stats）
-                let fetch_result = RangeFetcher::new(&self.client, &url, range, stats).fetch_with_cancel(cancel_rx).await;
+                // 将 AllocatedRange 转换为 FetchRange
+                use crate::utils::fetch::FetchRange;
+                let fetch_range = FetchRange::from_allocated_range(&range)
+                    .expect("AllocatedRange 应该总是有效的");
+                let fetch_result = RangeFetcher::new(&self.client, &url, fetch_range, stats).fetch_with_cancel(cancel_rx).await;
 
                 match fetch_result {
                     Ok(FetchRangeResult::Complete(data)) => {
                         // 下载完成，直接写入文件
-                        match self.writer.write_range(range, data).await {
-                            Ok(()) => {
+                        match self.writer.write_range(range, data.as_ref()) {
+                            Ok(_) => {
                                 // 记录 range 完成
                                 stats.record_range_complete();
                                 
@@ -127,27 +131,61 @@ where
                             }
                         }
                     }
-                    Ok(FetchRangeResult::Cancelled { data, remaining_range }) => {
+                    Ok(FetchRangeResult::Cancelled { data, bytes_downloaded }) => {
                         // 下载被取消，先写入已下载的部分数据（如果有）
-                        if !data.is_empty() {
-                            // 计算已下载部分的 range
-                            let downloaded_range = AllocatedRange::from_file_range(start, start + data.len() as u64);
-                            if let Err(e) = self.writer.write_range(downloaded_range, data).await {
-                                error!("Worker #{} 写入已下载的部分数据失败: {:?}", worker_id, e);
-                            } else {
-                                debug!("Worker #{} 成功写入已下载的 {} bytes", worker_id, downloaded_range.len());
+                        match bytes_downloaded {
+                            0 => {
+                                // 没有下载任何数据，返回原始 range 重试
+                                let error_msg = format!("下载被取消，重试整个 range: {}..{}", start, end);
+                                debug!("Worker #{} {}", worker_id, error_msg);
+                                RangeResult::DownloadFailed {
+                                    worker_id,
+                                    range,
+                                    error: error_msg,
+                                    retry_count,
+                                }
                             }
-                        }
-                        
-                        // 返回剩余的 range 用于重试
-                        let (remaining_start, remaining_end) = remaining_range.as_file_range();
-                        let error_msg = format!("下载被取消，剩余 range: {}..{}", remaining_start, remaining_end);
-                        debug!("Worker #{} {}", worker_id, error_msg);
-                        RangeResult::DownloadFailed {
-                            worker_id,
-                            range: remaining_range,
-                            error: error_msg,
-                            retry_count,
+                            _ => {
+                                // 使用 split_at 拆分 range，得到已下载部分和剩余部分
+                                use std::num::NonZeroU64;
+                                let bytes_downloaded = NonZeroU64::new(bytes_downloaded).unwrap();
+                                match range.split_at(bytes_downloaded) {
+                                    Ok((downloaded_range, remaining_range)) => {
+                                        // 写入已下载的部分
+                                        match self.writer.write_range(downloaded_range, data.as_ref()) {
+                                            Ok(_) => {
+                                                // 写入成功
+                                                debug!("Worker #{} 成功写入已下载的 {} bytes", worker_id, bytes_downloaded);
+                                            }
+                                            Err(e) => {
+                                                // 写入失败
+                                                error!("Worker #{} 写入已下载的部分数据失败: {:?}", worker_id, e);
+                                            }
+                                        }
+                                        
+                                        // 返回剩余的 range 用于重试
+                                        let error_msg = format!("下载被取消，剩余 range: {}..{}", remaining_range.start(), remaining_range.end());
+                                        debug!("Worker #{} {}", worker_id, error_msg);
+                                        return RangeResult::DownloadFailed {
+                                            worker_id,
+                                            range: remaining_range,
+                                            error: error_msg,
+                                            retry_count,
+                                        };
+                                    }
+                                    Err(e) => {
+                                        // pos >= end
+                                        error!("Worker #{} 无法拆分 range: bytes_downloaded={}, range={}..{}", 
+                                            worker_id, bytes_downloaded, start, end);
+                                        RangeResult::DownloadFailed {
+                                            worker_id,
+                                            range,
+                                            error: e.to_string(),
+                                            retry_count,
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -203,7 +241,7 @@ impl DownloadWorkerPool {
     pub(crate) fn new<C>(
         client: C,
         initial_worker_count: usize,
-        writer: Arc<RangeWriter>,
+        writer: MmapWriter,
         config: Arc<crate::config::DownloadConfig>,
     ) -> Result<Self>
     where
@@ -213,7 +251,7 @@ impl DownloadWorkerPool {
         let global_stats = TaskStats::from_config(config.speed());
 
         // 创建执行器（直接 move writer，避免 Arc 克隆）
-        let executor = Arc::new(DownloadWorkerExecutor::new(client, writer));
+        let executor = DownloadWorkerExecutor::new(client, writer);
 
         // 为每个 worker 创建独立的上下文和统计
         let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..initial_worker_count)
@@ -234,7 +272,7 @@ impl DownloadWorkerPool {
             .collect();
 
         // 创建通用协程池
-        let pool = WorkerPool::new(executor, contexts_with_stats)?;
+        let pool = WorkerPool::new(Arc::new(executor), contexts_with_stats)?;
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
@@ -443,12 +481,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_pool_creation() {
+        use std::num::NonZeroU64;
+        
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, _) = RangeWriter::new(save_path, 1000).await.unwrap();
-        let writer = Arc::new(writer);
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
 
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
@@ -459,18 +498,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_pool_send_task() {
+        use std::num::NonZeroU64;
+        
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = RangeWriter::new(save_path, 100).await.unwrap();
-        let writer = Arc::new(writer);
+        let (writer, mut allocator) = MmapWriter::new(save_path, NonZeroU64::new(100).unwrap()).unwrap();
 
         let config = Arc::new(crate::config::DownloadConfig::default());
         let pool = DownloadWorkerPool::new(client, 2, writer, config).unwrap();
 
         // 分配一个 range
-        let range = allocator.allocate(10).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
 
         let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let task = RangeTask::Range {
@@ -487,12 +527,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_pool_stats() {
+        use std::num::NonZeroU64;
+        
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, _) = RangeWriter::new(save_path, 1000).await.unwrap();
-        let writer = Arc::new(writer);
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
 
         let worker_count = 3;
         let config = Arc::new(crate::config::DownloadConfig::default());
@@ -510,12 +551,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_pool_shutdown() {
+        use std::num::NonZeroU64;
+        
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, _) = RangeWriter::new(save_path, 1000).await.unwrap();
-        let writer = Arc::new(writer);
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
 
         let config = Arc::new(crate::config::DownloadConfig::default());
         let mut pool = DownloadWorkerPool::new(client.clone(), 2, writer, config).unwrap();
@@ -534,6 +576,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_executor_success() {
+        use std::num::NonZeroU64;
+        
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJ"; // 20 bytes
 
@@ -541,12 +585,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = RangeWriter::new(save_path, test_data.len() as u64)
-            .await
-            .unwrap();
-        let writer = Arc::new(writer);
+        let (writer, mut allocator) = MmapWriter::new(save_path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
 
-        let range = allocator.allocate(test_data.len() as u64).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
 
         // 设置 Range 响应
         let mut headers = HeaderMap::new();
@@ -604,16 +645,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_executor_failure() {
+        use std::num::NonZeroU64;
+        
         let test_url = "http://example.com/file.bin";
 
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = RangeWriter::new(save_path, 100).await.unwrap();
-        let writer = Arc::new(writer);
+        let (writer, mut allocator) = MmapWriter::new(save_path, NonZeroU64::new(100).unwrap()).unwrap();
 
-        let range = allocator.allocate(10).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
 
         // 设置失败的 Range 响应
         client.set_range_response(

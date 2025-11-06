@@ -57,7 +57,7 @@ impl ProgressManager {
                 worker_count,
                 initial_chunk_size,
             } => {
-                self.main_bar.set_length(total_size);
+                self.main_bar.set_length(total_size.get());
                 self.main_bar.set_message(format!(
                     "{} workers, 初始分块: {}",
                     worker_count,
@@ -99,7 +99,7 @@ impl ProgressManager {
 
                 // 计算 ETA
                 let eta = if avg_speed > 0.0 {
-                    let remaining_bytes = total_size.saturating_sub(bytes_downloaded) as f64;
+                    let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded) as f64;
                     let eta_secs = remaining_bytes / avg_speed;
                     format!(", ETA: {}", format_duration(eta_secs))
                 } else {

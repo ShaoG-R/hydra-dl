@@ -3,11 +3,10 @@ use futures::StreamExt;
 use log::{debug, info};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use ranged_mmap::AllocatedRange;
 
 use crate::utils::io_traits::{HttpClient, HttpResponse, IoError};
-use crate::utils::range_writer::AllocatedRange;
 use crate::task::FileTask;
-use crate::utils::async_file::AsyncFile;
 use crate::utils::stats::WorkerStats;
 
 /// Fetch 操作错误类型
@@ -29,6 +28,10 @@ pub enum FetchError {
     #[error("Content-Range 格式错误，缺少 '/' 分隔符")]
     InvalidContentRangeFormat,
     
+    /// 范围无效
+    #[error("范围无效，start >= end")]
+    InvalidRange,
+    
     /// 无法解析文件总大小
     #[error("无法解析文件总大小为 u64: {0}")]
     InvalidContentRangeSize(String),
@@ -36,17 +39,149 @@ pub enum FetchError {
 
 pub type Result<T> = std::result::Result<T, FetchError>;
 
+// ============================================================================
+// FetchRange：专为 Fetch 设计的 Range 类型
+// ============================================================================
+
+/// Fetch 专用的 Range 类型
+/// 
+/// 用于处理 HTTP Range 请求的闭区间 `[start, end]` 和文件操作的半开区间 `[start, end)` 之间的转换。
+/// 
+/// # 区间格式说明
+/// 
+/// - **文件操作（半开区间）**：`[start, end)` - start 包含，end 不包含
+///   - 例如：`[0, 10)` 表示字节 0-9，共 10 字节
+///   - 这是 `AllocatedRange` 使用的格式
+/// 
+/// - **HTTP Range 请求（闭区间）**：`[start, end]` - start 和 end 都包含
+///   - 例如：`[0, 9]` 表示字节 0-9，共 10 字节
+///   - HTTP Range header 格式：`Range: bytes=0-9`
+/// 
+/// # 转换关系
+/// 
+/// - 文件范围 `[start, end)` → HTTP Range `[start, end-1]`
+/// - HTTP Range `[start, end]` → 文件范围 `[start, end+1)`
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// # use hydra_dl::utils::fetch::FetchRange;
+/// # use ranged_mmap::{MmapFile, AllocatedRange};
+/// # use std::num::NonZeroU64;
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // 从 AllocatedRange 创建
+/// let (file, mut allocator) = MmapFile::create("test.bin", NonZeroU64::new(1000).unwrap())?;
+/// let allocated = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
+/// let fetch_range = FetchRange::from_allocated_range(&allocated)?;
+/// 
+/// // 获取 HTTP Range（闭区间）
+/// let (http_start, http_end) = fetch_range.as_http_range();
+/// assert_eq!(http_start, 0);
+/// assert_eq!(http_end, 9); // end-1 因为 HTTP Range 是闭区间
+/// 
+/// // 获取文件范围（半开区间）
+/// let (file_start, file_end) = fetch_range.as_file_range();
+/// assert_eq!(file_start, 0);
+/// assert_eq!(file_end, 10); // 半开区间
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchRange {
+    /// 范围起始位置（包含）
+    start: u64,
+    
+    /// 范围结束位置（不包含）- 文件操作使用的半开区间格式
+    end: u64,
+}
+
+impl FetchRange {
+
+    /// 从 AllocatedRange 创建
+    #[inline]
+    pub fn from_allocated_range(range: &AllocatedRange) -> Result<Self> {
+        if range.start() >= range.end() {
+            return Err(FetchError::InvalidRange);
+        }
+        Ok(Self {
+            start: range.start(),
+            end: range.end(),
+        })
+    }
+    
+    /// 获取 HTTP Range 格式（闭区间 `[start, end]`）
+    /// 
+    /// 返回用于 HTTP Range 请求的闭区间。
+    /// 
+    /// # Returns
+    /// `(start, end)` - 其中 start 和 end 都是包含的
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// # use hydra_dl::utils::fetch::FetchRange;
+    /// # use ranged_mmap::{MmapFile, AllocatedRange};
+    /// # use std::num::NonZeroU64;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let (file, mut allocator) = MmapFile::create("test.bin", NonZeroU64::new(1000).unwrap())?;
+    /// let allocated = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
+    /// let range = FetchRange::from_allocated_range(&allocated)?;
+    /// let (http_start, http_end) = range.as_http_range();
+    /// assert_eq!(http_start, 0);
+    /// assert_eq!(http_end, 9); // 文件的 [0, 10) 对应 HTTP 的 [0, 9]
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn as_http_range(&self) -> (u64, u64) {
+        // HTTP Range 是闭区间 [start, end]
+        // 文件范围 [start, end) 转换为 HTTP Range [start, end-1]
+        (self.start, self.end.saturating_sub(1))
+    }
+    
+    /// 获取文件范围格式（半开区间 `[start, end)`）
+    /// 
+    /// 返回用于文件操作的半开区间。
+    /// 
+    /// # Returns
+    /// `(start, end)` - 其中 start 包含，end 不包含
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// # use hydra_dl::utils::fetch::FetchRange;
+    /// # use ranged_mmap::{MmapFile, AllocatedRange};
+    /// # use std::num::NonZeroU64;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let (file, mut allocator) = MmapFile::create("test.bin", NonZeroU64::new(1000).unwrap())?;
+    /// let allocated = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
+    /// let range = FetchRange::from_allocated_range(&allocated)?;
+    /// let (file_start, file_end) = range.as_file_range();
+    /// assert_eq!(file_start, 0);
+    /// assert_eq!(file_end, 10); // 半开区间
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn as_file_range(&self) -> (u64, u64) {
+        (self.start, self.end)
+    }
+}
+
+
 /// fetch_range 的返回结果
 #[derive(Debug, Clone)]
 pub enum FetchRangeResult {
     /// 下载完成
     Complete(Bytes),
-    /// 下载被取消（包含已下载的部分数据和剩余需要下载的 range）
+    /// 下载被取消（包含已下载的部分数据和已下载的字节数）
     Cancelled {
         /// 已下载的部分数据
         data: Bytes,
-        /// 剩余需要下载的 range
-        remaining_range: AllocatedRange,
+        /// 已下载的字节数
+        /// 
+        /// 调用方可以使用此值配合 `AllocatedRange::split_at` 方法来拆分原始 range
+        bytes_downloaded: u64,
     },
 }
 
@@ -204,6 +339,8 @@ pub fn generate_timestamp_filename() -> String {
 }
 
 /// 获取并保存完整文件
+/// 
+/// 用于不支持 Range 请求的文件下载，使用标准的流式写入
 pub async fn fetch_file<C>(
     client: &C,
     task: FileTask,
@@ -211,6 +348,8 @@ pub async fn fetch_file<C>(
 where
     C: HttpClient,
 {
+    use tokio::io::AsyncWriteExt;
+    
     info!("开始下载: {} -> {:?}", task.url, task.save_path);
 
     let response = client.get(&task.url).await?;
@@ -219,25 +358,23 @@ where
         return Err(FetchError::HttpStatus(response.status().as_u16()));
     }
 
-    // 创建文件
-    let file = AsyncFile::create(&task.save_path).await
+    // 创建文件（使用标准的 tokio::fs::File）
+    let mut file = tokio::fs::File::create(&task.save_path).await
         .map_err(IoError::FileCreate)?;
 
     // 流式下载
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
-    let mut offset: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         let chunk_len = chunk.len() as u64;
         
-        // 使用 write_all_at 写入数据
-        file.write_all_at(offset, &chunk).await
+        // 写入数据
+        file.write_all(&chunk).await
             .map_err(IoError::FileWrite)?;
         
         downloaded += chunk_len;
-        offset += chunk_len;
     }
 
     // 刷新到磁盘
@@ -258,7 +395,7 @@ where
 pub struct RangeFetcher<'a, C: HttpClient> {
     client: &'a C,
     url: &'a str,
-    range: AllocatedRange,
+    range: FetchRange,
     stats: &'a WorkerStats,
 }
 
@@ -270,10 +407,10 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     /// * `url` - 下载 URL
     /// * `range` - 已分配的 Range，定义要下载的字节范围
     /// * `stats` - 共享的下载统计，每个 chunk 到达时实时更新
-    pub fn new(
+    pub(crate) fn new(
         client: &'a C,
         url: &'a str,
-        range: AllocatedRange,
+        range: FetchRange,
         stats: &'a WorkerStats,
     ) -> Self {
         Self { client, url, range, stats }
@@ -321,7 +458,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     /// 
     /// 返回 `FetchRangeResult`：
     /// - `Complete(Bytes)`: 下载完整完成，包含所有请求的数据
-    /// - `Cancelled { data, remaining_range }`: 下载被取消，包含已下载的部分数据和剩余需要下载的 range
+    /// - `Cancelled { data, bytes_downloaded }`: 下载被取消，包含已下载的部分数据和已下载的字节数
     pub async fn fetch_with_cancel(
         self,
         cancel_rx: tokio::sync::oneshot::Receiver<()>,
@@ -350,12 +487,10 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
                     start, end, data.len()
                 );
             }
-            FetchRangeResult::Cancelled { data, remaining_range } => {
-                let (remaining_start, remaining_end) = remaining_range.as_file_range();
+            FetchRangeResult::Cancelled { bytes_downloaded, .. } => {
                 debug!(
-                    "Range {}..{} 下载被取消，已下载: {} bytes，剩余 range: {}..{}",
-                    start, end, data.len(),
-                    remaining_start, remaining_end
+                    "Range {}..{} 下载被取消，已下载: {} bytes",
+                    start, end, bytes_downloaded
                 );
             }
         }
@@ -416,14 +551,10 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
                     }
                 }
                 _ = &mut cancel_rx => {
-                    // 收到取消信号，计算剩余需要下载的 range
-                    let (start, end) = self.range.as_file_range();
-                    let new_start = start + downloaded_bytes;
-                    let remaining_range = AllocatedRange::from_file_range(new_start, end);
-                    
+                    // 收到取消信号，返回已下载的字节数
                     return Ok(FetchRangeResult::Cancelled {
                         data: buffer.freeze(),
-                        remaining_range,
+                        bytes_downloaded: downloaded_bytes,
                     });
                 }
             }
@@ -667,7 +798,7 @@ where
 mod tests {
     use super::*;
     use crate::utils::io_traits::mock::{MockHttpClient, MockHttpResponse};
-    use crate::utils::range_writer::RangeAllocator;
+    use ranged_mmap::MmapFile;
     use reqwest::header::HeaderMap;
     use reqwest::StatusCode;
     use std::path::PathBuf;
@@ -739,16 +870,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_range_success() {
+        use std::num::NonZeroU64;
+        use tempfile::tempdir;
+        
         let test_url = "http://example.com/file.bin";
         let full_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         
         let client = MockHttpClient::new();
         let stats = WorkerStats::default();
 
-        // 创建一个 RangeAllocator 来生成 AllocatedRange
-        // RangeAllocator 总是从 0 开始分配
-        let mut allocator = RangeAllocator::new(full_data.len() as u64);
-        let range = allocator.allocate(10).unwrap(); // 分配 10 bytes，范围是 0-9
+        // 创建临时文件和 allocator
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(full_data.len() as u64).unwrap()).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap(); // 分配 10 bytes，范围是 0-9
         
         // range.start() = 0, range.end() = 10
         let expected_data = &full_data[0..10]; // "0123456789"
@@ -766,7 +901,8 @@ mod tests {
         );
 
         // 执行下载（不可取消版本）
-        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch().await;
+        let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch().await;
         assert!(result.is_ok(), "Range 下载应该成功: {:?}", result);
 
         let data = result.unwrap();
@@ -779,12 +915,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_range_http_error() {
+        use std::num::NonZeroU64;
+        use tempfile::tempdir;
+        
         let test_url = "http://example.com/file.bin";
         let client = MockHttpClient::new();
         let stats = WorkerStats::default();
 
-        let mut allocator = RangeAllocator::new(100);
-        let range = allocator.allocate(10).unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(100).unwrap()).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
 
         // 设置错误响应
         client.set_range_response(
@@ -797,7 +938,8 @@ mod tests {
         );
 
         // 执行下载（不可取消版本）
-        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch().await;
+        let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch().await;
         assert!(result.is_err(), "应该返回错误");
     }
 
@@ -879,6 +1021,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_range_chunked_stream() {
+        use std::num::NonZeroU64;
+        use tempfile::tempdir;
+        
         // 测试流式传输，确保大数据被正确分块处理
         let test_url = "http://example.com/large_file.bin";
         
@@ -890,8 +1035,10 @@ mod tests {
         let client = MockHttpClient::new();
         let stats = WorkerStats::default();
 
-        let mut allocator = RangeAllocator::new(end);
-        let range = allocator.allocate(end).unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(end).unwrap()).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(end).unwrap()).unwrap();
 
         // 设置 Range 响应
         let mut headers = HeaderMap::new();
@@ -906,7 +1053,8 @@ mod tests {
         );
 
         // 执行下载（不可取消版本）
-        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch().await;
+        let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch().await;
         assert!(result.is_ok(), "大数据 Range 下载应该成功");
 
         let data = result.unwrap();
@@ -920,6 +1068,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_range_with_cancel() {
+        use std::num::NonZeroU64;
+        use tempfile::tempdir;
+        
         // 测试取消功能
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
@@ -927,8 +1078,10 @@ mod tests {
         let client = MockHttpClient::new();
         let stats = WorkerStats::default();
 
-        let mut allocator = RangeAllocator::new(test_data.len() as u64);
-        let range = allocator.allocate(test_data.len() as u64).unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
 
         // 设置 Range 响应
         let mut headers = HeaderMap::new();
@@ -953,20 +1106,17 @@ mod tests {
         });
 
         // 执行下载（可取消版本）
-        let result = RangeFetcher::new(&client, test_url, range, &stats).fetch_with_cancel(cancel_rx).await;
+        let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &stats).fetch_with_cancel(cancel_rx).await;
         assert!(result.is_ok(), "调用应该成功");
 
         // 验证返回的是 Cancelled 变体（注意：由于 Mock 实现可能一次性返回所有数据，可能会返回 Complete）
         match result.unwrap() {
-            FetchRangeResult::Cancelled { data, remaining_range } => {
+            FetchRangeResult::Cancelled { data, bytes_downloaded } => {
                 // 应该有部分数据（或可能没有，取决于取消的时机）
                 assert!(data.len() <= test_data.len(), "取消时的数据不应该超过总大小");
-                // 验证剩余 range 的正确性
-                let expected_start = data.len() as u64;
-                let expected_end = test_data.len() as u64;
-                let (remaining_start, remaining_end) = remaining_range.as_file_range();
-                assert_eq!(remaining_start, expected_start, "剩余 range 的起始位置应该匹配");
-                assert_eq!(remaining_end, expected_end, "剩余 range 的结束位置应该匹配");
+                // 验证已下载字节数的正确性
+                assert_eq!(bytes_downloaded, data.len() as u64, "已下载字节数应该匹配数据长度");
             }
             FetchRangeResult::Complete(data) => {
                 // 如果 Mock 一次性返回了所有数据，在取消信号到达之前就完成了

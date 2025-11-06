@@ -21,9 +21,11 @@ indicatif = "0.18.2"
 url = "2.5"
 urlencoding = "2.1"
 arc-swap = "1.7.1"
-kestrel-timer = "0.2.5"
 rustc-hash = "2.1.1"
 portable-atomic = "1.11.1"
+
+kestrel-timer = "0.2.5"
+ranged-mmap = "0.1.1"
 
 
 [dev-dependencies]

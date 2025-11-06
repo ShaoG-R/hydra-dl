@@ -3,12 +3,13 @@
 //! 负责管理任务分配、空闲 worker 队列和失败任务重试
 
 use crate::{Result, DownloadError};
-use crate::utils::range_writer::{AllocatedRange, RangeAllocator};
 use crate::task::WorkerTask;
 use kestrel_timer::{TaskId, TimerService, TimerTask};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use log::{debug, error};
+use ranged_mmap::{AllocatedRange, RangeAllocator};
 
 /// 失败的 Range 信息
 pub(super) type FailedRange = (AllocatedRange, String);
@@ -92,7 +93,7 @@ impl TaskAllocator {
         
         // 优先从重试队列中取任务
         if let Some(retry_info) = self.ready_retry_queue.pop_front() {
-            let (start, end) = retry_info.range.as_file_range();
+            let (start, end) = retry_info.range.as_range_tuple();
             debug!(
                 "从重试队列分配任务 range {}..{}, 重试次数 {}",
                 start,
@@ -129,7 +130,7 @@ impl TaskAllocator {
         let alloc_size = chunk_size.min(remaining);
         
         // 分配 range
-        let range = self.allocator.allocate(alloc_size)?;
+        let range = self.allocator.allocate(NonZeroU64::new(alloc_size).unwrap()).ok()?;
         
         // 创建取消通道
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -185,7 +186,7 @@ impl TaskAllocator {
     /// 
     /// * `task_info` - 失败任务信息
     pub(super) fn push_ready_retry_task(&mut self, task_info: FailedTaskInfo) {
-        let (start, end) = task_info.range.as_file_range();
+        let (start, end) = task_info.range.as_range_tuple();
         debug!(
             "推入重试任务到就绪队列 range {}..{}, 重试次数 {}",
             start,
@@ -214,7 +215,7 @@ impl TaskAllocator {
         delay: std::time::Duration,
         timer_service: &TimerService,
     ) -> Result<()> {
-        let (start, end) = range.as_file_range();
+        let (start, end) = range.as_range_tuple();
         debug!(
             "记录失败任务 range {}..{}, 重试次数 {}, 将在 {:.1}s 后重试",
             start,
@@ -247,7 +248,7 @@ impl TaskAllocator {
     /// * `range` - 失败的 range
     /// * `error` - 错误信息
     pub(super) fn record_permanent_failure(&mut self, range: AllocatedRange, error: String) {
-        let (start, end) = range.as_file_range();
+        let (start, end) = range.as_range_tuple();
         error!(
             "任务永久失败 range {}..{}: {}",
             start,
@@ -283,227 +284,387 @@ impl TaskAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::range_writer::RangeAllocator;
     use kestrel_timer::{TimerWheel, config::ServiceConfig};
 
-    #[test]
-    fn test_task_allocator_basic() {
-        let allocator = RangeAllocator::new(1000);
-        let task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+    /// 创建测试用的 TaskAllocator
+    /// 
+    /// 通过创建临时文件来获取 RangeAllocator
+    fn create_test_allocator(size: u64) -> TaskAllocator {
+        use tempfile::NamedTempFile;
+        use ranged_mmap::MmapFile;
         
-        // 初始状态
-        assert_eq!(task_allocator.remaining(), 1000);
-        assert_eq!(task_allocator.pending_retry_count(), 0);
-        assert!(!task_allocator.has_permanent_failures());
+        let temp_file = NamedTempFile::new().unwrap();
+        let (_file, allocator) = MmapFile::create(temp_file.path(), NonZeroU64::new(size).unwrap()).unwrap();
+        TaskAllocator::new(allocator, "http://example.com/file.bin".to_string())
+    }
+    
+    /// 从 TaskAllocator 中分配一个 range（用于测试）
+    /// 
+    /// 直接从底层的 RangeAllocator 分配，不经过任务分配逻辑
+    fn allocate_range_from(allocator: &mut TaskAllocator, size: u64) -> AllocatedRange {
+        allocator.allocator.allocate(NonZeroU64::new(size).unwrap())
+            .expect("Failed to allocate range")
     }
 
     #[test]
-    fn test_mark_worker_idle_and_allocate() {
-        let allocator = RangeAllocator::new(1000);
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+    fn test_initial_state() {
+        let allocator = create_test_allocator(1000);
+        
+        // 初始状态验证
+        assert_eq!(allocator.remaining(), 1000);
+        assert_eq!(allocator.pending_retry_count(), 0);
+        assert!(!allocator.has_permanent_failures());
+        assert_eq!(allocator.url(), "http://example.com/file.bin");
+        assert_eq!(allocator.idle_workers.len(), 0);
+    }
+
+    #[test]
+    fn test_idle_worker_management() {
+        let mut allocator = create_test_allocator(1000);
+        
+        // 测试添加空闲 worker
+        allocator.mark_worker_idle(0);
+        allocator.mark_worker_idle(1);
+        allocator.mark_worker_idle(2);
+        
+        assert_eq!(allocator.idle_workers.len(), 3);
+        assert_eq!(allocator.idle_workers.front(), Some(&0));
+        
+        // 测试 FIFO 顺序
+        allocator.mark_worker_idle(3);
+        assert_eq!(allocator.idle_workers.len(), 4);
+        assert_eq!(allocator.idle_workers.back(), Some(&3));
+    }
+
+    #[test]
+    fn test_allocate_new_task_to_idle_worker() {
+        let mut allocator = create_test_allocator(1000);
         
         // 标记 worker 为空闲
-        task_allocator.mark_worker_idle(0);
-        task_allocator.mark_worker_idle(1);
+        allocator.mark_worker_idle(5);
         
-        assert_eq!(task_allocator.idle_workers.len(), 2);
-        
-        // 分配任务给第一个空闲 worker
-        let result = task_allocator.try_allocate_task_to_idle_worker(100);
+        // 分配新任务
+        let result = allocator.try_allocate_task_to_idle_worker(100);
         assert!(result.is_some());
         
         let allocated = result.unwrap();
         let (task, worker_id, _cancel_tx) = allocated.into_parts();
-        assert_eq!(worker_id, 0); // 应该分配给第一个空闲的 worker
         
-        // 验证任务
+        // 验证分配结果
+        assert_eq!(worker_id, 5);
         match task {
             WorkerTask::Range { url, range, retry_count, .. } => {
-                assert_eq!(url, "http://example.com/file");
-                let (start, end) = range.as_file_range();
-                assert_eq!(start, 0);
-                assert_eq!(end, 100);
-                assert_eq!(retry_count, 0);
+                assert_eq!(url, "http://example.com/file.bin");
+                assert_eq!(range.len(), 100);
+                assert_eq!(retry_count, 0); // 新任务重试次数为 0
             }
         }
         
-        // 剩余空间应该减少
-        assert_eq!(task_allocator.remaining(), 900);
-        
-        // 空闲队列应该少了一个
-        assert_eq!(task_allocator.idle_workers.len(), 1);
+        // 空闲队列应该为空
+        assert_eq!(allocator.idle_workers.len(), 0);
+        assert_eq!(allocator.remaining(), 900);
     }
 
     #[test]
-    fn test_allocate_with_no_idle_workers() {
-        let allocator = RangeAllocator::new(1000);
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+    fn test_no_allocation_without_idle_workers() {
+        let mut allocator = create_test_allocator(1000);
         
-        // 没有空闲 worker
-        let result = task_allocator.try_allocate_task_to_idle_worker(100);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_allocate_with_no_remaining_space() {
-        let allocator = RangeAllocator::new(0); // 没有剩余空间
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
-        
-        task_allocator.mark_worker_idle(0);
-        
-        // 尝试分配但没有剩余空间
-        let result = task_allocator.try_allocate_task_to_idle_worker(100);
+        // 没有空闲 worker，不应该分配任务
+        let result = allocator.try_allocate_task_to_idle_worker(100);
         assert!(result.is_none());
         
-        // Worker 应该被放回队列
-        assert_eq!(task_allocator.idle_workers.len(), 1);
+        // 状态不应该改变
+        assert_eq!(allocator.remaining(), 1000);
     }
 
     #[test]
-    fn test_allocate_respects_chunk_size() {
-        let allocator = RangeAllocator::new(1000);
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+    fn test_no_allocation_when_space_exhausted() {
+        let mut allocator = create_test_allocator(100);
         
-        task_allocator.mark_worker_idle(0);
+        // 分配所有空间
+        allocator.mark_worker_idle(0);
+        let _ = allocator.try_allocate_task_to_idle_worker(100).unwrap();
         
-        // 分配 250 字节
-        let result = task_allocator.try_allocate_task_to_idle_worker(250);
+        assert_eq!(allocator.remaining(), 0);
+        
+        // 再次尝试分配
+        allocator.mark_worker_idle(1);
+        let result = allocator.try_allocate_task_to_idle_worker(100);
+        
+        // 应该返回 None，但 worker 应该被放回队列
+        assert!(result.is_none());
+        assert_eq!(allocator.idle_workers.len(), 1);
+        assert_eq!(allocator.idle_workers.front(), Some(&1));
+    }
+
+    #[test]
+    fn test_retry_task_has_priority() {
+        let mut allocator = create_test_allocator(1000);
+        
+        // 先分配一个 range，然后将它作为重试任务
+        let range = allocate_range_from(&mut allocator, 100);
+        let retry_info = FailedTaskInfo {
+            range,
+            retry_count: 2,
+        };
+        allocator.push_ready_retry_task(retry_info);
+        
+        // 标记 worker 为空闲
+        allocator.mark_worker_idle(0);
+        
+        // 分配任务，应该优先分配重试任务
+        let result = allocator.try_allocate_task_to_idle_worker(200);
         assert!(result.is_some());
         
         let allocated = result.unwrap();
-        let (task, _, _cancel_tx) = allocated.into_parts();
+        let (task, worker_id, _cancel_tx) = allocated.into_parts();
+        
+        assert_eq!(worker_id, 0);
         match task {
-            WorkerTask::Range { range, .. } => {
-                assert_eq!(range.len(), 250);
+            WorkerTask::Range { range, retry_count, .. } => {
+                assert_eq!(range.len(), 100); // 重试任务的大小，不是 200
+                assert_eq!(retry_count, 2); // 重试次数应该保持
             }
         }
         
-        assert_eq!(task_allocator.remaining(), 750);
+        // 重试队列应该为空
+        assert_eq!(allocator.ready_retry_queue.len(), 0);
+        // remaining 应该是 900（因为我们之前分配了 100）
+        assert_eq!(allocator.remaining(), 900);
     }
 
     #[test]
-    fn test_allocate_caps_at_remaining() {
-        let allocator = RangeAllocator::new(100);
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+    fn test_push_and_allocate_multiple_retry_tasks() {
+        let mut allocator = create_test_allocator(1000);
         
-        task_allocator.mark_worker_idle(0);
+        // 分配两个 range 作为重试任务
+        let range1 = allocate_range_from(&mut allocator, 100);
+        let range2 = allocate_range_from(&mut allocator, 100);
         
-        // 请求 500 字节但只剩 100 字节
-        let result = task_allocator.try_allocate_task_to_idle_worker(500);
-        assert!(result.is_some());
+        allocator.push_ready_retry_task(FailedTaskInfo {
+            range: range1,
+            retry_count: 1,
+        });
+        allocator.push_ready_retry_task(FailedTaskInfo {
+            range: range2,
+            retry_count: 2,
+        });
         
-        let allocated = result.unwrap();
-        let (task, _, _cancel_tx) = allocated.into_parts();
-        match task {
-            WorkerTask::Range { range, .. } => {
-                assert_eq!(range.len(), 100); // 应该被限制在剩余空间
+        assert_eq!(allocator.pending_retry_count(), 2);
+        
+        // 分配第一个重试任务
+        allocator.mark_worker_idle(0);
+        let result1 = allocator.try_allocate_task_to_idle_worker(500);
+        assert!(result1.is_some());
+        
+        let (task1, _, _) = result1.unwrap().into_parts();
+        match task1 {
+            WorkerTask::Range { range, retry_count, .. } => {
+                assert_eq!(range.start(), 0);
+                assert_eq!(range.end(), 100);
+                assert_eq!(retry_count, 1);
             }
         }
         
-        assert_eq!(task_allocator.remaining(), 0);
+        // 分配第二个重试任务
+        allocator.mark_worker_idle(1);
+        let result2 = allocator.try_allocate_task_to_idle_worker(500);
+        assert!(result2.is_some());
+        
+        let (task2, _, _) = result2.unwrap().into_parts();
+        match task2 {
+            WorkerTask::Range { range, retry_count, .. } => {
+                assert_eq!(range.start(), 100);
+                assert_eq!(range.end(), 200);
+                assert_eq!(retry_count, 2);
+            }
+        }
+        
+        assert_eq!(allocator.pending_retry_count(), 0);
     }
 
     #[tokio::test]
-    async fn test_record_and_pop_failed_task() {
-        let allocator = RangeAllocator::new(1000);
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+    async fn test_record_failed_task_with_timer() {
+        let mut allocator = create_test_allocator(1000);
+        
+        // 创建定时器服务
+        let timer = TimerWheel::with_defaults();
+        let timer_service = timer.create_service(ServiceConfig::default());
+        
+        // 分配一个 range 作为失败任务
+        let range = allocate_range_from(&mut allocator, 100);
+        
+        // 记录失败任务
+        let result = allocator.record_failed_task(
+            range,
+            1,
+            std::time::Duration::from_millis(100),
+            &timer_service,
+        );
+        
+        assert!(result.is_ok());
+        assert_eq!(allocator.pending_retry_count(), 1);
+        assert_eq!(allocator.failed_tasks.len(), 1);
+        assert_eq!(allocator.ready_retry_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pop_failed_task_after_timer() {
+        let mut allocator = create_test_allocator(1000);
         
         // 创建定时器服务
         let timer = TimerWheel::with_defaults();
         let mut timer_service = timer.create_service(ServiceConfig::default());
         
-        // 分配一个 range 来模拟失败
-        task_allocator.mark_worker_idle(0);
-        let allocated = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
-        let (task, _, _cancel_tx) = allocated.into_parts();
-        let range = match task {
-            WorkerTask::Range { range, .. } => range,
-        };
+        // 分配一个 range
+        let range = allocate_range_from(&mut allocator, 100);
+        let (start, end) = range.as_range_tuple();
         
         // 记录失败任务
-        let result = task_allocator.record_failed_task(
-            range.clone(),
-            1,
-            std::time::Duration::from_millis(100),
+        allocator.record_failed_task(
+            range,
+            3,
+            std::time::Duration::from_millis(50),
             &timer_service,
-        );
-        assert!(result.is_ok());
+        ).unwrap();
         
-        // 应该有一个待重试的任务
-        assert_eq!(task_allocator.pending_retry_count(), 1);
-        
-        // 获取定时器 ID（从 timer_service 获取下一个超时）
+        // 获取接收器
         let timeout_rx = timer_service.take_receiver().unwrap();
         
         // 等待定时器触发
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         
         if let Some(timer_id) = timeout_rx.recv().await {
             // 取出失败任务
-            let failed_info = task_allocator.pop_failed_task(timer_id.task_id());
+            let failed_info = allocator.pop_failed_task(timer_id.task_id());
             assert!(failed_info.is_some());
             
             let info = failed_info.unwrap();
-            assert_eq!(info.retry_count, 1);
-            let (info_start, info_end) = info.range.as_file_range();
-            let (range_start, range_end) = range.as_file_range();
-            assert_eq!(info_start, range_start);
-            assert_eq!(info_end, range_end);
+            assert_eq!(info.retry_count, 3);
+            assert_eq!(info.range.start(), start);
+            assert_eq!(info.range.end(), end);
             
-            // 取出后应该没有待重试的任务了
-            assert_eq!(task_allocator.pending_retry_count(), 0);
+            // 从 failed_tasks 中移除后，pending_retry_count 应该减少
+            assert_eq!(allocator.pending_retry_count(), 0);
         }
     }
 
     #[test]
     fn test_record_permanent_failure() {
-        let allocator = RangeAllocator::new(1000);
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+        let mut allocator = create_test_allocator(1000);
         
-        // 分配一个 range
-        task_allocator.mark_worker_idle(0);
-        let allocated = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
-        let (task, _, _cancel_tx) = allocated.into_parts();
-        let range = match task {
-            WorkerTask::Range { range, .. } => range,
-        };
+        let range = allocate_range_from(&mut allocator, 100);
+        allocator.record_permanent_failure(range, "Network timeout".to_string());
         
-        // 记录永久失败
-        task_allocator.record_permanent_failure(range.clone(), "Connection timeout".to_string());
+        assert!(allocator.has_permanent_failures());
         
-        assert!(task_allocator.has_permanent_failures());
-        
-        let failures = task_allocator.get_permanent_failures();
+        let failures = allocator.get_permanent_failures();
         assert_eq!(failures.len(), 1);
-        let (failure_start, failure_end) = failures[0].0.as_file_range();
-        let (range_start, range_end) = range.as_file_range();
-        assert_eq!(failure_start, range_start);
-        assert_eq!(failure_end, range_end);
-        assert_eq!(failures[0].1, "Connection timeout");
+        assert_eq!(failures[0].0.start(), 0);
+        assert_eq!(failures[0].0.end(), 100);
+        assert_eq!(failures[0].1, "Network timeout");
     }
 
     #[test]
     fn test_multiple_permanent_failures() {
-        let allocator = RangeAllocator::new(1000);
-        let mut task_allocator = TaskAllocator::new(allocator, "http://example.com/file".to_string());
+        let mut allocator = create_test_allocator(1000);
         
-        task_allocator.mark_worker_idle(0);
-        task_allocator.mark_worker_idle(1);
+        let range1 = allocate_range_from(&mut allocator, 100);
+        let range2 = allocate_range_from(&mut allocator, 100);
+        let range3 = allocate_range_from(&mut allocator, 100);
         
-        // 分配并失败两个任务
-        let allocated1 = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
-        let (task1, _, _cancel_tx1) = allocated1.into_parts();
-        let range1 = match task1 { WorkerTask::Range { range, .. } => range };
+        allocator.record_permanent_failure(range1, "Error 1".to_string());
+        allocator.record_permanent_failure(range2, "Error 2".to_string());
+        allocator.record_permanent_failure(range3, "Error 3".to_string());
         
-        let allocated2 = task_allocator.try_allocate_task_to_idle_worker(100).unwrap();
-        let (task2, _, _cancel_tx2) = allocated2.into_parts();
-        let range2 = match task2 { WorkerTask::Range { range, .. } => range };
+        assert!(allocator.has_permanent_failures());
         
-        task_allocator.record_permanent_failure(range1, "Error 1".to_string());
-        task_allocator.record_permanent_failure(range2, "Error 2".to_string());
+        let failures = allocator.get_permanent_failures();
+        assert_eq!(failures.len(), 3);
+        assert_eq!(failures[0].1, "Error 1");
+        assert_eq!(failures[1].1, "Error 2");
+        assert_eq!(failures[2].1, "Error 3");
+    }
+
+    #[test]
+    fn test_pending_retry_count_accuracy() {
+        let mut allocator = create_test_allocator(1000);
         
-        assert!(task_allocator.has_permanent_failures());
-        assert_eq!(task_allocator.get_permanent_failures().len(), 2);
+        // 初始为 0
+        assert_eq!(allocator.pending_retry_count(), 0);
+        
+        // 添加就绪重试任务
+        let range1 = allocate_range_from(&mut allocator, 100);
+        allocator.push_ready_retry_task(FailedTaskInfo {
+            range: range1,
+            retry_count: 1,
+        });
+        assert_eq!(allocator.pending_retry_count(), 1);
+        
+        // 添加更多就绪任务
+        let range2 = allocate_range_from(&mut allocator, 100);
+        allocator.push_ready_retry_task(FailedTaskInfo {
+            range: range2,
+            retry_count: 2,
+        });
+        assert_eq!(allocator.pending_retry_count(), 2);
+        
+        // 模拟添加定时器等待中的任务（通过直接操作 failed_tasks）
+        // 注意：TaskId 是一个不透明类型，我们需要使用 TimerTask 来生成真实的 TaskId
+        use kestrel_timer::TimerTask;
+        let timer_task = TimerTask::new_oneshot(std::time::Duration::from_secs(10), None);
+        let timer_id = timer_task.get_id();
+        
+        let range3 = allocate_range_from(&mut allocator, 100);
+        allocator.failed_tasks.insert(timer_id, FailedTaskInfo {
+            range: range3,
+            retry_count: 3,
+        });
+        
+        // 应该包括就绪队列和等待队列
+        assert_eq!(allocator.pending_retry_count(), 3);
+    }
+
+    #[test]
+    fn test_allocate_respects_remaining_space() {
+        let mut allocator = create_test_allocator(500);
+        
+        allocator.mark_worker_idle(0);
+        
+        // 请求 1000 字节，但只有 500 字节
+        let result = allocator.try_allocate_task_to_idle_worker(1000);
+        assert!(result.is_some());
+        
+        let (task, _, _) = result.unwrap().into_parts();
+        match task {
+            WorkerTask::Range { range, .. } => {
+                assert_eq!(range.len(), 500); // 应该被限制为剩余空间
+            }
+        }
+        
+        assert_eq!(allocator.remaining(), 0);
+    }
+
+    #[test]
+    fn test_cancel_channel_created_for_each_task() {
+        let mut allocator = create_test_allocator(1000);
+        
+        allocator.mark_worker_idle(0);
+        let result = allocator.try_allocate_task_to_idle_worker(100);
+        assert!(result.is_some());
+        
+        let allocated = result.unwrap();
+        let (task, _, cancel_tx) = allocated.into_parts();
+        
+        // 验证 cancel_rx 存在于任务中
+        match task {
+            WorkerTask::Range { mut cancel_rx, .. } => {
+                // 验证通道有效性
+                // 如果 cancel_tx 被 drop，cancel_rx 会收到 Err
+                drop(cancel_tx);
+                assert!(cancel_rx.try_recv().is_err()); // 已经被 drop，会返回错误
+            }
+        }
     }
 }
 

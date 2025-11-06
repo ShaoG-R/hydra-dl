@@ -1,5 +1,7 @@
+use crate::utils::writer::MmapWriter;
 use crate::{DownloadError, Result};
 use log::{debug, error, info, warn};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -7,9 +9,9 @@ use tokio::task::JoinHandle;
 use kestrel_timer::{TimerService, TaskId};
 use crate::pool::download::DownloadWorkerPool;
 use crate::utils::io_traits::{HttpClient};
-use crate::utils::range_writer::{RangeAllocator, RangeWriter, AllocatedRange};
 use crate::task::RangeResult;
 use std::collections::HashMap;
+use ranged_mmap::{RangeAllocator, AllocatedRange};
 
 mod progressive;
 mod task_allocator;
@@ -52,7 +54,7 @@ pub enum DownloadProgress {
     /// 下载已开始
     Started { 
         /// 文件总大小（bytes）
-        total_size: u64,
+        total_size: NonZeroU64,
         /// Worker 数量
         worker_count: usize,
         /// 初始分块大小（bytes）
@@ -63,7 +65,7 @@ pub enum DownloadProgress {
         /// 已下载字节数
         bytes_downloaded: u64,
         /// 文件总大小（bytes）
-        total_size: u64,
+        total_size: NonZeroU64,
         /// 下载百分比 (0.0 ~ 100.0)
         percentage: f64,
         /// 平均速度 (bytes/s)
@@ -200,13 +202,13 @@ struct DownloadTaskParams<C: HttpClient> {
     /// 进度更新发送器
     progress_sender: Option<Sender<DownloadProgress>>,
     /// 文件写入器
-    writer: Arc<RangeWriter>,
+    writer: MmapWriter,
     /// Range 分配器
     allocator: RangeAllocator,
     /// 下载 URL
     url: String,
     /// 文件总大小（字节）
-    total_size: u64,
+    total_size: NonZeroU64,
     /// 定时器服务
     timer_service: TimerService,
     /// 下载配置
@@ -222,7 +224,7 @@ struct DownloadTask<C: HttpClient> {
     /// Worker 协程池
     pool: DownloadWorkerPool,
     /// 文件写入器
-    writer: Arc<RangeWriter>,
+    writer: MmapWriter,
     /// 任务分配器
     task_allocator: TaskAllocator,
     /// 进度报告器
@@ -267,7 +269,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let pool = DownloadWorkerPool::new(
             client.clone(),
             initial_worker_count,
-            Arc::clone(&writer),
+            writer.clone(),
             Arc::clone(&config),
         )?;
         
@@ -376,7 +378,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             return LoopControl::Continue;
         };
         
-        let (start, end) = info.range.as_file_range();
+        let (start, end) = info.range.as_range_tuple();
         info!(
             "定时器触发，重试任务 range {}..{}, 重试次数 {}",
             start,
@@ -428,7 +430,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             }
             RangeResult::WriteFailed { worker_id, range, error, .. } => {
                 // 写入失败通常是致命的（磁盘满、权限问题等），直接终止下载
-                let (start, end) = range.as_file_range();
+                let (start, end) = range.as_range_tuple();
                 error!(
                     "Worker #{} 写入失败，终止下载 (range: {}..{}): {}",
                     worker_id, start, end, error
@@ -463,7 +465,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         error: String,
         retry_count: usize,
     ) -> LoopControl {
-        let (start, end) = range.as_file_range();
+        let (start, end) = range.as_range_tuple();
         warn!(
             "Worker #{} Range {}..{} 失败 (重试 {}): {}",
             worker_id,
@@ -588,7 +590,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             let error_details: Vec<String> = failures
                 .iter()
                 .map(|(range, error)| {
-                    let (start, end) = range.as_file_range();
+                    let (start, end) = range.as_range_tuple();
                     format!("range {}..{}: {}", start, end, error)
                 })
                 .collect();
@@ -615,7 +617,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         retry_count: usize,
     ) {
         let max_retry = self.config.retry().max_retry_count();
-        let (start, end) = range.as_file_range();
+        let (start, end) = range.as_range_tuple();
         if retry_count < max_retry {
             // 还可以重试，计算延迟时间
             let retry_delays = self.config.retry().retry_delays();
@@ -865,10 +867,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 释放 pool（它持有 writer 的引用）
         drop(pool);
         
-        // 完成写入（从 Arc 中提取 writer）
-        let writer = Arc::try_unwrap(self.writer)
-            .map_err(|_| DownloadError::WriterOwnership)?;
-        writer.finalize().await?;
+        // 完成写入
+        self.writer.finalize()?;
         
         info!("Range 下载任务完成: {:?}", save_path);
         
@@ -984,7 +984,13 @@ where
     }
 
     let content_length = metadata.content_length.ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
-    info!("文件大小: {} bytes ({:.2} MB)", content_length, content_length as f64 / 1024.0 / 1024.0);
+
+    let content_length = match std::num::NonZeroU64::new(content_length) {
+        Some(length) => length,
+        None => return Err(DownloadError::Other("文件大小无效".to_string())),
+    };
+
+    info!("文件大小: {} bytes ({:.2} MB)", content_length.get(), content_length.get() as f64 / 1024.0 / 1024.0);
     info!(
         "动态分块配置: 初始 {} bytes, 范围 {} ~ {} bytes",
         config.chunk().initial_size(),
@@ -993,10 +999,9 @@ where
     );
 
     // 创建 RangeWriter 和 RangeAllocator（会预分配文件）
-    let (writer, allocator) = RangeWriter::new(save_path.clone(), content_length).await?;
+    let (writer, allocator) = MmapWriter::new(save_path.clone(), content_length)?;
 
     // 将 writer 包装在 Arc 中
-    let writer = Arc::new(writer);
     let config = Arc::new(config.clone());
 
     // 创建下载任务（内部会创建 WorkerPool 并启动第一批 worker）
