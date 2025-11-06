@@ -24,6 +24,7 @@ arc-swap = "1.7.1"
 rustc-hash = "2.1.1"
 portable-atomic = "1.11.1"
 
+# 下面的crates是由本库作者维护
 kestrel-timer = "0.2.5"
 ranged-mmap = "0.1.1"
 
