@@ -70,9 +70,6 @@ pub struct MmapWriter {
     /// `MmapFile` 内部使用引用计数，支持安全的克隆和并发访问
     file: MmapFile,
     
-    /// 文件总大小
-    total_bytes: u64,
-    
     /// 已写入的字节数（原子计数器）
     written_bytes: Arc<AtomicU64>,
 }
@@ -118,7 +115,6 @@ impl MmapWriter {
         
         let writer = Self {
             file,
-            total_bytes: total_size.get(),
             written_bytes: Arc::new(AtomicU64::new(0)),
         };
         
@@ -143,11 +139,9 @@ impl MmapWriter {
         info!("打开 MmapWriter: {:?}", path.as_ref());
         
         let (file, allocator) = MmapFile::open(path)?;
-        let total_bytes = file.size().get();
         
         let writer = Self {
             file,
-            total_bytes,
             written_bytes: Arc::new(AtomicU64::new(0)),
         };
         
@@ -204,11 +198,11 @@ impl MmapWriter {
         // 无锁更新已写入字节数
         let written = self.written_bytes.fetch_add(data_len, Ordering::SeqCst) + data_len;
         
-        let progress = (written as f64 / self.total_bytes as f64) * 100.0;
+        let progress = (written as f64 / self.file.size().get() as f64) * 100.0;
         info!(
             "Range {}..{} 已写入 ({} bytes), 总进度: {:.1}% ({}/{} bytes)",
             start, end, data_len, progress, 
-            written, self.total_bytes
+            written, self.file.size().get()
         );
 
         self.file.flush_range(receipt)?;
@@ -226,7 +220,7 @@ impl MmapWriter {
     /// 
     /// 如果已写入字节数等于文件总大小，返回 true
     pub fn is_complete(&self) -> bool {
-        self.written_bytes.load(Ordering::SeqCst) == self.total_bytes
+        self.written_bytes.load(Ordering::SeqCst) == self.file.size().get()
     }
     
     /// 获取进度信息
@@ -237,7 +231,7 @@ impl MmapWriter {
     /// 
     /// 返回元组 (已写入字节数, 总字节数)
     pub fn progress(&self) -> (u64, u64) {
-        (self.written_bytes.load(Ordering::SeqCst), self.total_bytes)
+        (self.written_bytes.load(Ordering::SeqCst), self.file.size().get())
     }
     
     /// 获取文件大小
@@ -255,8 +249,8 @@ impl MmapWriter {
     /// 
     /// # Safety
     /// 
-    /// 这个方法是 unsafe 的，因为它要求所有写入操作都已完成。
-    /// 调用者必须确保没有其他线程正在进行写入操作。
+    /// 这个方法是安全的，因为它要求所有写入操作都已完成。
+    /// 调用者必须确保没有其他线程正在进行写入操作，否则会导致数据不一致。
     /// 
     /// # Errors
     /// 
@@ -271,7 +265,7 @@ impl MmapWriter {
 
         info!(
             "MmapWriter 完成: {}/{} bytes 已写入",
-            written_bytes, self.total_bytes
+            written_bytes, self.file.size().get()
         );
         
         Ok(())
@@ -282,7 +276,6 @@ impl std::fmt::Debug for MmapWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MmapWriter")
             .field("file", &self.file)
-            .field("total_bytes", &self.total_bytes)
             .field("written_bytes", &self.written_bytes.load(Ordering::SeqCst))
             .finish()
     }
