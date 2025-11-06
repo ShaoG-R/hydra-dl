@@ -13,7 +13,7 @@ use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
 use crate::utils::fetch::{RangeFetcher, FetchRangeResult};
 use crate::utils::io_traits::HttpClient;
-use crate::utils::stats::TaskStats;
+use crate::utils::stats::{TaskStats, WorkerStats};
 use crate::Result;
 use crate::utils::writer::MmapWriter;
 use async_trait::async_trait;
@@ -26,7 +26,7 @@ impl WorkerTask for RangeTask {}
 
 impl WorkerResult for RangeResult {}
 
-impl super::common::WorkerStats for crate::utils::stats::WorkerStats {}
+impl super::common::WorkerStats for WorkerStats {}
 
 // ==================== 下载 Worker 上下文 ====================
 
@@ -70,17 +70,22 @@ impl<C> DownloadWorkerExecutor<C> {
 }
 
 #[async_trait]
-impl<C> WorkerExecutor<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats> for DownloadWorkerExecutor<C>
+impl<C> WorkerExecutor for DownloadWorkerExecutor<C>
 where
     C: HttpClient,
 {
+    type Task = RangeTask;
+    type Result = RangeResult;
+    type Context = DownloadWorkerContext;
+    type Stats = WorkerStats;
+    
     async fn execute(
         &self,
         worker_id: usize,
-        task: RangeTask,
-        context: &mut DownloadWorkerContext,
-        stats: &crate::utils::stats::WorkerStats,
-    ) -> RangeResult {
+        task: Self::Task,
+        context: &mut Self::Context,
+        stats: &Self::Stats,
+    ) -> Self::Result {
         match task {
             RangeTask::Range { url, range, retry_count, cancel_rx } => {
                 let (start, end) = range.as_range_tuple();
@@ -219,7 +224,7 @@ where
 /// 封装通用 WorkerPool，提供下载特定的便捷方法
 pub(crate) struct DownloadWorkerPool<C: HttpClient> {
     /// 底层通用协程池
-    pool: WorkerPool<RangeTask, RangeResult, DownloadWorkerContext, crate::utils::stats::WorkerStats, DownloadWorkerExecutor<C>>,
+    pool: WorkerPool<DownloadWorkerExecutor<C>>,
     /// 全局统计管理器（聚合所有 worker 的数据）
     global_stats: TaskStats,
     /// 下载配置（用于创建新 worker 的分块策略）

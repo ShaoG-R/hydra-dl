@@ -76,7 +76,6 @@ use async_trait::async_trait;
 use arc_swap::ArcSwap;
 use log::{debug, error, info};
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Notify;
@@ -84,9 +83,6 @@ use tokio::sync::Notify;
 use crate::config::ConcurrencyDefaults;
 use crate::{DownloadError, Result};
 use super::worker_mask::WorkerMask;
-
-/// Worker 槽位的包装类型，简化复杂类型定义
-type WorkerSlotArc<T, S> = Arc<ArcSwap<Option<WorkerSlot<T, S>>>>;
 
 /// Worker 任务 trait
 ///
@@ -127,22 +123,35 @@ pub trait WorkerStats: Send + Sync + 'static {}
 /// - `Send`: 上下文可以在线程间传递（worker 独占所有权）
 pub trait WorkerContext: Send + 'static {}
 
+/// Worker 槽位的包装类型，简化复杂类型定义
+type WorkerSlotArc<E> = Arc<ArcSwap<Option<WorkerSlot<E>>>>;
+
+
 /// Worker 执行器 trait
 ///
 /// 定义了如何处理任务的具体逻辑
 ///
-/// # 泛型参数
+/// # 关联类型
 ///
-/// - `T`: 任务类型
-/// - `R`: 结果类型
-/// - `C`: 上下文类型
-/// - `S`: 统计类型
+/// - `Task`: 任务类型
+/// - `Result`: 结果类型
+/// - `Context`: 上下文类型
+/// - `Stats`: 统计类型
 ///
 /// # 要求
 ///
 /// - `Send + Sync`: 执行器可以在多个 worker 间共享
 #[async_trait]
-pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats>: Send + Sync + Clone + 'static {
+pub trait WorkerExecutor: Send + Sync + Clone + 'static {
+    /// 任务类型
+    type Task: WorkerTask;
+    /// 结果类型
+    type Result: WorkerResult;
+    /// 上下文类型
+    type Context: WorkerContext;
+    /// 统计类型
+    type Stats: WorkerStats;
+    
     /// 执行任务
     ///
     /// # Arguments
@@ -155,19 +164,19 @@ pub trait WorkerExecutor<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: Wo
     /// # Returns
     ///
     /// 任务执行结果
-    async fn execute(&self, worker_id: usize, task: T, context: &mut C, stats: &S) -> R;
+    async fn execute(&self, worker_id: usize, task: Self::Task, context: &mut Self::Context, stats: &Self::Stats) -> Self::Result;
 }
 
 /// Worker 配置
 ///
 /// 封装启动单个 worker 所需的所有参数
-pub(crate) struct WorkerConfig<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats, E: WorkerExecutor<T, R, C, S>> {
+pub(crate) struct WorkerConfig<E: WorkerExecutor> {
     pub id: usize,
     pub executor: E,
-    pub task_receiver: Receiver<T>,
-    pub result_sender: Sender<R>,
-    pub context: C,
-    pub stats: Arc<S>,
+    pub task_receiver: Receiver<E::Task>,
+    pub result_sender: Sender<E::Result>,
+    pub context: E::Context,
+    pub stats: Arc<E::Stats>,
     pub shutdown_receiver: tokio::sync::oneshot::Receiver<()>,
 }
 
@@ -179,19 +188,8 @@ pub(crate) struct WorkerConfig<T: WorkerTask, R: WorkerResult, C: WorkerContext,
 ///
 /// # 泛型参数
 ///
-/// - `T`: 任务类型
-/// - `R`: 结果类型
-/// - `C`: 上下文类型
-/// - `S`: 统计类型
 /// - `E`: 执行器类型
-pub(crate) async fn run_worker<T, R, C, S, E>(config: WorkerConfig<T, R, C, S, E>)
-where
-    T: WorkerTask,
-    R: WorkerResult,
-    C: WorkerContext,
-    S: WorkerStats,
-    E: WorkerExecutor<T, R, C, S>,
-{
+pub(crate) async fn run_worker<E: WorkerExecutor>(config: WorkerConfig<E>) {
     let WorkerConfig {
         id,
         executor,
@@ -237,11 +235,11 @@ where
 /// 单个 Worker 的槽位
 ///
 /// 封装了与单个 worker 交互所需的所有信息
-pub struct WorkerSlot<T: WorkerTask, S: WorkerStats> {
+pub struct WorkerSlot<E: WorkerExecutor> {
     /// 向 worker 发送任务的通道
-    pub(crate) task_sender: Sender<T>,
+    pub(crate) task_sender: Sender<E::Task>,
     /// 该 worker 的统计数据（Arc 包装以便外部访问）
-    pub(crate) stats: Arc<S>,
+    pub(crate) stats: Arc<E::Stats>,
     /// 关闭通道的发送端（用于向 worker 发送关闭信号）
     pub(crate) shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -250,18 +248,18 @@ pub struct WorkerSlot<T: WorkerTask, S: WorkerStats> {
 /// Worker 自动清理器
 /// 
 /// 封装 worker 退出时的资源清理逻辑
-pub(crate) struct WorkerCleanup<T: WorkerTask, S: WorkerStats> {
+pub(crate) struct WorkerCleanup<E: WorkerExecutor> {
     /// Worker ID
     worker_id: usize,
     /// 该 worker 的 slot 引用（而非整个 workers 数组）
-    slot: Arc<ArcSwap<Option<WorkerSlot<T, S>>>>,
+    slot: Arc<ArcSwap<Option<WorkerSlot<E>>>>,
     /// Worker 槽位空闲位掩码
     free_mask: Arc<WorkerMask>,
     /// Worker 全部退出通知器
     shutdown_notify: Arc<Notify>,
 }
 
-impl<T: WorkerTask, S: WorkerStats> WorkerCleanup<T, S> {
+impl<E: WorkerExecutor> WorkerCleanup<E> {
     /// 执行清理逻辑
     pub(crate) fn cleanup(self) {
         let worker_id = self.worker_id;
@@ -292,10 +290,7 @@ impl<T: WorkerTask, S: WorkerStats> WorkerCleanup<T, S> {
 ///
 /// # 泛型参数
 ///
-/// - `T`: 任务类型
-/// - `R`: 结果类型
-/// - `C`: 上下文类型
-/// - `S`: 统计类型
+/// - `E`: 执行器类型（通过关联类型提供任务、结果、上下文、统计类型）
 ///
 /// # 核心功能
 ///
@@ -305,16 +300,16 @@ impl<T: WorkerTask, S: WorkerStats> WorkerCleanup<T, S> {
 /// - 动态添加 worker
 /// - 访问 worker 统计数据
 /// - Worker 自动清理（退出时自动释放资源）
-pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: WorkerStats, E: WorkerExecutor<T, R, C, S>> {
+pub struct WorkerPool<E: WorkerExecutor> {
     /// Worker 槽位数组（索引即为 worker_id，None 表示该位置空闲）
     /// 使用固定大小数组和 ArcSwap 实现无锁并发访问
     /// ArcSwap<T> = ArcSwapAny<Arc<T>>，所以这里是 Arc<Option<WorkerSlot>>
     /// 外层 Arc 允许在 tokio::spawn 闭包中访问（worker 自动清理需要）
-    pub(crate) workers: [WorkerSlotArc<T, S>; ConcurrencyDefaults::MAX_WORKER_COUNT],
+    pub(crate) workers: [WorkerSlotArc<E>; ConcurrencyDefaults::MAX_WORKER_COUNT],
     /// 统一的结果接收器（所有 worker 共享）
-    result_receiver: Receiver<R>,
+    result_receiver: Receiver<E::Result>,
     /// 结果发送器的克隆（用于创建新 worker）
-    result_sender: Sender<R>,
+    result_sender: Sender<E::Result>,
     /// 执行器
     pub(crate) executor: E,
     /// Worker 槽位空闲位掩码（1 表示已占用，0 表示空闲）
@@ -322,28 +317,20 @@ pub struct WorkerPool<T: WorkerTask, R: WorkerResult, C: WorkerContext, S: Worke
     free_mask: Arc<WorkerMask>,
     /// Worker 全部退出通知器
     shutdown_notify: Arc<Notify>,
-    marker: PhantomData<C>,
 }
 
-impl<T, R, C, S, E> WorkerPool<T, R, C, S, E>
-where
-    T: WorkerTask,
-    R: WorkerResult,
-    C: WorkerContext,
-    S: WorkerStats,
-    E: WorkerExecutor<T, R, C, S>,
-{
+impl<E: WorkerExecutor> WorkerPool<E> {
     /// 启动单个 worker（内部辅助方法）
     /// 
     /// 封装创建和启动 worker 的通用逻辑，避免在 new 和 add_workers 中重复
     fn spawn_worker(
         &self,
         worker_id: usize,
-        context: C,
-        stats_arc: Arc<S>,
+        context: E::Context,
+        stats_arc: Arc<E::Stats>,
     ) {
         // 创建任务和关闭通道
-        let (task_sender, task_receiver) = mpsc::channel::<T>(100);
+        let (task_sender, task_receiver) = mpsc::channel::<E::Task>(100);
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
         
         // 克隆 worker 需要的资源（直接从 self 获取，减少一层克隆）
@@ -401,14 +388,11 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// let executor = Arc::new(MyExecutor);
+    /// let executor = MyExecutor;
     /// let contexts_with_stats = vec![(MyContext::new(), Arc::new(MyStats::new())); 4];
     /// let pool = WorkerPool::new(executor, contexts_with_stats);
     /// ```
-    pub fn new(executor: E, contexts_with_stats: Vec<(C, Arc<S>)>) -> Result<Self>
-    where
-        E: WorkerExecutor<T, R, C, S>,
-    {
+    pub fn new(executor: E, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<Self> {
         let worker_count = contexts_with_stats.len();
         
         // 验证 worker 数量不超过最大限制
@@ -417,7 +401,7 @@ where
         }
         
         // 创建统一的 result channel（所有 worker 共享同一个 sender）
-        let (result_sender, result_receiver) = mpsc::channel::<R>(100);
+        let (result_sender, result_receiver) = mpsc::channel::<E::Result>(100);
         
         // 初始化空闲位掩码
         let free_mask = Arc::new(WorkerMask::new(worker_count)?);
@@ -426,7 +410,7 @@ where
         let shutdown_notify = Arc::new(Notify::new());
         
         // 使用 array::from_fn 初始化固定大小数组（暂时全部为 None）
-        let workers: [WorkerSlotArc<T, S>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
+        let workers: [WorkerSlotArc<E>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
             std::array::from_fn(|_| Arc::new(ArcSwap::new(Arc::new(None))));
         
         // 创建 pool 实例（先不启动 workers）
@@ -434,8 +418,7 @@ where
             workers,
             result_receiver,
             result_sender: result_sender.clone(),
-            executor: executor,
-            marker: PhantomData,
+            executor,
             free_mask: Arc::clone(&free_mask),
             shutdown_notify: Arc::clone(&shutdown_notify),
         };
@@ -468,7 +451,7 @@ where
     /// let new_contexts = vec![(MyContext::new(), Arc::new(MyStats::new())); 2];
     /// pool.add_workers(new_contexts)?;
     /// ```
-    pub async fn add_workers(&mut self, contexts_with_stats: Vec<(C, Arc<S>)>) -> Result<()> {
+    pub async fn add_workers(&mut self, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<()> {
         let count = contexts_with_stats.len();
         let current_active = self.worker_count();
         
@@ -556,7 +539,7 @@ where
     /// # Returns
     ///
     /// 成功时返回 `Ok(())`，如果 worker 不存在则返回 `Err(DownloadError::WorkerNotFound)`
-    pub async fn send_task(&self, task: T, worker_id: usize) -> Result<()> {
+    pub async fn send_task(&self, task: E::Task, worker_id: usize) -> Result<()> {
         // 检查 worker_id 是否在范围内
         if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
             return Err(crate::DownloadError::WorkerNotFound(worker_id));
@@ -584,7 +567,7 @@ where
     /// # Returns
     ///
     /// 结果接收器的可变引用
-    pub fn result_receiver(&mut self) -> &mut Receiver<R> {
+    pub fn result_receiver(&mut self) -> &mut Receiver<E::Result> {
         &mut self.result_receiver
     }
 
@@ -597,7 +580,7 @@ where
     /// # Returns
     ///
     /// Worker 统计数据的 Arc 引用，如果 worker 不存在则返回 `None`
-    pub fn worker_stats(&self, worker_id: usize) -> Option<Arc<S>> {
+    pub fn worker_stats(&self, worker_id: usize) -> Option<Arc<E::Stats>> {
         if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
             return None;
         }
@@ -730,8 +713,13 @@ pub mod test_utils {
     pub struct TestExecutor;
     
     #[async_trait]
-    impl WorkerExecutor<TestTask, TestResult, TestContext, TestStats> for TestExecutor {
-        async fn execute(&self, worker_id: usize, task: TestTask, context: &mut TestContext, stats: &TestStats) -> TestResult {
+    impl WorkerExecutor for TestExecutor {
+        type Task = TestTask;
+        type Result = TestResult;
+        type Context = TestContext;
+        type Stats = TestStats;
+        
+        async fn execute(&self, worker_id: usize, task: Self::Task, context: &mut Self::Context, stats: &Self::Stats) -> Self::Result {
             // 模拟处理任务
             sleep(Duration::from_millis(10)).await;
             context.processed_count.fetch_add(1, Ordering::SeqCst);
@@ -748,8 +736,13 @@ pub mod test_utils {
     pub struct FailingExecutor;
     
     #[async_trait]
-    impl WorkerExecutor<TestTask, TestResult, TestContext, TestStats> for FailingExecutor {
-        async fn execute(&self, worker_id: usize, _task: TestTask, _context: &mut TestContext, _stats: &TestStats) -> TestResult {
+    impl WorkerExecutor for FailingExecutor {
+        type Task = TestTask;
+        type Result = TestResult;
+        type Context = TestContext;
+        type Stats = TestStats;
+        
+        async fn execute(&self, worker_id: usize, _task: Self::Task, _context: &mut Self::Context, _stats: &Self::Stats) -> Self::Result {
             TestResult::Failed {
                 worker_id,
                 error: "intentional failure".to_string(),
