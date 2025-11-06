@@ -9,13 +9,16 @@
 //! - **DownloadWorkerPool**: 下载协程池，封装通用 WorkerPool 并提供下载特定方法
 
 use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
-use crate::task::{RangeResult, WorkerTask as RangeTask};
-use crate::utils::chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy};
-use crate::utils::fetch::{RangeFetcher, FetchRangeResult};
-use crate::utils::io_traits::HttpClient;
-use crate::utils::stats::{TaskStats, WorkerStats};
 use crate::Result;
-use crate::utils::writer::MmapWriter;
+use crate::task::{RangeResult, WorkerTask as RangeTask};
+use crate::utils::{
+    chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy},
+    fetch::{RangeFetcher, FetchRangeResult},
+    io_traits::HttpClient,
+    stats::{TaskStats, WorkerStats},
+    writer::MmapWriter,
+};
+use crate::download::WorkerStatSnapshot;
 use async_trait::async_trait;
 use log::{debug, error, info};
 use std::sync::Arc;
@@ -429,7 +432,7 @@ where
     /// # Returns
     ///
     /// 所有活跃 worker 的统计信息向量
-    pub(crate) fn get_worker_snapshots(&self) -> Vec<crate::download::WorkerStatSnapshot> {
+    pub(crate) fn get_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
         self.pool.workers.iter()
             .enumerate()
             .filter_map(|(id, worker_slot)| {
@@ -439,7 +442,7 @@ where
                     let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid, _window_avg_speed, _window_avg_valid) = 
                         worker.stats.get_full_summary();
                     let current_chunk_size = worker.stats.get_current_chunk_size();
-                    crate::download::WorkerStatSnapshot {
+                    WorkerStatSnapshot {
                         worker_id: id,
                         bytes: worker_bytes,
                         ranges: worker_ranges,

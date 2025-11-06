@@ -180,7 +180,10 @@ pub use config::{
     ChunkDefaults, ConcurrencyDefaults, NetworkDefaults, SpeedDefaults, ProgressiveDefaults, RetryDefaults,
     BuildError,
 };
-pub use download::{download_ranged, DownloadHandle, DownloadProgress, WorkerStatSnapshot};
+pub use download::{
+    download_ranged, DownloadHandle, WorkerStatSnapshot,
+    DownloadProgress,
+};
 pub use task::FileTask;
 pub use utils::fetch::{fetch_file_metadata, FileMetadata};
 pub mod timer {

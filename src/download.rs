@@ -17,8 +17,9 @@ mod progressive;
 mod task_allocator;
 mod progress_reporter;
 
-use progressive::{ProgressiveLauncher, WorkerLaunchExecutor};
+use progressive::{ProgressiveLauncher, WorkerLaunchExecutor,};
 use task_allocator::{TaskAllocator, FailedRange};
+pub use progress_reporter::{DownloadProgress, WorkerStatSnapshot};
 use progress_reporter::ProgressReporter;
 
 /// 下载循环控制流
@@ -29,68 +30,6 @@ enum LoopControl {
     Continue,
     /// 正常完成，退出循环
     Break,
-}
-
-/// Worker 统计信息
-#[derive(Debug, Clone)]
-pub struct WorkerStatSnapshot {
-    /// Worker ID
-    pub worker_id: usize,
-    /// 该 worker 下载的字节数
-    pub bytes: u64,
-    /// 该 worker 完成的 range 数量
-    pub ranges: usize,
-    /// 该 worker 平均速度 (bytes/s)
-    pub avg_speed: f64,
-    /// 该 worker 实时速度 (bytes/s)，如果无效则为 None
-    pub instant_speed: Option<f64>,
-    /// 该 worker 当前的分块大小 (bytes)
-    pub current_chunk_size: u64,
-}
-
-/// 下载进度更新信息
-#[derive(Debug, Clone)]
-pub enum DownloadProgress {
-    /// 下载已开始
-    Started { 
-        /// 文件总大小（bytes）
-        total_size: NonZeroU64,
-        /// Worker 数量
-        worker_count: usize,
-        /// 初始分块大小（bytes）
-        initial_chunk_size: u64,
-    },
-    /// 下载进度更新（包含总体统计和所有 worker 的统计）
-    Progress {
-        /// 已下载字节数
-        bytes_downloaded: u64,
-        /// 文件总大小（bytes）
-        total_size: NonZeroU64,
-        /// 下载百分比 (0.0 ~ 100.0)
-        percentage: f64,
-        /// 平均速度 (bytes/s)
-        avg_speed: f64,
-        /// 实时速度 (bytes/s)，如果无效则为 None
-        instant_speed: Option<f64>,
-        /// 所有 worker 的统计信息（包含各自的分块大小）
-        worker_stats: Vec<WorkerStatSnapshot>,
-    },
-    /// 下载已完成（包含最终的 worker 统计）
-    Completed {
-        /// 总下载字节数
-        total_bytes: u64,
-        /// 总耗时（秒）
-        total_time: f64,
-        /// 平均速度 (bytes/s)
-        avg_speed: f64,
-        /// 所有 worker 的最终统计信息
-        worker_stats: Vec<WorkerStatSnapshot>,
-    },
-    /// 下载出错
-    Error {
-        /// 错误消息
-        message: String,
-    },
 }
 
 /// 下载任务句柄
