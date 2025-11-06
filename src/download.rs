@@ -13,9 +13,11 @@ use ranged_mmap::RangeAllocator;
 mod progressive;
 mod task_allocator;
 mod progress_reporter;
+mod worker_health_checker;
 pub mod task;
 
 pub use progress_reporter::{DownloadProgress, WorkerStatSnapshot};
+pub use worker_health_checker::{WorkerHealthChecker, WorkerSpeed};
 use task::DownloadTask;
 
 /// 下载任务句柄

@@ -126,7 +126,7 @@
 //! ```
 
 pub mod config;
-mod download;
+pub mod download;
 mod task;
 pub mod cli;
 
@@ -182,7 +182,7 @@ pub use config::{
 };
 pub use download::{
     download_ranged, DownloadHandle, WorkerStatSnapshot,
-    DownloadProgress,
+    DownloadProgress
 };
 pub use task::FileTask;
 pub use utils::fetch::{fetch_file_metadata, FileMetadata};

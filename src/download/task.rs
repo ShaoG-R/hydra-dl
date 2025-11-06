@@ -8,6 +8,7 @@ use crate::download::{
     progress_reporter::ProgressReporter,
     progressive::{ProgressiveLauncher, WorkerLaunchExecutor, LaunchDecision},
     task_allocator::{FailedRange, TaskAllocator},
+    worker_health_checker::{WorkerHealthChecker, WorkerSpeed},
 };
 use crate::utils::writer::MmapWriter;
 use crate::DownloadError;
@@ -521,23 +522,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 检查并处理不健康的 worker
     ///
-    /// 使用"最大间隙检测"算法来识别速度异常的 worker：
-    /// 1. 收集所有 worker 的窗口平均速度并排序
-    /// 2. 计算相邻元素的间隙
-    /// 3. 找到最大间隙作为分界线，将 workers 分为慢速簇和快速簇
-    /// 4. 以快速簇的最小值作为健康基准
-    /// 5. 同时应用绝对速度阈值，确保不会错误地终止健康的 worker
-    ///
-    /// # 算法示例
-    ///
-    /// ```text
-    /// 速度列表: [10, 30, 5120, 6144] KB/s
-    /// 间隙: [20, 5090, 1024]
-    /// 最大间隙: 5090 (在 30 和 5120 之间)
-    /// 慢速簇: [10, 30]
-    /// 快速簇: [5120, 6144]
-    /// 健康基准: 5120 KB/s (快速簇的最小值)
-    /// ```
+    /// 使用健康检查器来识别速度异常的 worker 并取消其任务
     fn check_and_handle_unhealthy_workers(&mut self) {
         // 检查是否启用健康检查
         if !self.config.health_check().enabled() {
@@ -553,13 +538,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         }
 
         // 收集所有 worker 的速度信息
-        let mut worker_speeds: Vec<(usize, f64)> = Vec::new();
+        let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
 
         for worker_id in 0..current_worker_count {
             if let Some((speed, valid)) = self.pool.get_worker_window_avg_speed(worker_id) {
                 // 只考虑有效的速度数据
                 if valid && speed > 0.0 {
-                    worker_speeds.push((worker_id, speed));
+                    worker_speeds.push(WorkerSpeed { worker_id, speed });
                 }
             }
         }
@@ -569,90 +554,29 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             return;
         }
 
-        // 按速度排序
-        worker_speeds.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // 创建健康检查器
+        let absolute_threshold = self.config.health_check().absolute_speed_threshold() as f64;
+        let checker = WorkerHealthChecker::new(absolute_threshold, 0.5);
 
-        // 计算相邻元素的间隙
-        let gaps: Vec<(usize, f64)> = worker_speeds
-            .windows(2)
-            .enumerate()
-            .map(|(idx, window)| {
-                let gap = window[1].1 - window[0].1;
-                (idx, gap)
-            })
-            .collect();
-
-        // 没有间隙，所有 worker 速度相近
-        if gaps.is_empty() {
+        // 执行健康检查
+        let Some(result) = checker.check(&worker_speeds) else {
             return;
-        }
+        };
 
-        // 找到最大间隙
-        let max_gap = gaps.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-        if let Some(&(max_gap_idx, gap_value)) = max_gap {
-            // 分界点：最大间隙之后的第一个元素
-            let split_idx = max_gap_idx + 1;
-
-            // 慢速簇（不健康）
-            let slow_cluster = &worker_speeds[..split_idx];
-            // 快速簇（健康）
-            let fast_cluster = &worker_speeds[split_idx..];
-
-            // 如果快速簇为空（所有 worker 速度相近），则不处理
-            if fast_cluster.is_empty() {
-                return;
-            }
-
-            // 健康基准：快速簇的最小值
-            let health_baseline = fast_cluster[0].1;
-
-            // 绝对速度阈值（从配置中获取）
-            let absolute_threshold = self.config.health_check().absolute_speed_threshold() as f64;
-
-            // 记录检测到的信息
-            debug!(
-                "健康检查: 检测到最大间隙 {:.2} KB/s (在索引 {} 和 {} 之间)",
-                gap_value / 1024.0,
-                max_gap_idx,
-                split_idx
-            );
-            debug!(
-                "健康基准: {:.2} KB/s, 绝对阈值: {:.2} KB/s",
-                health_baseline / 1024.0,
+        // 终止不健康的 worker
+        for (worker_id, speed) in result.unhealthy_workers {
+            warn!(
+                "检测到不健康的 Worker #{}: 速度 {:.2} KB/s (基准: {:.2} KB/s, 阈值: {:.2} KB/s)，准备终止",
+                worker_id,
+                speed / 1024.0,
+                result.health_baseline / 1024.0,
                 absolute_threshold / 1024.0
             );
 
-            // 标记需要终止的 worker
-            let mut workers_to_cancel = Vec::new();
-
-            for &(worker_id, speed) in slow_cluster {
-                // 同时满足以下条件才终止：
-                // 1. 速度低于绝对阈值
-                // 2. 速度明显低于健康基准（例如：低于 50%）
-                let is_below_absolute = speed < absolute_threshold;
-                let is_significantly_slow = speed < health_baseline * 0.5;
-
-                if is_below_absolute && is_significantly_slow {
-                    workers_to_cancel.push((worker_id, speed));
-                }
-            }
-
-            // 终止不健康的 worker
-            for (worker_id, speed) in workers_to_cancel {
-                warn!(
-                    "检测到不健康的 Worker #{}: 速度 {:.2} KB/s (基准: {:.2} KB/s, 阈值: {:.2} KB/s)，准备终止",
-                    worker_id,
-                    speed / 1024.0,
-                    health_baseline / 1024.0,
-                    absolute_threshold / 1024.0
-                );
-
-                if self.cancel_worker_task(worker_id) {
-                    info!("已取消 Worker #{} 的任务，将重新分配", worker_id);
-                    // worker 会在任务取消后返回 DownloadFailed 结果，
-                    // 触发失败处理流程，自动将该 worker 标记为空闲并重新分配任务
-                }
+            if self.cancel_worker_task(worker_id) {
+                info!("已取消 Worker #{} 的任务，将重新分配", worker_id);
+                // worker 会在任务取消后返回 DownloadFailed 结果，
+                // 触发失败处理流程，自动将该 worker 标记为空闲并重新分配任务
             }
         }
     }
