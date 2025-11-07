@@ -220,6 +220,123 @@ where
     }
 }
 
+// ==================== 下载 Worker 句柄 ====================
+
+/// 下载 Worker 句柄
+///
+/// 封装单个下载 worker 的操作接口，提供下载特定的便捷方法
+///
+/// # 示例
+///
+/// ```ignore
+/// let handle = pool.get_worker(0).ok_or(...)?;
+/// handle.send_task(range_task).await?;
+/// let speed = handle.instant_speed();
+/// ```
+#[derive(Clone)]
+pub(crate) struct DownloadWorkerHandle<C: HttpClient> {
+    /// 底层通用 worker 句柄
+    handle: super::common::WorkerHandle<DownloadWorkerExecutor<C>>,
+}
+
+impl<C: HttpClient> DownloadWorkerHandle<C> {
+    /// 创建新的下载 worker 句柄
+    ///
+    /// # Arguments
+    ///
+    /// - `handle`: 底层通用 worker 句柄
+    pub(crate) fn new(handle: super::common::WorkerHandle<DownloadWorkerExecutor<C>>) -> Self {
+        Self { handle }
+    }
+
+    /// 获取 worker ID
+    ///
+    /// # Returns
+    ///
+    /// Worker 的 ID
+    #[inline]
+    #[allow(unused)]
+    pub fn worker_id(&self) -> usize {
+        self.handle.worker_id()
+    }
+
+    /// 提交下载任务给该 worker
+    ///
+    /// # Arguments
+    ///
+    /// - `task`: 要执行的下载任务
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回 `Ok(())`，如果 worker 不存在或已关闭则返回 `Err`
+    pub async fn send_task(&self, task: RangeTask) -> Result<()> {
+        self.handle.send_task(task).await
+    }
+
+    /// 获取该 worker 的统计数据
+    ///
+    /// # Returns
+    ///
+    /// Worker 统计数据的 Arc 引用，如果 worker 不存在则返回 `None`
+    #[inline]
+    #[allow(unused)]
+    pub fn stats(&self) -> Option<Arc<WorkerStats>> {
+        self.handle.stats()
+    }
+
+    /// 关闭该 worker
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回 `Ok(())`，如果 worker 不存在则返回 `Err`
+    #[inline]
+    #[allow(unused)]
+    pub fn shutdown(&self) -> Result<()> {
+        self.handle.shutdown()
+    }
+
+    /// 检查 worker 是否仍然活跃
+    ///
+    /// # Returns
+    ///
+    /// 如果 worker 存在且活跃返回 `true`，否则返回 `false`
+    #[inline]
+    #[allow(unused)]
+    pub fn is_alive(&self) -> bool {
+        self.handle.is_alive()
+    }
+
+    /// 获取该 worker 的实时速度
+    ///
+    /// # Returns
+    ///
+    /// Some((实时速度 bytes/s, 是否有效)) 或 None（如果 worker 不存在）
+    pub fn instant_speed(&self) -> Option<(f64, bool)> {
+        let stats = self.handle.stats()?;
+        Some(stats.get_instant_speed())
+    }
+
+    /// 获取该 worker 的窗口平均速度
+    ///
+    /// # Returns
+    ///
+    /// Some((窗口平均速度 bytes/s, 是否有效)) 或 None（如果 worker 不存在）
+    pub fn window_avg_speed(&self) -> Option<(f64, bool)> {
+        let stats = self.handle.stats()?;
+        Some(stats.get_window_avg_speed())
+    }
+
+    /// 获取该 worker 的当前分块大小
+    ///
+    /// # Returns
+    ///
+    /// Some(当前分块大小 bytes) 或 None（如果 worker 不存在）
+    pub fn chunk_size(&self) -> Option<u64> {
+        let stats = self.handle.stats()?;
+        Some(stats.get_current_chunk_size())
+    }
+}
+
 // ==================== 下载 Worker 协程池 ====================
 
 /// 下载 Worker 协程池
@@ -249,13 +366,13 @@ where
     ///
     /// # Returns
     ///
-    /// 新创建的 DownloadWorkerPool
+    /// 返回新创建的 DownloadWorkerPool 和所有初始 worker 的句柄
     pub(crate) fn new(
         client: C,
         initial_worker_count: usize,
         writer: MmapWriter,
         config: Arc<crate::config::DownloadConfig>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<DownloadWorkerHandle<C>>)> {
         // 创建全局统计管理器（使用配置的速度配置）
         let global_stats = TaskStats::from_config(config.speed());
 
@@ -280,16 +397,22 @@ where
             })
             .collect();
 
-        // 创建通用协程池
-        let pool = WorkerPool::new(executor, contexts_with_stats)?;
+        // 创建通用协程池并获取 worker 句柄
+        let (pool, worker_handles) = WorkerPool::new(executor, contexts_with_stats)?;
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
-        Ok(Self {
+        // 将通用句柄转换为下载特定句柄
+        let download_handles = worker_handles
+            .into_iter()
+            .map(DownloadWorkerHandle::new)
+            .collect();
+
+        Ok((Self {
             pool,
             global_stats,
             config,
-        })
+        }, download_handles))
     }
 
     /// 动态添加新的 worker
@@ -300,8 +423,8 @@ where
     ///
     /// # Returns
     ///
-    /// 成功时返回 `Ok(())`，失败时返回错误信息
-    pub(crate) async fn add_workers(&mut self, count: usize) -> Result<()> {
+    /// 成功时返回新添加的所有 worker 的句柄，失败时返回错误信息
+    pub(crate) async fn add_workers(&mut self, count: usize) -> Result<Vec<DownloadWorkerHandle<C>>> {
         // 创建新的 worker 上下文和统计
         let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..count)
             .map(|_| {
@@ -319,8 +442,16 @@ where
             })
             .collect();
 
-        // 添加新 workers（使用现有的执行器）
-        self.pool.add_workers(contexts_with_stats).await
+        // 添加新 workers（使用现有的执行器）并获取句柄
+        let worker_handles = self.pool.add_workers(contexts_with_stats).await?;
+        
+        // 将通用句柄转换为下载特定句柄
+        let download_handles = worker_handles
+            .into_iter()
+            .map(DownloadWorkerHandle::new)
+            .collect();
+        
+        Ok(download_handles)
     }
 
     /// 获取当前活跃 worker 总数
@@ -328,20 +459,54 @@ where
         self.pool.worker_count()
     }
 
-    /// 提交任务给指定的 worker
-    pub(crate) async fn send_task(&self, task: RangeTask, worker_id: usize) -> Result<()> {
-        self.pool.send_task(task, worker_id).await
-    }
-
     /// 获取结果接收器的可变引用
     pub(crate) fn result_receiver(&mut self) -> &mut tokio::sync::mpsc::Receiver<RangeResult> {
         self.pool.result_receiver()
     }
 
-    /// 获取指定 worker 的统计信息
-    #[allow(dead_code)]
-    pub(crate) fn worker_stats(&self, worker_id: usize) -> Option<Arc<crate::utils::stats::WorkerStats>> {
-        self.pool.worker_stats(worker_id)
+    /// 获取指定 worker 的句柄
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: Worker ID
+    ///
+    /// # Returns
+    ///
+    /// 下载 worker 句柄，如果 worker 不存在则返回 `None`
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = pool.get_worker(0).ok_or(...)?;
+    /// handle.send_task(range_task).await?;
+    /// ```
+    #[inline]
+    #[allow(unused)]
+    pub(crate) fn get_worker(&self, worker_id: usize) -> Option<DownloadWorkerHandle<C>> {
+        let handle = self.pool.get_worker(worker_id)?;
+        Some(DownloadWorkerHandle::new(handle))
+    }
+
+    /// 获取所有活跃 worker 的句柄列表
+    ///
+    /// # Returns
+    ///
+    /// 所有活跃下载 worker 的句柄向量
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// for handle in pool.workers() {
+    ///     println!("Worker #{} speed: {:?}", handle.worker_id(), handle.instant_speed());
+    /// }
+    /// ```
+    #[inline]
+    #[allow(unused)]
+    pub(crate) fn workers(&self) -> Vec<DownloadWorkerHandle<C>> {
+        self.pool.workers()
+            .into_iter()
+            .map(DownloadWorkerHandle::new)
+            .collect()
     }
 
     /// 获取所有 worker 的聚合统计（O(1)，无需遍历）
@@ -372,22 +537,6 @@ where
         self.global_stats.get_window_avg_speed()
     }
 
-    /// 获取指定 worker 的当前分块大小
-    ///
-    /// # Arguments
-    ///
-    /// - `worker_id`: Worker ID
-    ///
-    /// # Returns
-    ///
-    /// 当前分块大小 (bytes)，如果 worker 不存在返回默认初始分块大小
-    #[inline]
-    pub(crate) fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
-        self.pool.worker_stats(worker_id)
-            .map(|stats| stats.get_current_chunk_size())
-            .unwrap_or(self.config.chunk().initial_size())
-    }
-
     /// 优雅关闭所有 workers
     ///
     /// 发送关闭信号到所有活跃的 worker，让它们停止接收新任务并自动退出清理
@@ -407,41 +556,20 @@ where
         self.pool.wait_for_shutdown().await;
     }
 
-    /// 关闭指定的 worker
-    ///
-    /// 清空 worker slot，导致 task_sender 被 drop，worker 会检测到 channel 关闭并自动退出清理
-    ///
-    /// # Arguments
-    ///
-    /// - `worker_id`: 要关闭的 worker ID
-    ///
-    /// # Returns
-    ///
-    /// 成功时返回 `Ok(())`，如果 worker 不存在则返回 `Err(DownloadError::WorkerNotFound)`
-    ///
-    /// # Note
-    ///
-    /// 此方法不会等待 worker 退出，worker 会在检测到 channel 关闭后异步自动清理
-    #[allow(dead_code)]
-    pub(crate) fn shutdown_worker(&self, worker_id: usize) -> Result<()> {
-        self.pool.shutdown_worker(worker_id)
-    }
-
     /// 获取所有活跃 worker 的统计快照
     ///
     /// # Returns
     ///
     /// 所有活跃 worker 的统计信息向量
     pub(crate) fn get_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
-        self.pool.workers.iter()
-            .enumerate()
-            .filter_map(|(id, worker_slot)| {
-                // load() 返回 Arc<Option<WorkerSlot>>
-                let slot_arc = worker_slot.load();
-                slot_arc.as_ref().as_ref().map(|worker| {
+        self.pool.workers()
+            .into_iter()
+            .filter_map(|handle| {
+                let id = handle.worker_id();
+                handle.stats().map(|worker_stats| {
                     let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid, _window_avg_speed, _window_avg_valid) = 
-                        worker.stats.get_full_summary();
-                    let current_chunk_size = worker.stats.get_current_chunk_size();
+                        worker_stats.get_full_summary();
+                    let current_chunk_size = worker_stats.get_current_chunk_size();
                     WorkerStatSnapshot {
                         worker_id: id,
                         bytes: worker_bytes,
@@ -455,25 +583,6 @@ where
             .collect()
     }
 
-    /// 获取指定 worker 的实时速度
-    ///
-    /// # Returns
-    ///
-    /// Some((实时速度 bytes/s, 是否有效)) 或 None（如果 worker 不存在）
-    pub(crate) fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
-        let stats = self.pool.worker_stats(worker_id)?;
-        Some(stats.get_instant_speed())
-    }
-
-    /// 获取指定 worker 的窗口平均速度
-    ///
-    /// # Returns
-    ///
-    /// Some((窗口平均速度 bytes/s, 是否有效)) 或 None（如果 worker 不存在）
-    pub(crate) fn get_worker_window_avg_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
-        let stats = self.pool.worker_stats(worker_id)?;
-        Some(stats.get_window_avg_speed())
-    }
 }
 
 #[cfg(test)]
@@ -495,38 +604,9 @@ mod tests {
 
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
+        let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
 
         assert_eq!(pool.worker_count(), 4);
-    }
-
-    #[tokio::test]
-    async fn test_download_worker_pool_send_task() {
-        use std::num::NonZeroU64;
-        
-        let client = MockHttpClient::new();
-        let dir = tempfile::tempdir().unwrap();
-        let save_path = dir.path().join("test.bin");
-
-        let (writer, mut allocator) = MmapWriter::new(save_path, NonZeroU64::new(100).unwrap()).unwrap();
-
-        let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::new(client, 2, writer, config).unwrap();
-
-        // 分配一个 range
-        let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
-
-        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let task = RangeTask::Range {
-            url: "http://example.com/file.bin".to_string(),
-            range,
-            retry_count: 0,
-            cancel_rx,
-        };
-
-        // 发送任务到 worker 0
-        let result = pool.send_task(task, 0).await;
-        assert!(result.is_ok(), "发送任务应该成功");
     }
 
     #[tokio::test]
@@ -541,7 +621,7 @@ mod tests {
 
         let worker_count = 3;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let pool = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
+        let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
 
         // 初始统计应该都是 0
         let (total_bytes, total_secs, ranges) = pool.get_total_stats();
@@ -564,7 +644,7 @@ mod tests {
         let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let mut pool = DownloadWorkerPool::new(client.clone(), 2, writer, config).unwrap();
+        let (mut pool, _handles) = DownloadWorkerPool::new(client.clone(), 2, writer, config).unwrap();
 
         // 关闭 workers
         pool.shutdown();
@@ -572,10 +652,9 @@ mod tests {
         // 等待 workers 完成清理（使用事件通知，非轮询）
         pool.wait_for_shutdown().await;
 
-        // 验证所有 worker 都已被移除（slot 为 None）
-        for worker_slot in pool.pool.workers.iter() {
-            assert!(worker_slot.load().is_none());
-        }
+        // 验证所有 worker 都已被移除
+        assert_eq!(pool.pool.worker_count(), 0);
+        assert!(pool.pool.registry.is_empty());
     }
 
     #[tokio::test]
@@ -705,6 +784,219 @@ mod tests {
                 panic!("任务应该失败");
             }
         }
+    }
+
+    // ==================== DownloadWorkerHandle API 测试 ====================
+
+    #[tokio::test]
+    async fn test_download_get_worker_handle() {
+        use std::num::NonZeroU64;
+        
+        let client = MockHttpClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
+
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let (pool, _handles) = DownloadWorkerPool::new(client, 2, writer, config).unwrap();
+
+        // 获取存在的 worker 句柄
+        let handle = pool.get_worker(0);
+        assert!(handle.is_some());
+        
+        let handle = handle.unwrap();
+        assert_eq!(handle.worker_id(), 0);
+        assert!(handle.is_alive());
+
+        // 获取不存在的 worker 句柄
+        let handle = pool.get_worker(100);
+        assert!(handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_download_get_all_workers() {
+        use std::num::NonZeroU64;
+        
+        let client = MockHttpClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
+
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
+
+        let worker_count = 3;
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
+
+        let handles = pool.workers();
+        assert_eq!(handles.len(), 3);
+
+        // 验证 worker IDs
+        let ids: Vec<usize> = handles.iter().map(|h| h.worker_id()).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        // 验证所有 workers 都是活跃的
+        for handle in handles {
+            assert!(handle.is_alive());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_handle_send_task() {
+        use std::num::NonZeroU64;
+        
+        let test_url = "http://example.com/file.bin";
+        let test_data = b"0123456789"; // 10 bytes
+
+        let client = MockHttpClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
+
+        let (writer, mut allocator) = MmapWriter::new(save_path, NonZeroU64::new(100).unwrap()).unwrap();
+
+        let range = allocator.allocate(NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+
+        // 设置 Range 响应
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-range",
+            format!("bytes 0-9/10").parse().unwrap(),
+        );
+        client.set_range_response(
+            test_url,
+            0,
+            9,
+            StatusCode::PARTIAL_CONTENT,
+            headers,
+            Bytes::from_static(test_data),
+        );
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let (mut pool, _handles) = DownloadWorkerPool::new(client, 1, writer, config).unwrap();
+
+        let handle = pool.get_worker(0).unwrap();
+
+        // 通过 handle 发送任务
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let task = RangeTask::Range {
+            url: test_url.to_string(),
+            range,
+            retry_count: 0,
+            cancel_rx,
+        };
+        handle.send_task(task).await.unwrap();
+
+        // 接收结果
+        let result = pool.result_receiver().recv().await;
+        assert!(result.is_some());
+        
+        match result.unwrap() {
+            RangeResult::Complete { worker_id } => {
+                assert_eq!(worker_id, 0);
+            }
+            _ => panic!("任务不应该失败"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_handle_stats() {
+        use std::num::NonZeroU64;
+        
+        let client = MockHttpClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
+
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let (pool, _handles) = DownloadWorkerPool::new(client, 1, writer, config).unwrap();
+
+        let handle = pool.get_worker(0).unwrap();
+
+        // 获取统计信息
+        let stats = handle.stats().unwrap();
+        assert_eq!(stats.get_summary().0, 0); // 初始下载字节数为 0
+    }
+
+    #[tokio::test]
+    async fn test_download_handle_speed_methods() {
+        use std::num::NonZeroU64;
+        
+        let client = MockHttpClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
+
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let (pool, _handles) = DownloadWorkerPool::new(client, 1, writer, config).unwrap();
+
+        let handle = pool.get_worker(0).unwrap();
+
+        // 测试速度方法
+        let instant_speed = handle.instant_speed();
+        assert!(instant_speed.is_some());
+        
+        let window_avg_speed = handle.window_avg_speed();
+        assert!(window_avg_speed.is_some());
+        
+        let chunk_size = handle.chunk_size();
+        assert!(chunk_size.is_some());
+        assert!(chunk_size.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_download_handle_shutdown() {
+        use std::num::NonZeroU64;
+        
+        let client = MockHttpClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
+
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let (pool, _handles) = DownloadWorkerPool::new(client, 2, writer, config).unwrap();
+
+        let handle = pool.get_worker(0).unwrap();
+        assert!(handle.is_alive());
+
+        // 通过 handle 关闭 worker
+        handle.shutdown().unwrap();
+
+        // 等待一会儿让 worker 退出
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // 验证 worker 已经不活跃
+        assert!(!handle.is_alive());
+
+        // 验证剩余的 worker 仍然活跃
+        assert_eq!(pool.worker_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_download_handle_clone() {
+        use std::num::NonZeroU64;
+        
+        let client = MockHttpClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("test.bin");
+
+        let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
+
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let (pool, _handles) = DownloadWorkerPool::new(client, 1, writer, config).unwrap();
+
+        let handle1 = pool.get_worker(0).unwrap();
+        let handle2 = handle1.clone();
+
+        // 两个 handle 应该指向同一个 worker
+        assert_eq!(handle1.worker_id(), handle2.worker_id());
+        assert_eq!(handle1.worker_id(), 0);
+
+        // 两个 handle 都应该是活跃的
+        assert!(handle1.is_alive());
+        assert!(handle2.is_alive());
     }
 }
 
