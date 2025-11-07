@@ -224,16 +224,18 @@ impl TaskAllocator {
             delay.as_secs_f64()
         );
         
+        let task_handle = timer_service.allocate_handle();
+        let task_id = task_handle.task_id();
+
         // 创建定时器任务（无回调，仅通知）
         let timer_task = TimerTask::new_oneshot(delay, None);
-        let timer_id = timer_task.get_id();
         
         // 注册到 TimerService
-        timer_service.register(timer_task)
+        timer_service.register(task_handle, timer_task)
             .map_err(|e| DownloadError::Other(format!("注册定时器失败: {:?}", e)))?;
         
         // 存储映射关系
-        self.failed_tasks.insert(timer_id, FailedTaskInfo {
+        self.failed_tasks.insert(task_id, FailedTaskInfo {
             range,
             retry_count,
         });
@@ -610,13 +612,12 @@ mod tests {
         assert_eq!(allocator.pending_retry_count(), 2);
         
         // 模拟添加定时器等待中的任务（通过直接操作 failed_tasks）
-        // 注意：TaskId 是一个不透明类型，我们需要使用 TimerTask 来生成真实的 TaskId
-        use kestrel_timer::TimerTask;
-        let timer_task = TimerTask::new_oneshot(std::time::Duration::from_secs(10), None);
-        let timer_id = timer_task.get_id();
+        let timer_service = TimerWheel::with_defaults().create_service(ServiceConfig::default());
+        let task_handle = timer_service.allocate_handle();
+        let task_id = task_handle.task_id();
         
         let range3 = allocate_range_from(&mut allocator, 100);
-        allocator.failed_tasks.insert(timer_id, FailedTaskInfo {
+        allocator.failed_tasks.insert(task_id, FailedTaskInfo {
             range: range3,
             retry_count: 3,
         });
