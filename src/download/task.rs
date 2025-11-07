@@ -51,6 +51,8 @@ pub struct DownloadTask<C: HttpClient> {
     /// 用于内部管理每个 worker 当前任务的取消功能
     /// 当需要中止某个 worker 的任务时，可以通过发送取消信号来实现
     cancel_senders: HashMap<usize, tokio::sync::oneshot::Sender<()>>,
+    /// Worker 句柄缓存（worker_id -> handle）
+    worker_handles: Vec<crate::pool::download::DownloadWorkerHandle<C>>,
 }
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
@@ -77,7 +79,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         info!("初始启动 {} 个 workers", initial_worker_count);
 
         // 创建 DownloadWorkerPool（只启动第一批 worker）
-        let pool = DownloadWorkerPool::new(
+        let (pool, initial_handles) = DownloadWorkerPool::new(
             client.clone(),
             initial_worker_count,
             writer.clone(),
@@ -101,6 +103,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             progressive_launcher,
             timer_service,
             cancel_senders: HashMap::new(),
+            worker_handles: initial_handles,
         })
     }
 
@@ -207,14 +210,20 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 cancel_rx,
             };
 
-            if let Err(e) = self.pool.send_task(task, worker_id).await {
-                error!("分配重试任务失败: {:?}", e);
-                self.task_allocator.mark_worker_idle(worker_id);
-                // 任务发送失败，放回就绪队列
-                self.task_allocator.push_ready_retry_task(info);
+            if let Some(handle) = self.get_worker_handle(worker_id) {
+                if let Err(e) = handle.send_task(task).await {
+                    error!("分配重试任务失败: {:?}", e);
+                    self.task_allocator.mark_worker_idle(worker_id);
+                    // 任务发送失败，放回就绪队列
+                    self.task_allocator.push_ready_retry_task(info);
+                } else {
+                    // 保存取消 sender
+                    self.cancel_senders.insert(worker_id, cancel_tx);
+                }
             } else {
-                // 保存取消 sender
-                self.cancel_senders.insert(worker_id, cancel_tx);
+                error!("Worker #{} 不存在", worker_id);
+                self.task_allocator.mark_worker_idle(worker_id);
+                self.task_allocator.push_ready_retry_task(info);
             }
         } else {
             // 没有空闲 worker，推入就绪队列等待下次分配
@@ -318,19 +327,26 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 尝试为所有空闲 worker 分配初始任务
         while let Some(&worker_id) = self.task_allocator.idle_workers.front() {
-            let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+            let chunk_size = self.get_worker_handle(worker_id)
+                .and_then(|h| h.chunk_size())
+                .unwrap_or(self.config.chunk().initial_size());
 
             if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
                 let (task, worker_id, cancel_tx) = allocated.into_parts();
                 info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
 
-                if let Err(e) = self.pool.send_task(task, worker_id).await {
-                    error!("初始任务分配失败: {:?}", e);
-                    // 失败了，将 worker 放回队列
-                    self.task_allocator.mark_worker_idle(worker_id);
+                if let Some(handle) = self.get_worker_handle(worker_id) {
+                    if let Err(e) = handle.send_task(task).await {
+                        error!("初始任务分配失败: {:?}", e);
+                        // 失败了，将 worker 放回队列
+                        self.task_allocator.mark_worker_idle(worker_id);
+                    } else {
+                        // 保存取消 sender
+                        self.cancel_senders.insert(worker_id, cancel_tx);
+                    }
                 } else {
-                    // 保存取消 sender
-                    self.cancel_senders.insert(worker_id, cancel_tx);
+                    error!("Worker #{} 不存在", worker_id);
+                    self.task_allocator.mark_worker_idle(worker_id);
                 }
             } else {
                 info!("没有足够的数据为空闲 workers 分配更多任务");
@@ -345,7 +361,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     ///
     /// 获取该 worker 的当前分块大小，并尝试分配新任务
     async fn try_allocate_next_task(&mut self, worker_id: usize) {
-        let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+        let chunk_size = self.get_worker_handle(worker_id)
+            .and_then(|h| h.chunk_size())
+            .unwrap_or(self.config.chunk().initial_size());
 
         if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
             let (task, target_worker, cancel_tx) = allocated.into_parts();
@@ -354,13 +372,18 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 worker_id, target_worker, chunk_size
             );
 
-            if let Err(e) = self.pool.send_task(task, target_worker).await {
-                error!("分配新任务失败: {:?}", e);
-                // 失败了，将 worker 放回队列
-                self.task_allocator.mark_worker_idle(target_worker);
+            if let Some(handle) = self.get_worker_handle(target_worker) {
+                if let Err(e) = handle.send_task(task).await {
+                    error!("分配新任务失败: {:?}", e);
+                    // 失败了，将 worker 放回队列
+                    self.task_allocator.mark_worker_idle(target_worker);
+                } else {
+                    // 保存取消 sender
+                    self.cancel_senders.insert(target_worker, cancel_tx);
+                }
             } else {
-                // 保存取消 sender
-                self.cancel_senders.insert(target_worker, cancel_tx);
+                error!("Worker #{} 不存在", target_worker);
+                self.task_allocator.mark_worker_idle(target_worker);
             }
         } else {
             debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
@@ -541,7 +564,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
 
         for worker_id in 0..current_worker_count {
-            if let Some((speed, valid)) = self.pool.get_worker_window_avg_speed(worker_id) {
+            if let Some((speed, valid)) = self.get_worker_handle(worker_id).and_then(|h| h.window_avg_speed()) {
                 // 只考虑有效的速度数据
                 if valid && speed > 0.0 {
                     worker_speeds.push(WorkerSpeed { worker_id, speed });
@@ -614,10 +637,26 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.pool.worker_count()
     }
 
+    /// 获取指定 worker 的句柄（从缓存中）
+    ///
+    /// # Arguments
+    ///
+    /// * `worker_id` - Worker ID
+    ///
+    /// # Returns
+    ///
+    /// Worker 句柄的克隆，如果 worker 不存在则返回 `None`
+    #[inline]
+    fn get_worker_handle(&self, worker_id: usize) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
+        self.worker_handles.get(worker_id).cloned()
+    }
+
     /// 获取指定 worker 的当前分块大小
     #[inline]
     pub fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
-        self.pool.get_worker_chunk_size(worker_id)
+        self.get_worker_handle(worker_id)
+            .and_then(|h| h.chunk_size())
+            .unwrap_or(self.config.chunk().initial_size())
     }
 
     /// 获取进度报告器
@@ -642,7 +681,7 @@ impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
     }
 
     fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
-        self.pool.get_worker_instant_speed(worker_id)
+        self.get_worker_handle(worker_id).and_then(|h| h.instant_speed())
     }
 
     fn get_total_window_avg_speed(&self) -> (f64, bool) {
@@ -670,28 +709,41 @@ impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
         );
 
         // 动态添加新 worker
-        if let Err(e) = self.pool.add_workers(count).await {
-            error!("添加新 workers 失败: {:?}", e);
-            return Err(e);
-        }
+        let new_handles = match self.pool.add_workers(count).await {
+            Ok(handles) => handles,
+            Err(e) => {
+                error!("添加新 workers 失败: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        // 将新 worker 句柄添加到缓存
+        self.worker_handles.extend(new_handles);
 
         // 为新启动的worker加入队列并分配任务
         for worker_id in current_worker_count..next_target {
             // 将新 worker 加入空闲队列
             self.task_allocator.mark_worker_idle(worker_id);
 
-            let chunk_size = self.pool.get_worker_chunk_size(worker_id);
+            let chunk_size = self.get_worker_handle(worker_id)
+                .and_then(|h| h.chunk_size())
+                .unwrap_or(self.config.chunk().initial_size());
 
             if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
                 let (task, assigned_worker, cancel_tx) = allocated.into_parts();
                 info!("为新启动的 Worker #{} 分配任务，分块大小 {} bytes", assigned_worker, chunk_size);
-                if let Err(e) = self.pool.send_task(task, assigned_worker).await {
-                    error!("为新 worker 分配任务失败: {:?}", e);
-                    // 失败了，将 worker 放回队列
-                    self.task_allocator.mark_worker_idle(assigned_worker);
+                if let Some(handle) = self.get_worker_handle(assigned_worker) {
+                    if let Err(e) = handle.send_task(task).await {
+                        error!("为新 worker 分配任务失败: {:?}", e);
+                        // 失败了，将 worker 放回队列
+                        self.task_allocator.mark_worker_idle(assigned_worker);
+                    } else {
+                        // 收集取消通道，稍后由调用者保存
+                        new_cancel_senders.push((assigned_worker, cancel_tx));
+                    }
                 } else {
-                    // 收集取消通道，稍后由调用者保存
-                    new_cancel_senders.push((assigned_worker, cancel_tx));
+                    error!("Worker #{} 不存在", assigned_worker);
+                    self.task_allocator.mark_worker_idle(assigned_worker);
                 }
             } else {
                 debug!("没有足够的数据为新 worker #{} 分配任务", worker_id);
