@@ -126,6 +126,175 @@ pub trait WorkerContext: Send + 'static {}
 /// Worker 槽位的包装类型，简化复杂类型定义
 type WorkerSlotArc<E> = Arc<ArcSwap<Option<WorkerSlot<E>>>>;
 
+/// Worker 注册表
+///
+/// 封装 worker 槽位数组和空闲位掩码的管理，提供统一的 worker 生命周期管理接口
+///
+/// # 职责
+///
+/// - 管理固定大小的 worker 槽位数组
+/// - 追踪哪些槽位是空闲的（通过位掩码）
+/// - 提供槽位的分配和释放
+/// - 提供槽位的查询和迭代
+///
+/// # 设计特点
+///
+/// - **无锁访问**: 使用 ArcSwap 实现无锁并发读写
+/// - **空间高效**: 使用位掩码追踪空闲状态
+/// - **快速分配**: O(1) 时间复杂度分配空闲槽位
+pub(crate) struct WorkerRegistry<E: WorkerExecutor> {
+    /// Worker 槽位数组（索引即为 worker_id，None 表示该位置空闲）
+    slots: [WorkerSlotArc<E>; ConcurrencyDefaults::MAX_WORKER_COUNT],
+    /// Worker 槽位空闲位掩码（1 表示已占用，0 表示空闲）
+    free_mask: Arc<WorkerMask>,
+}
+
+impl<E: WorkerExecutor> WorkerRegistry<E> {
+    /// 创建新的 worker 注册表
+    ///
+    /// # Arguments
+    ///
+    /// - `initial_count`: 初始 worker 数量（用于初始化位掩码）
+    ///
+    /// # Returns
+    ///
+    /// 新创建的注册表实例
+    pub fn new(initial_count: usize) -> Result<Self> {
+        // 验证 worker 数量不超过最大限制
+        if initial_count > ConcurrencyDefaults::MAX_WORKER_COUNT {
+            return Err(crate::DownloadError::WorkerCountExceeded(
+                initial_count,
+                ConcurrencyDefaults::MAX_WORKER_COUNT,
+            ));
+        }
+
+        // 初始化空闲位掩码
+        let free_mask = Arc::new(WorkerMask::new(initial_count)?);
+
+        // 使用 array::from_fn 初始化固定大小数组（全部为 None）
+        let slots: [WorkerSlotArc<E>; ConcurrencyDefaults::MAX_WORKER_COUNT] =
+            std::array::from_fn(|_| Arc::new(ArcSwap::new(Arc::new(None))));
+
+        Ok(Self { slots, free_mask })
+    }
+
+    /// 分配一个空闲槽位
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回槽位 ID，失败时返回错误（如池已满）
+    pub fn allocate(&self) -> Result<usize> {
+        self.free_mask.allocate()
+    }
+
+    /// 释放指定槽位
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: 要释放的槽位 ID
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回 `Ok(())`，失败时返回错误
+    #[inline]
+    #[allow(dead_code)]
+    pub fn free(&self, worker_id: usize) -> Result<()> {
+        self.free_mask.free(worker_id)
+    }
+
+    /// 获取指定槽位的引用
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: 槽位 ID
+    ///
+    /// # Returns
+    ///
+    /// 槽位的 Arc 引用，如果 ID 无效则返回 `None`
+    pub fn get(&self, worker_id: usize) -> Option<&WorkerSlotArc<E>> {
+        if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
+            return None;
+        }
+        Some(&self.slots[worker_id])
+    }
+
+    /// 存储 worker 到指定槽位
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: 槽位 ID
+    /// - `slot`: Worker 槽位
+    pub fn store(&self, worker_id: usize, slot: WorkerSlot<E>) {
+        self.slots[worker_id].store(Arc::new(Some(slot)));
+    }
+
+    /// 清空指定槽位（设置为 None）
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: 槽位 ID
+    ///
+    /// # Returns
+    ///
+    /// 返回被移除的槽位（如果存在）
+    #[inline]
+    #[allow(dead_code)]
+    pub fn clear(&self, worker_id: usize) -> Option<WorkerSlot<E>> {
+        let old_slot_arc = self.slots[worker_id].swap(Arc::new(None));
+        Arc::try_unwrap(old_slot_arc).ok().and_then(|s| s)
+    }
+
+    /// 获取当前活跃 worker 总数
+    ///
+    /// 使用位掩码快速计算，O(1) 时间复杂度
+    pub fn count(&self) -> usize {
+        self.free_mask.count()
+    }
+
+    /// 检查是否所有 worker 都已退出
+    pub fn is_empty(&self) -> bool {
+        self.free_mask.is_empty()
+    }
+
+    /// 获取位掩码的引用（用于传递给 WorkerCleanup）
+    pub fn free_mask(&self) -> Arc<WorkerMask> {
+        Arc::clone(&self.free_mask)
+    }
+
+    /// 迭代所有活跃 worker 的句柄
+    ///
+    /// # Returns
+    ///
+    /// 活跃 worker 句柄的迭代器
+    pub fn iter_active(&self) -> impl Iterator<Item = WorkerHandle<E>> + '_ {
+        self.slots.iter().enumerate().filter_map(|(id, slot)| {
+            let slot_arc = slot.load();
+            if slot_arc.as_ref().is_some() {
+                Some(WorkerHandle::new(id, Arc::clone(slot)))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 批量清空所有槽位（用于 shutdown）
+    ///
+    /// # Returns
+    ///
+    /// 返回所有被移除的槽位列表（带 worker_id）
+    pub fn clear_all(&self) -> Vec<(usize, WorkerSlot<E>)> {
+        (0..ConcurrencyDefaults::MAX_WORKER_COUNT)
+            .filter_map(|id| {
+                let old_slot_arc = self.slots[id].swap(Arc::new(None));
+                Arc::try_unwrap(old_slot_arc)
+                    .ok()
+                    .and_then(|s| s)
+                    .map(|slot| (id, slot))
+            })
+            .collect()
+    }
+}
+
 
 /// Worker 执行器 trait
 ///
@@ -267,7 +436,7 @@ pub struct WorkerHandle<E: WorkerExecutor> {
     /// Worker ID
     worker_id: usize,
     /// Worker 槽位的引用
-    slot: Arc<ArcSwap<Option<WorkerSlot<E>>>>,
+    slot: WorkerSlotArc<E>,
 }
 
 impl<E: WorkerExecutor> WorkerHandle<E> {
@@ -279,7 +448,7 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
     /// - `slot`: Worker 槽位的引用
     pub(crate) fn new(
         worker_id: usize,
-        slot: Arc<ArcSwap<Option<WorkerSlot<E>>>>,
+        slot: WorkerSlotArc<E>,
     ) -> Self {
         Self {
             worker_id,
@@ -382,9 +551,9 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
 pub(crate) struct WorkerCleanup<E: WorkerExecutor> {
     /// Worker ID
     worker_id: usize,
-    /// 该 worker 的 slot 引用（而非整个 workers 数组）
-    slot: Arc<ArcSwap<Option<WorkerSlot<E>>>>,
-    /// Worker 槽位空闲位掩码
+    /// 该 worker 的 slot 引用（用于清理）
+    slot: WorkerSlotArc<E>,
+    /// Worker 注册表的位掩码引用
     free_mask: Arc<WorkerMask>,
     /// Worker 全部退出通知器
     shutdown_notify: Arc<Notify>,
@@ -432,20 +601,14 @@ impl<E: WorkerExecutor> WorkerCleanup<E> {
 /// - 访问 worker 统计数据
 /// - Worker 自动清理（退出时自动释放资源）
 pub struct WorkerPool<E: WorkerExecutor> {
-    /// Worker 槽位数组（索引即为 worker_id，None 表示该位置空闲）
-    /// 使用固定大小数组和 ArcSwap 实现无锁并发访问
-    /// ArcSwap<T> = ArcSwapAny<Arc<T>>，所以这里是 Arc<Option<WorkerSlot>>
-    /// 外层 Arc 允许在 tokio::spawn 闭包中访问（worker 自动清理需要）
-    pub(crate) workers: [WorkerSlotArc<E>; ConcurrencyDefaults::MAX_WORKER_COUNT],
+    /// Worker 注册表（封装槽位数组和空闲位掩码）
+    pub(crate) registry: Arc<WorkerRegistry<E>>,
     /// 统一的结果接收器（所有 worker 共享）
     result_receiver: Receiver<E::Result>,
     /// 结果发送器的克隆（用于创建新 worker）
     result_sender: Sender<E::Result>,
     /// 执行器
     pub(crate) executor: E,
-    /// Worker 槽位空闲位掩码（1 表示已占用，0 表示空闲）
-    /// 用于快速查找空闲槽位和判断是否所有 worker 都已退出
-    free_mask: Arc<WorkerMask>,
     /// Worker 全部退出通知器
     shutdown_notify: Arc<Notify>,
 }
@@ -473,20 +636,22 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         let stats_for_worker = Arc::clone(&stats_arc);
         let executor_clone = self.executor.clone();
         
-        // 创建 WorkerSlot 并存入 workers 数组
+        // 创建 WorkerSlot 并存入注册表
         let slot = WorkerSlot {
             task_sender,
             stats: stats_arc,
             shutdown_sender: Some(shutdown_sender),
         };
-        self.workers[worker_id].store(Arc::new(Some(slot)));
+        self.registry.store(worker_id, slot);
         
-        // 创建清理器（只持有单个 slot 的引用）
-        let slot_ref = Arc::clone(&self.workers[worker_id]);
+        // 获取该 worker 的 slot 引用（用于清理）
+        let slot_ref = Arc::clone(self.registry.get(worker_id).unwrap());
+        
+        // 创建清理器
         let cleanup = WorkerCleanup {
             worker_id,
             slot: slot_ref,
-            free_mask: Arc::clone(&self.free_mask),
+            free_mask: self.registry.free_mask(),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
         };
         
@@ -509,7 +674,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         });
         
         // 创建并返回 worker 句柄
-        WorkerHandle::new(worker_id, Arc::clone(&self.workers[worker_id]))
+        WorkerHandle::new(worker_id, Arc::clone(self.registry.get(worker_id).unwrap()))
     }
 
     /// 创建新的协程池
@@ -533,31 +698,21 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     pub fn new(executor: E, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<(Self, Vec<WorkerHandle<E>>)> {
         let worker_count = contexts_with_stats.len();
         
-        // 验证 worker 数量不超过最大限制
-        if worker_count > ConcurrencyDefaults::MAX_WORKER_COUNT {
-            return Err(crate::DownloadError::WorkerCountExceeded(worker_count, ConcurrencyDefaults::MAX_WORKER_COUNT));
-        }
+        // 创建 worker 注册表
+        let registry = Arc::new(WorkerRegistry::new(worker_count)?);
         
         // 创建统一的 result channel（所有 worker 共享同一个 sender）
         let (result_sender, result_receiver) = mpsc::channel::<E::Result>(100);
         
-        // 初始化空闲位掩码
-        let free_mask = Arc::new(WorkerMask::new(worker_count)?);
-        
         // 初始化通知器
         let shutdown_notify = Arc::new(Notify::new());
         
-        // 使用 array::from_fn 初始化固定大小数组（暂时全部为 None）
-        let workers: [WorkerSlotArc<E>; ConcurrencyDefaults::MAX_WORKER_COUNT] = 
-            std::array::from_fn(|_| Arc::new(ArcSwap::new(Arc::new(None))));
-        
         // 创建 pool 实例（先不启动 workers）
         let pool = Self {
-            workers,
+            registry,
             result_receiver,
             result_sender: result_sender.clone(),
             executor,
-            free_mask: Arc::clone(&free_mask),
             shutdown_notify: Arc::clone(&shutdown_notify),
         };
         
@@ -600,8 +755,8 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         
         let mut handles = Vec::with_capacity(count);
         for (context, stats_arc) in contexts_with_stats.into_iter() {
-            // 使用位掩码快速查找第一个空位
-            let worker_id = self.free_mask.allocate()?;
+            // 使用注册表分配空闲槽位
+            let worker_id = self.registry.allocate()?;
             
             // 启动 worker（spawn_worker 直接返回句柄）
             let handle = self.spawn_worker(worker_id, context, stats_arc);
@@ -620,7 +775,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// 
     /// 使用位掩码快速计算，O(1) 时间复杂度
     pub fn worker_count(&self) -> usize {
-        self.free_mask.count()
+        self.registry.count()
     }
 
     /// 获取结果接收器的可变引用
@@ -651,21 +806,16 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// handle.send_task(task).await?;
     /// ```
     pub fn get_worker(&self, worker_id: usize) -> Option<WorkerHandle<E>> {
-        if worker_id >= ConcurrencyDefaults::MAX_WORKER_COUNT {
-            return None;
-        }
+        let slot_ref = self.registry.get(worker_id)?;
         
         // 检查 worker 是否存在
-        let slot_arc = self.workers[worker_id].load();
+        let slot_arc = slot_ref.load();
         if slot_arc.as_ref().is_none() {
             return None;
         }
         
         // 创建并返回 handle
-        Some(WorkerHandle::new(
-            worker_id,
-            Arc::clone(&self.workers[worker_id]),
-        ))
+        Some(WorkerHandle::new(worker_id, Arc::clone(slot_ref)))
     }
 
     /// 获取所有活跃 worker 的句柄列表
@@ -682,21 +832,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// }
     /// ```
     pub fn workers(&self) -> Vec<WorkerHandle<E>> {
-        self.workers
-            .iter()
-            .enumerate()
-            .filter_map(|(id, slot)| {
-                let slot_arc = slot.load();
-                if slot_arc.as_ref().is_some() {
-                    Some(WorkerHandle::new(
-                        id,
-                        Arc::clone(slot),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.registry.iter_active().collect()
     }
 
     /// 优雅关闭所有 workers
@@ -711,21 +847,16 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     pub fn shutdown(&mut self) {
         info!("发送关闭信号到所有活跃 workers");
         
-        let mut closed_count = 0;
+        // 批量清空所有槽位并获取需要关闭的 workers
+        let slots_to_close = self.registry.clear_all();
+        let closed_count = slots_to_close.len();
         
-        for id in 0..ConcurrencyDefaults::MAX_WORKER_COUNT {
-            // 原子性地取出 worker slot（swap 为 None）
-            let old_slot_arc = self.workers[id].swap(Arc::new(None));
-            
-            // 检查 worker 是否存在并发送关闭信号
-            if let Some(mut slot) = Arc::try_unwrap(old_slot_arc).ok().and_then(|s| s) {
-                // 取出 shutdown_sender 并发送关闭信号
-                if let Some(sender) = slot.shutdown_sender.take() {
-                    // 忽略发送错误（worker 可能已经退出）
-                    let _ = sender.send(());
-                    debug!("Worker #{} 关闭信号已发送", id);
-                    closed_count += 1;
-                }
+        // 向每个 worker 发送关闭信号
+        for (id, mut slot) in slots_to_close {
+            if let Some(sender) = slot.shutdown_sender.take() {
+                // 忽略发送错误（worker 可能已经退出）
+                let _ = sender.send(());
+                debug!("Worker #{} 关闭信号已发送", id);
             }
         }
         
@@ -744,7 +875,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// ```
     pub async fn wait_for_shutdown(&self) {
         // 如果已经没有运行中的 worker，直接返回
-        if self.free_mask.is_empty() {
+        if self.registry.is_empty() {
             debug!("没有运行中的 workers，无需等待");
             return;
         }
@@ -911,9 +1042,8 @@ mod tests {
         pool.wait_for_shutdown().await;
 
         // 验证所有 worker 都已被移除
-        for worker_slot in pool.workers.iter() {
-            assert!(worker_slot.load().is_none());
-        }
+        assert_eq!(pool.worker_count(), 0);
+        assert!(pool.registry.is_empty());
     }
     
     // ==================== WorkerHandle API 基础测试 ====================

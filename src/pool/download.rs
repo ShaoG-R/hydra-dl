@@ -562,15 +562,14 @@ where
     ///
     /// 所有活跃 worker 的统计信息向量
     pub(crate) fn get_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
-        self.pool.workers.iter()
-            .enumerate()
-            .filter_map(|(id, worker_slot)| {
-                // load() 返回 Arc<Option<WorkerSlot>>
-                let slot_arc = worker_slot.load();
-                slot_arc.as_ref().as_ref().map(|worker| {
+        self.pool.workers()
+            .into_iter()
+            .filter_map(|handle| {
+                let id = handle.worker_id();
+                handle.stats().map(|worker_stats| {
                     let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid, _window_avg_speed, _window_avg_valid) = 
-                        worker.stats.get_full_summary();
-                    let current_chunk_size = worker.stats.get_current_chunk_size();
+                        worker_stats.get_full_summary();
+                    let current_chunk_size = worker_stats.get_current_chunk_size();
                     WorkerStatSnapshot {
                         worker_id: id,
                         bytes: worker_bytes,
@@ -653,10 +652,9 @@ mod tests {
         // 等待 workers 完成清理（使用事件通知，非轮询）
         pool.wait_for_shutdown().await;
 
-        // 验证所有 worker 都已被移除（slot 为 None）
-        for worker_slot in pool.pool.workers.iter() {
-            assert!(worker_slot.load().is_none());
-        }
+        // 验证所有 worker 都已被移除
+        assert_eq!(pool.pool.worker_count(), 0);
+        assert!(pool.pool.registry.is_empty());
     }
 
     #[tokio::test]

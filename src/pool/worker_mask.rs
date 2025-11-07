@@ -199,7 +199,6 @@ impl WorkerMask {
     /// 
     /// 如果 `worker_id >= MAX_WORKERS` 则 panic
     #[inline]
-    #[allow(dead_code)]
     pub fn is_allocated(&self, worker_id: usize) -> bool {
         assert!(worker_id < MAX_WORKERS, "worker_id {} 超出范围 [0, {})", worker_id, MAX_WORKERS);
         
