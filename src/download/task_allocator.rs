@@ -588,8 +588,8 @@ mod tests {
         assert_eq!(failures[2].1, "Error 3");
     }
 
-    #[test]
-    fn test_pending_retry_count_accuracy() {
+    #[tokio::test]
+    async fn test_pending_retry_count_accuracy() {
         let mut allocator = create_test_allocator(1000);
         
         // 初始为 0
