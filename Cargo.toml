@@ -26,7 +26,7 @@ portable-atomic = "1.11.1"
 
 # 下面的crates是由本库作者维护
 kestrel-timer = "0.3.0"
-ranged-mmap = "0.1.1"
+ranged-mmap = "0.1.2"
 
 
 [dev-dependencies]
