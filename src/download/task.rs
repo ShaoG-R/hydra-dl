@@ -1,11 +1,11 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use log::{debug, error, info, warn};
 use kestrel_timer::{TaskId, TimerService};
 use ranged_mmap::AllocatedRange;
+use rustc_hash::FxHashMap;
 use crate::download::{
-    progress_reporter::ProgressReporter,
+    progress_reporter::{ProgressReporter, WorkerStatsRef},
     progressive::{ProgressiveLauncher, WorkerLaunchExecutor, LaunchDecision},
     task_allocator::{FailedRange, TaskAllocator},
     worker_health_checker::{WorkerHealthChecker, WorkerSpeed},
@@ -50,7 +50,7 @@ pub struct DownloadTask<C: HttpClient> {
     ///
     /// 用于内部管理每个 worker 当前任务的取消功能
     /// 当需要中止某个 worker 的任务时，可以通过发送取消信号来实现
-    cancel_senders: HashMap<usize, tokio::sync::oneshot::Sender<()>>,
+    cancel_senders: FxHashMap<usize, tokio::sync::oneshot::Sender<()>>,
     /// Worker 句柄缓存（worker_id -> handle）
     worker_handles: Vec<crate::pool::download::DownloadWorkerHandle<C>>,
 }
@@ -102,7 +102,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             config,
             progressive_launcher,
             timer_service,
-            cancel_senders: HashMap::new(),
+            cancel_senders: FxHashMap::default(),
             worker_handles: initial_handles,
         })
     }
@@ -144,7 +144,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 处理进度更新定时器触发
     async fn handle_progress_tick(&mut self) -> LoopControl {
-        self.send_progress().await;
+        self.send_progress();
 
         // 执行健康检查，检测并终止异常下载线程
         self.check_and_handle_unhealthy_workers();
@@ -310,11 +310,37 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.check_completion_status()
     }
 
+    /// 收集 worker 原始统计数据
+    ///
+    /// 从 pool 收集 worker 统计引用，让 actor 内部计算
+    fn collect_worker_stats(&self) -> Vec<WorkerStatsRef> {
+        self.pool.workers()
+            .into_iter()
+            .filter_map(|handle| {
+                let worker_id = handle.worker_id();
+                handle.stats().map(|stats| WorkerStatsRef {
+                    worker_id,
+                    stats,
+                })
+            })
+            .collect()
+    }
+    
     /// 发送进度更新
     ///
     /// 定期发送进度更新（分块大小由各 worker 独立调整）
-    async fn send_progress(&mut self) {
-        self.progress_reporter.send_progress_update(&self.pool).await;
+    fn send_progress(&self) {
+        let total_avg_speed = self.pool.get_total_speed();
+        let (total_instant_speed, instant_valid) = self.pool.get_total_instant_speed();
+        let (total_bytes, _, _) = self.pool.get_total_stats();
+        let worker_stats = self.collect_worker_stats();
+        
+        self.progress_reporter.send_stats_update(
+            total_bytes,
+            total_avg_speed,
+            if instant_valid { Some(total_instant_speed) } else { None },
+            worker_stats,
+        );
     }
 
     /// 分配初始任务给所有空闲的 worker
@@ -378,7 +404,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                     // 失败了，将 worker 放回队列
                     self.task_allocator.mark_worker_idle(target_worker);
                 } else {
-                    // 保存取消 sender
+                    // 保存取消通道，稍后由调用者保存
                     self.cancel_senders.insert(target_worker, cancel_tx);
                 }
             } else {
@@ -398,10 +424,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         if self.task_allocator.remaining() == 0
             && self.task_allocator.pending_retry_count() == 0
             && self.writer.is_complete() {
-            info!(
-                "所有任务已完成，总共完成 {} 个 range",
-                self.progress_reporter.total_ranges_completed()
-            );
+            info!("所有任务已完成");
             return LoopControl::Break;
         }
 
@@ -501,7 +524,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     pub(super) async fn shutdown_and_cleanup(mut self, error_msg: Option<String>) -> crate::Result<()> {
         // 发送错误事件
         if let Some(ref msg) = error_msg {
-            self.progress_reporter.send_error(msg).await;
+            self.progress_reporter.send_error(msg);
         }
 
         // 清理所有取消 sender
@@ -512,6 +535,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 等待所有 workers 完成自动清理
         self.pool.wait_for_shutdown().await;
+        
+        // 关闭 progress reporter actor
+        self.progress_reporter.shutdown();
 
         if let Some(msg) = error_msg {
             return Err(DownloadError::Other(msg));
@@ -606,8 +632,18 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 完成并清理资源
     pub(super) async fn finalize_and_cleanup(mut self, save_path: PathBuf) -> crate::Result<()> {
+        // 收集完成统计数据
+        let total_avg_speed = self.pool.get_total_speed();
+        let (total_bytes, total_secs, _) = self.pool.get_total_stats();
+        let worker_stats = self.collect_worker_stats();
+        
         // 发送完成统计
-        self.progress_reporter.send_completion_stats(&self.pool).await;
+        self.progress_reporter.send_completion(
+            total_bytes,
+            total_avg_speed,
+            total_secs,
+            worker_stats,
+        );
 
         // 清理所有取消 sender
         self.cancel_senders.clear();
@@ -622,6 +658,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 释放 pool（它持有 writer 的引用）
         drop(pool);
+        
+        // 关闭 progress reporter actor
+        self.progress_reporter.shutdown();
 
         // 完成写入
         self.writer.finalize()?;

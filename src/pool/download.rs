@@ -18,7 +18,6 @@ use crate::utils::{
     stats::{TaskStats, WorkerStats},
     writer::MmapWriter,
 };
-use crate::download::WorkerStatSnapshot;
 use async_trait::async_trait;
 use log::{debug, error, info};
 use std::sync::Arc;
@@ -555,34 +554,6 @@ where
     pub(crate) async fn wait_for_shutdown(&self) {
         self.pool.wait_for_shutdown().await;
     }
-
-    /// 获取所有活跃 worker 的统计快照
-    ///
-    /// # Returns
-    ///
-    /// 所有活跃 worker 的统计信息向量
-    pub(crate) fn get_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
-        self.pool.workers()
-            .into_iter()
-            .filter_map(|handle| {
-                let id = handle.worker_id();
-                handle.stats().map(|worker_stats| {
-                    let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid, _window_avg_speed, _window_avg_valid) = 
-                        worker_stats.get_full_summary();
-                    let current_chunk_size = worker_stats.get_current_chunk_size();
-                    WorkerStatSnapshot {
-                        worker_id: id,
-                        bytes: worker_bytes,
-                        ranges: worker_ranges,
-                        avg_speed,
-                        instant_speed: if instant_valid { Some(instant_speed) } else { None },
-                        current_chunk_size,
-                    }
-                })
-            })
-            .collect()
-    }
-
 }
 
 #[cfg(test)]
