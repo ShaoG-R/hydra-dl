@@ -1,18 +1,52 @@
-//! 任务分配器模块
+//! 任务分配器 Actor 模块
 //! 
-//! 负责管理任务分配、空闲 worker 队列和失败任务重试
+//! 使用 Actor 模式管理任务分配、超时监听、任务结果监听和取消监听
 
 use crate::{Result, DownloadError};
-use crate::task::WorkerTask;
-use kestrel_timer::{TaskId, TimerService, TimerTask};
+use crate::task::{WorkerTask, RangeResult};
+use kestrel_timer::{TaskId, TimerService, TimerTask, TaskNotification, spsc};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
-use log::{debug, error};
+use std::sync::Arc;
+use log::{debug, error, info, warn};
 use ranged_mmap::{AllocatedRange, RangeAllocator};
+use tokio::sync::{mpsc, oneshot};
+use crate::download::worker_health_checker::WorkerCancelRequest;
+use crate::pool::download::DownloadWorkerHandle;
+use crate::utils::io_traits::HttpClient;
+use arc_swap::ArcSwap;
 
 /// 失败的 Range 信息
 pub(super) type FailedRange = (AllocatedRange, String);
+
+/// 任务完成结果
+#[derive(Debug)]
+pub(super) enum CompletionResult {
+    /// 所有任务成功完成
+    Success,
+    /// 有任务永久失败
+    PermanentFailure {
+        failures: Vec<FailedRange>,
+    },
+}
+
+/// TaskAllocator Actor 的消息类型
+pub(super) enum AllocatorMessage {
+    /// 标记 worker 为空闲
+    MarkWorkerIdle {
+        worker_id: u64,
+    },
+    /// 注册新启动的 workers（批量标记为空闲并添加到活跃集合）
+    RegisterNewWorkers {
+        worker_ids: Vec<u64>,
+    },
+    /// 获取永久失败的任务
+    /// 分配初始任务
+    AllocateInitialTasks,
+    /// 关闭 Actor
+    Shutdown,
+}
 
 /// 已分配的任务（封装任务和取消通道）
 pub(super) struct AllocatedTask {
@@ -42,10 +76,10 @@ pub(super) struct FailedTaskInfo {
     pub(super) retry_count: usize,
 }
 
-/// 任务分配器
+/// 任务分配器内部状态
 /// 
-/// 负责管理任务分配、空闲 worker 队列和失败任务重试
-pub(super) struct TaskAllocator {
+/// 管理 range 分配、空闲 worker 和失败任务
+struct TaskAllocatorState {
     /// Range 分配器
     allocator: RangeAllocator,
     /// 下载 URL
@@ -60,9 +94,9 @@ pub(super) struct TaskAllocator {
     permanently_failed: Vec<(AllocatedRange, String)>,
 }
 
-impl TaskAllocator {
-    /// 创建新的任务分配器
-    pub(super) fn new(
+impl TaskAllocatorState {
+    /// 创建新的任务分配器状态
+    fn new(
         allocator: RangeAllocator,
         url: String,
     ) -> Self {
@@ -283,27 +317,458 @@ impl TaskAllocator {
     }
 }
 
+
+/// TaskAllocator Actor 实体
+/// 
+/// 管理任务分配、超时监听、结果处理和取消处理
+pub(super) struct TaskAllocatorActor<C: HttpClient> {
+    /// 内部状态
+    state: TaskAllocatorState,
+    /// 定时器服务
+    timer_service: TimerService,
+    /// 定时器超时接收器
+    timeout_rx: Option<spsc::Receiver<TaskNotification, 32>>,
+    /// Worker 结果接收器
+    result_rx: mpsc::Receiver<RangeResult>,
+    /// 取消请求接收器
+    cancel_rx: mpsc::Receiver<WorkerCancelRequest>,
+    /// 消息接收器
+    message_rx: mpsc::Receiver<AllocatorMessage>,
+    /// 配置
+    config: Arc<crate::config::DownloadConfig>,
+    /// Worker 句柄映射
+    worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+    /// 任务取消 sender 映射
+    cancel_senders: FxHashMap<u64, oneshot::Sender<()>>,
+    /// 活跃 worker 集合
+    active_workers: im::HashSet<u64>,
+    /// 完成通知发送器（当所有任务完成时发送）
+    completion_tx: Option<oneshot::Sender<CompletionResult>>,
+}
+
+impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
+    /// 创建新的 TaskAllocator Actor 并启动
+    pub(super) fn new(
+        allocator: RangeAllocator,
+        url: String,
+        mut timer_service: TimerService,
+        result_rx: mpsc::Receiver<RangeResult>,
+        cancel_rx: mpsc::Receiver<WorkerCancelRequest>,
+        config: Arc<crate::config::DownloadConfig>,
+        worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+    ) -> (TaskAllocatorHandle, oneshot::Receiver<CompletionResult>) {
+        let (message_tx, message_rx) = mpsc::channel(100);
+        let (completion_tx, completion_rx) = oneshot::channel();
+        
+        let timeout_rx = timer_service.take_receiver();
+        
+        let actor = Self {
+            state: TaskAllocatorState::new(allocator, url),
+            timer_service,
+            timeout_rx,
+            result_rx,
+            cancel_rx,
+            message_rx,
+            config,
+            worker_handles,
+            cancel_senders: FxHashMap::default(),
+            active_workers: im::HashSet::new(),
+            completion_tx: Some(completion_tx),
+        };
+        
+        // 启动 Actor
+        let actor_handle = tokio::spawn(actor.run());
+        
+        let handle = TaskAllocatorHandle {
+            message_tx,
+            actor_handle: Arc::new(tokio::sync::Mutex::new(Some(actor_handle))),
+        };
+        
+        (handle, completion_rx)
+    }
+    
+    /// 运行 Actor 主循环
+    pub(super) async fn run(mut self) {
+        info!("TaskAllocator Actor 启动");
+        
+        loop {
+            tokio::select! {
+                // 处理定时器超时事件
+                Some(notification) = async {
+                    self.timeout_rx.as_mut()?.recv().await
+                }, if self.timeout_rx.is_some() => {
+                    self.handle_retry_timeout(notification.task_id()).await;
+                }
+                
+                // 处理 worker 结果
+                Some(result) = self.result_rx.recv() => {
+                    if !self.handle_worker_result(result).await {
+                        break;
+                    }
+                }
+                
+                // 处理取消请求
+                Some(request) = self.cancel_rx.recv() => {
+                    self.handle_cancel_request(request).await;
+                }
+                
+                // 处理消息
+                Some(msg) = self.message_rx.recv() => {
+                    if !self.handle_message(msg).await {
+                        break;
+                    }
+                }
+                
+                else => {
+                    debug!("所有通道已关闭，Actor 退出");
+                    break;
+                }
+            }
+        }
+        
+        info!("TaskAllocator Actor 停止");
+    }
+    
+    /// 处理消息
+    async fn handle_message(&mut self, msg: AllocatorMessage) -> bool {
+        match msg {
+            AllocatorMessage::MarkWorkerIdle { worker_id } => {
+                self.state.mark_worker_idle(worker_id);
+            }
+            AllocatorMessage::RegisterNewWorkers { worker_ids } => {
+                for worker_id in worker_ids {
+                    // 将新 worker 加入空闲队列
+                    self.state.mark_worker_idle(worker_id);
+                    // 标记为活跃
+                    self.active_workers.insert(worker_id);
+                }
+            }
+            AllocatorMessage::AllocateInitialTasks => {
+                self.allocate_initial_tasks().await;
+            }
+            AllocatorMessage::Shutdown => {
+                return false;
+            }
+        }
+        true
+    }
+    
+    /// 处理重试超时事件
+    async fn handle_retry_timeout(&mut self, timer_id: TaskId) {
+        let Some(info) = self.state.pop_failed_task(timer_id) else {
+            return;
+        };
+
+        let (start, end) = info.range.as_range_tuple();
+        info!(
+            "定时器触发，重试任务 range {}..{}, 重试次数 {}",
+            start, end, info.retry_count
+        );
+
+        // 从空闲队列获取 worker
+        if let Some(worker_id) = self.state.idle_workers.pop_front() {
+            // 有空闲 worker，创建任务和取消通道
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let task = WorkerTask::Range {
+                url: self.state.url().to_string(),
+                range: info.range,
+                retry_count: info.retry_count,
+                cancel_rx,
+            };
+
+            if let Some(handle) = self.worker_handles.load().get(&worker_id) {
+                if let Err(e) = handle.send_task(task).await {
+                    error!("分配重试任务失败: {:?}", e);
+                    self.state.mark_worker_idle(worker_id);
+                    self.state.push_ready_retry_task(info);
+                } else {
+                    self.cancel_senders.insert(worker_id, cancel_tx);
+                    self.active_workers.insert(worker_id);
+                }
+            } else {
+                error!("Worker #{} 不存在", worker_id);
+                self.state.mark_worker_idle(worker_id);
+                self.state.push_ready_retry_task(info);
+            }
+        } else {
+            debug!("定时器触发但没有空闲 worker，推入就绪队列");
+            self.state.push_ready_retry_task(info);
+        }
+    }
+    
+    /// 处理 worker 结果
+    async fn handle_worker_result(&mut self, result: RangeResult) -> bool {
+        match result {
+            RangeResult::Complete { worker_id } => {
+                self.handle_complete(worker_id).await;
+            }
+            RangeResult::DownloadFailed { worker_id, range, error, retry_count } => {
+                self.handle_failed(worker_id, range, error, retry_count).await;
+            }
+            RangeResult::WriteFailed { worker_id, range, error } => {
+                let (start, end) = range.as_range_tuple();
+                error!(
+                    "Worker #{} 写入失败，终止下载 (range: {}..{}): {}",
+                    worker_id, start, end, error
+                );
+                return false;
+            }
+        }
+        
+        // 检查是否有永久失败
+        if self.state.has_permanent_failures() {
+            let failures = self.state.get_permanent_failures().to_vec();
+            info!("遇到永久失败，终止下载：{} 个任务失败", failures.len());
+            // 发送失败通知
+            if let Some(tx) = self.completion_tx.take() {
+                let _ = tx.send(CompletionResult::PermanentFailure { failures });
+            }
+            return false;
+        }
+        
+        // 检查是否所有任务已完成
+        if self.state.remaining() == 0
+            && self.state.pending_retry_count() == 0
+            && self.active_workers.is_empty() {
+            info!("所有任务已成功完成");
+            // 发送成功通知
+            if let Some(tx) = self.completion_tx.take() {
+                let _ = tx.send(CompletionResult::Success);
+            }
+            return false;
+        }
+        
+        true
+    }
+    
+    /// 处理任务完成
+    async fn handle_complete(&mut self, worker_id: u64) {
+        // 移除取消 sender
+        self.cancel_senders.remove(&worker_id);
+        self.active_workers.remove(&worker_id);
+        
+        // 标记为空闲
+        self.state.mark_worker_idle(worker_id);
+        
+        // 尝试分配新任务
+        self.try_allocate_next_task(worker_id).await;
+    }
+    
+    /// 处理任务失败
+    async fn handle_failed(
+        &mut self,
+        worker_id: u64,
+        range: AllocatedRange,
+        error: String,
+        retry_count: usize,
+    ) {
+        let (start, end) = range.as_range_tuple();
+        warn!(
+            "Worker #{} Range {}..{} 失败 (重试 {}): {}",
+            worker_id, start, end, retry_count, error
+        );
+        
+        // 移除取消 sender
+        self.cancel_senders.remove(&worker_id);
+        self.active_workers.remove(&worker_id);
+        
+        // 标记为空闲
+        self.state.mark_worker_idle(worker_id);
+        
+        // 调度重试
+        self.schedule_retry_task(range, retry_count);
+        
+        // 尝试分配新任务
+        self.try_allocate_next_task(worker_id).await;
+    }
+    
+    /// 处理取消请求
+    async fn handle_cancel_request(&mut self, request: WorkerCancelRequest) {
+        let WorkerCancelRequest { worker_id, reason } = request;
+        
+        info!("收到 Worker #{} 取消请求: {}", worker_id, reason);
+        
+        if let Some(cancel_tx) = self.cancel_senders.remove(&worker_id) {
+            let _ = cancel_tx.send(());
+            self.active_workers.remove(&worker_id);
+            info!("已取消 Worker #{} 的任务", worker_id);
+        }
+    }
+    
+    /// 分配初始任务
+    async fn allocate_initial_tasks(&mut self) {
+        info!("开始分配初始任务");
+        
+        while let Some(&worker_id) = self.state.idle_workers.front() {
+            let chunk_size = self.worker_handles.load().get(&worker_id)
+                .map(|h| h.chunk_size())
+                .unwrap_or(self.config.chunk().initial_size());
+            
+            if let Some(allocated) = self.state.try_allocate_task_to_idle_worker(chunk_size) {
+                let (task, worker_id, cancel_tx) = allocated.into_parts();
+                info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
+                
+                if let Some(handle) = self.worker_handles.load().get(&worker_id) {
+                    if let Err(e) = handle.send_task(task).await {
+                        error!("初始任务分配失败: {:?}", e);
+                        self.state.mark_worker_idle(worker_id);
+                    } else {
+                        self.cancel_senders.insert(worker_id, cancel_tx);
+                        self.active_workers.insert(worker_id);
+                    }
+                } else {
+                    error!("Worker #{} 不存在", worker_id);
+                    self.state.mark_worker_idle(worker_id);
+                }
+            } else {
+                info!("没有足够的数据为空闲 workers 分配更多任务");
+                break;
+            }
+        }
+    }
+    
+    /// 尝试为 worker 分配下一个任务
+    async fn try_allocate_next_task(&mut self, worker_id: u64) {
+        let chunk_size = self.worker_handles.load().get(&worker_id)
+            .map(|h| h.chunk_size())
+            .unwrap_or(self.config.chunk().initial_size());
+        
+        if let Some(allocated) = self.state.try_allocate_task_to_idle_worker(chunk_size) {
+            let (task, target_worker, cancel_tx) = allocated.into_parts();
+            debug!(
+                "Worker #{} 分配新任务到空闲 Worker #{}，分块大小 {} bytes",
+                worker_id, target_worker, chunk_size
+            );
+            
+            if let Some(handle) = self.worker_handles.load().get(&target_worker) {
+                if let Err(e) = handle.send_task(task).await {
+                    error!("分配新任务失败: {:?}", e);
+                    self.state.mark_worker_idle(target_worker);
+                } else {
+                    self.cancel_senders.insert(target_worker, cancel_tx);
+                    self.active_workers.insert(target_worker);
+                }
+            } else {
+                error!("Worker #{} 不存在", target_worker);
+                self.state.mark_worker_idle(target_worker);
+            }
+        } else {
+            debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
+        }
+    }
+    
+    /// 调度重试任务
+    fn schedule_retry_task(&mut self, range: AllocatedRange, retry_count: usize) {
+        let max_retry = self.config.retry().max_retry_count();
+        let (start, end) = range.as_range_tuple();
+        
+        if retry_count < max_retry {
+            let retry_delays = self.config.retry().retry_delays();
+            let delay = if retry_count < retry_delays.len() {
+                retry_delays[retry_count]
+            } else {
+                *retry_delays.last().unwrap_or(&std::time::Duration::from_secs(3))
+            };
+            
+            info!(
+                "任务 range {}..{} 将在 {:.1}s 后进行第 {} 次重试",
+                start, end, delay.as_secs_f64(), retry_count + 1
+            );
+            
+            if let Err(e) = self.state.record_failed_task(
+                range,
+                retry_count + 1,
+                delay,
+                &self.timer_service,
+            ) {
+                error!("注册重试定时器失败: {:?}", e);
+                self.state.record_permanent_failure(
+                    range,
+                    format!("注册定时器失败: {}", e)
+                );
+            }
+        } else {
+            error!(
+                "任务 range {}..{} 已达到最大重试次数 {}，标记为永久失败",
+                start, end, max_retry
+            );
+            self.state.record_permanent_failure(range, "达到最大重试次数".to_string());
+        }
+    }
+}
+
+/// TaskAllocator Handle
+/// 
+/// 用于与 TaskAllocator Actor 通信的句柄
+pub(super) struct TaskAllocatorHandle {
+    message_tx: mpsc::Sender<AllocatorMessage>,
+    /// Actor 任务句柄（使用 Arc 包裹以支持 clone）
+    actor_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl TaskAllocatorHandle {
+    
+    /// 标记 worker 为空闲
+    pub(super) async fn mark_worker_idle(&self, worker_id: u64) {
+        let _ = self.message_tx.send(AllocatorMessage::MarkWorkerIdle {
+            worker_id,
+        }).await;
+    }
+    
+    /// 批量注册新启动的 workers（标记为空闲并添加到活跃集合）
+    pub(super) async fn register_new_workers(&self, worker_ids: Vec<u64>) {
+        let _ = self.message_tx.send(AllocatorMessage::RegisterNewWorkers {
+            worker_ids,
+        }).await;
+    }
+    
+    /// 分配初始任务
+    pub(super) async fn allocate_initial_tasks(&self) {
+        let _ = self.message_tx.send(AllocatorMessage::AllocateInitialTasks).await;
+    }
+    
+    /// 关闭 Actor 并等待其完全停止
+    pub(super) async fn shutdown_and_wait(&self) {
+        // 发送关闭消息
+        let _ = self.message_tx.send(AllocatorMessage::Shutdown).await;
+        
+        // 等待 Actor 停止
+        if let Some(handle) = self.actor_handle.lock().await.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Clone for TaskAllocatorHandle {
+    fn clone(&self) -> Self {
+        Self {
+            message_tx: self.message_tx.clone(),
+            actor_handle: Arc::clone(&self.actor_handle),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kestrel_timer::{TimerWheel, config::ServiceConfig};
 
-    /// 创建测试用的 TaskAllocator
+    /// 创建测试用的 TaskAllocatorState
     /// 
     /// 通过创建临时文件来获取 RangeAllocator
-    fn create_test_allocator(size: u64) -> TaskAllocator {
+    fn create_test_allocator(size: u64) -> TaskAllocatorState {
         use tempfile::NamedTempFile;
         use ranged_mmap::MmapFile;
         
         let temp_file = NamedTempFile::new().unwrap();
         let (_file, allocator) = MmapFile::create(temp_file.path(), NonZeroU64::new(size).unwrap()).unwrap();
-        TaskAllocator::new(allocator, "http://example.com/file.bin".to_string())
+        TaskAllocatorState::new(allocator, "http://example.com/file.bin".to_string())
     }
     
-    /// 从 TaskAllocator 中分配一个 range（用于测试）
+    /// 从 TaskAllocatorState 中分配一个 range（用于测试）
     /// 
     /// 直接从底层的 RangeAllocator 分配，不经过任务分配逻辑
-    fn allocate_range_from(allocator: &mut TaskAllocator, size: u64) -> AllocatedRange {
+    fn allocate_range_from(allocator: &mut TaskAllocatorState, size: u64) -> AllocatedRange {
         allocator.allocator.allocate(NonZeroU64::new(size).unwrap())
             .expect("Failed to allocate range")
     }

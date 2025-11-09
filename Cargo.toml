@@ -26,7 +26,7 @@ arc-swap = "1.7.1"
 im = "15.1.0"
 
 # 下面的crates是由本库作者维护
-kestrel-timer = "0.3.1"
+kestrel-timer = "0.3.2"
 ranged-mmap = "0.1.2"
 deferred-map = "0.1.2"
 

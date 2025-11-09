@@ -75,8 +75,6 @@ pub enum DownloadProgress {
 /// Actor 消息类型
 #[derive(Debug)]
 enum ActorMessage {
-    /// 记录 range 完成
-    RecordRangeComplete,
     /// 发送开始事件
     SendStarted {
         worker_count: u64,
@@ -98,8 +96,6 @@ enum ActorMessage {
 struct ProgressReporterActor<C: crate::utils::io_traits::HttpClient> {
     /// 进度发送器
     progress_sender: Option<mpsc::Sender<DownloadProgress>>,
-    /// 已完成的 range 总数
-    total_ranges_completed: usize,
     /// 文件总大小
     total_size: NonZeroU64,
     /// 消息接收器（async channel）
@@ -127,7 +123,6 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
         
         Self {
             progress_sender,
-            total_ranges_completed: 0,
             total_size,
             message_rx,
             worker_handles,
@@ -149,9 +144,6 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
                 // 外部消息
                 msg = self.message_rx.recv() => {
                     match msg {
-                        Some(ActorMessage::RecordRangeComplete) => {
-                            self.total_ranges_completed += 1;
-                        }
                         Some(ActorMessage::SendStarted { worker_count, initial_chunk_size }) => {
                             self.send_started_event(worker_count, initial_chunk_size).await;
                         }
@@ -337,14 +329,6 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
         });
     }
     
-    /// 记录一个 range 完成
-    pub(super) fn record_range_complete(&self) {
-        let tx = self.message_tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(ActorMessage::RecordRangeComplete).await;
-        });
-    }
-    
     /// 关闭 actor
     pub(super) fn shutdown(&self) {
         let tx = self.message_tx.clone();
@@ -475,28 +459,6 @@ mod tests {
         reporter.send_error("Test error");
         
         // 给 actor 一些时间处理消息
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
-
-    #[tokio::test]
-    async fn test_shutdown() {
-        let (tx, _rx) = mpsc::channel(10);
-        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
-        let global_stats = create_mock_global_stats();
-        let reporter = ProgressReporter::new(
-            Some(tx),
-            NonZeroU64::new(1000).unwrap(),
-            worker_handles,
-            global_stats,
-            std::time::Duration::from_secs(1),
-        );
-        
-        reporter.record_range_complete();
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        
-        reporter.shutdown();
-        
-        // 给 actor 一些时间关闭
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 }

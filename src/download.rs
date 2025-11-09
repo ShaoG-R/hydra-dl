@@ -211,7 +211,7 @@ where
         total_size: content_length,
         timer_service,
         config: Arc::clone(&config),
-    })?;
+    }).await?;
     
     // 发送开始事件（使用第一个 worker 的初始分块大小）
     let current_worker_count = task.worker_count();
