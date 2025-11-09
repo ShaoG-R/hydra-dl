@@ -349,8 +349,6 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
 pub struct WorkerPool<E: WorkerExecutor> {
     /// Worker 槽位存储（使用 DeferredMap）
     pub(crate) slots: DeferredMap<WorkerSlot>,
-    /// 统一的结果接收器（所有 worker 共享）
-    result_receiver: Receiver<E::Result>,
     /// 结果发送器的克隆（用于创建新 worker）
     result_sender: Sender<E::Result>,
     /// 执行器
@@ -421,16 +419,16 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     ///
     /// # Returns
     ///
-    /// 返回新创建的 WorkerPool 和所有初始 worker 的句柄
+    /// 返回新创建的 WorkerPool、所有初始 worker 的句柄以及结果接收器
     ///
     /// # Example
     ///
     /// ```ignore
     /// let executor = MyExecutor;
     /// let contexts_with_stats = vec![(MyContext::new(), Arc::new(MyStats::new())); 4];
-    /// let (pool, handles) = WorkerPool::new(executor, contexts_with_stats)?;
+    /// let (pool, handles, result_receiver) = WorkerPool::new(executor, contexts_with_stats)?;
     /// ```
-    pub fn new(executor: E, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<(Self, Vec<WorkerHandle<E>>)> {
+    pub fn new(executor: E, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<(Self, Vec<WorkerHandle<E>>, Receiver<E::Result>)> {
         let worker_count = contexts_with_stats.len();
         
         // 创建 DeferredMap
@@ -442,7 +440,6 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         // 创建 pool 实例（先不启动 workers）
         let mut pool = Self {
             slots,
-            result_receiver,
             result_sender: result_sender.clone(),
             executor,
         };
@@ -466,7 +463,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         
         info!("创建协程池，{} 个初始 workers", worker_count);
 
-        Ok((pool, handles))
+        Ok((pool, handles, result_receiver))
     }
 
     /// 动态添加新的 worker
@@ -518,17 +515,6 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// 获取当前活跃 worker 总数
     pub fn worker_count(&self) -> u64 {
         self.slots.len() as u64
-    }
-
-    /// 获取结果接收器的可变引用
-    ///
-    /// 允许调用者接收 worker 返回的结果
-    ///
-    /// # Returns
-    ///
-    /// 结果接收器的可变引用
-    pub fn result_receiver(&mut self) -> &mut Receiver<E::Result> {
-        &mut self.result_receiver
     }
 
     /// 优雅关闭所有 workers
@@ -710,7 +696,7 @@ mod tests {
         let result = WorkerPool::new(executor, contexts);
         assert!(result.is_ok());
         
-        let (mut pool, handles) = result.unwrap();
+        let (mut pool, handles, _result_receiver) = result.unwrap();
         assert_eq!(pool.worker_count(), 4);
         assert_eq!(handles.len(), 4);
         
@@ -727,7 +713,7 @@ mod tests {
         let result = WorkerPool::new(executor, contexts);
         assert!(result.is_ok());
         
-        let (mut pool, handles) = result.unwrap();
+        let (mut pool, handles, _result_receiver) = result.unwrap();
         assert_eq!(pool.worker_count(), 0);
         assert_eq!(handles.len(), 0);
         
@@ -739,7 +725,7 @@ mod tests {
     async fn test_send_and_receive() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(2);
-        let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
         
         // 向第一个 worker 发送任务
         let task = TestTask {
@@ -750,7 +736,7 @@ mod tests {
         handles[0].send_task(task).await.unwrap();
         
         // 接收结果
-        if let Some(result) = pool.result_receiver().recv().await {
+        if let Some(result) = result_receiver.recv().await {
             match result {
                 TestResult::Success { worker_id: _, task_id } => {
                     assert_eq!(task_id, 1);
@@ -770,7 +756,7 @@ mod tests {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(1);
         let stats_ref = contexts[0].1.clone();
-        let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
         
         // 发送多个任务
         for i in 0..5 {
@@ -783,7 +769,7 @@ mod tests {
         
         // 接收所有结果
         for _ in 0..5 {
-            pool.result_receiver().recv().await;
+            result_receiver.recv().await;
         }
         
         // 验证统计数据
@@ -798,7 +784,7 @@ mod tests {
     async fn test_add_workers() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(2);
-        let (mut pool, _) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, _, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
         
         assert_eq!(pool.worker_count(), 2);
         
@@ -817,7 +803,7 @@ mod tests {
     async fn test_worker_handle_id() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(3);
-        let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
         
         // 验证每个 handle 的 worker_id 是唯一的
         let ids: Vec<u64> = handles.iter().map(|h| h.worker_id()).collect();
@@ -838,7 +824,7 @@ mod tests {
     async fn test_graceful_shutdown() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(4);
-        let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
         
         // 发送一些任务
         for i in 0..10 {
@@ -865,7 +851,7 @@ mod tests {
     async fn test_failing_executor() {
         let executor = FailingExecutor;
         let contexts = create_contexts_with_stats(2);
-        let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
         
         // 发送任务
         let task = TestTask {
@@ -875,7 +861,7 @@ mod tests {
         handles[0].send_task(task).await.unwrap();
         
         // 接收结果
-        if let Some(result) = pool.result_receiver().recv().await {
+        if let Some(result) = result_receiver.recv().await {
             match result {
                 TestResult::Failed { worker_id: _, error } => {
                     assert_eq!(error, "intentional failure");
@@ -894,7 +880,7 @@ mod tests {
     async fn test_worker_handle_clone() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(1);
-        let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
         
         // 克隆句柄
         let handle1 = handles[0].clone();
@@ -908,8 +894,8 @@ mod tests {
         handle2.send_task(TestTask { id: 2, data: "test2".to_string() }).await.unwrap();
         
         // 接收结果
-        pool.result_receiver().recv().await;
-        pool.result_receiver().recv().await;
+        result_receiver.recv().await;
+        result_receiver.recv().await;
         
         pool.shutdown().await;
     }

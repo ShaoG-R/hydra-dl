@@ -10,7 +10,7 @@ use crate::{download::{
     progress_reporter::ProgressReporter,
     progressive::{ProgressiveLauncher, WorkerLaunchRequest},
     task_allocator::{FailedRange, TaskAllocator},
-    worker_health_checker::{WorkerHealthChecker, WorkerCancelRequest},
+    worker_health_checker::{WorkerCancelRequest, WorkerHealthChecker},
 }, pool::download::DownloadWorkerHandle};
 use crate::utils::writer::MmapWriter;
 use crate::DownloadError;
@@ -29,13 +29,14 @@ enum LoopControl {
     Break,
 }
 
-
 /// 下载任务执行器
 ///
 /// 封装了下载任务的执行逻辑，使用辅助结构体管理任务分配和进度报告
 pub struct DownloadTask<C: HttpClient> {
     /// Worker 协程池
     pool: DownloadWorkerPool<C>,
+    /// 结果接收器
+    result_receiver: tokio::sync::mpsc::Receiver<RangeResult>,
     /// 文件写入器
     writer: MmapWriter,
     /// 任务分配器
@@ -122,7 +123,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         info!("初始启动 {} 个 workers", initial_worker_count);
 
         // 创建 DownloadWorkerPool（只启动第一批 worker）
-        let (pool, initial_handles) = DownloadWorkerPool::new(
+        let (pool, initial_handles, result_receiver) = DownloadWorkerPool::new(
             client.clone(),
             initial_worker_count,
             writer.clone(),
@@ -154,6 +155,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         Ok(Self {
             pool,
+            result_receiver,
             writer,
             task_allocator,
             progress_reporter,
@@ -179,19 +181,14 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let timeout_rx = self.timer_service.take_receiver()
             .ok_or_else(|| DownloadError::Other("无法获取定时器接收器".to_string()))?;
 
-        // 创建定时器，用于健康检查和渐进式启动
-        let mut management_timer = tokio::time::interval(self.config.speed().instant_speed_window());
-        management_timer.tick().await; // 跳过首次立即触发
-
         // 分配初始任务
         self.allocate_initial_tasks().await?;
 
         // 事件循环：分发各种事件到对应的处理器
         loop {
             let control = tokio::select! {
-                _ = management_timer.tick() => self.handle_management_tick().await,
                 Some(notification) = timeout_rx.recv() => self.handle_retry_timeout(notification.task_id()).await,
-                result = self.pool.result_receiver().recv() => self.handle_worker_result(result).await,
+                result = self.result_receiver.recv() => self.handle_worker_result(result).await,
                 Some(request) = self.launch_request_rx.recv() => self.handle_launch_request(request).await,
                 Some(request) = self.cancel_request_rx.recv() => self.handle_cancel_request(request).await,
             };
@@ -206,13 +203,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.check_final_status()
     }
 
-
-    /// 处理管理定时器触发（预留用于其他管理任务）
-    async fn handle_management_tick(&mut self) -> LoopControl {
-        // 健康检查已经由独立的 actor 处理，这里预留给其他管理任务
-        LoopControl::Continue
-    }
-    
     /// 处理 worker 取消请求（由 health_checker actor 发送）
     async fn handle_cancel_request(&mut self, request: WorkerCancelRequest) -> LoopControl {
         let WorkerCancelRequest { worker_id, reason } = request;
