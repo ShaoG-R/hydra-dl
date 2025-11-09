@@ -194,7 +194,7 @@ pub(crate) async fn run_worker<E: WorkerExecutor>(config: WorkerConfig<E>) {
         mut shutdown_receiver,
     } = config;
 
-    info!("Worker #{} 启动", id);
+    debug!("Worker #{} 启动", id);
 
     // 使用 select! 同时监听任务通道和关闭通道
     loop {
@@ -483,12 +483,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// let handles = pool.add_workers(new_contexts).await?;
     /// ```
     pub async fn add_workers(&mut self, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<Vec<WorkerHandle<E>>> {
-        let count = contexts_with_stats.len();
-        let current_active = self.worker_count();
-        
-        info!("动态添加 {} 个新 workers (当前活跃 {} 个)", count, current_active);
-        
-        let mut handles = Vec::with_capacity(count);
+        let mut handles = Vec::with_capacity(contexts_with_stats.len());
         for (context, stats_arc) in contexts_with_stats.into_iter() {
             // 分配新的 handle
             let deferred_handle = self.slots.allocate_handle();
@@ -506,8 +501,6 @@ impl<E: WorkerExecutor> WorkerPool<E> {
             debug!("新 worker 添加到位置 #{}", key);
         }
         
-        let new_active = self.worker_count();
-        info!("成功添加 {} 个新 workers，当前活跃 {} 个", count, new_active);
         Ok(handles)
     }
     
