@@ -234,6 +234,16 @@ impl MmapWriter {
         (self.written_bytes.load(Ordering::SeqCst), self.file.size().get())
     }
     
+    /// 获取written_bytes的Arc引用（用于共享）
+    pub fn written_bytes_ref(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.written_bytes)
+    }
+    
+    /// 获取文件总大小
+    pub fn total_size(&self) -> u64 {
+        self.file.size().get()
+    }
+    
     /// 获取文件大小
     /// 
     /// # Returns

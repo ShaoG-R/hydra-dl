@@ -404,10 +404,8 @@ where
         initial_worker_count: u64,
         writer: MmapWriter,
         config: Arc<crate::config::DownloadConfig>,
+        global_stats: Arc<TaskStats>,
     ) -> Result<(Self, Vec<DownloadWorkerHandle<C>>)> {
-        // 创建全局统计管理器（使用配置的速度配置）
-        let global_stats = Arc::new(TaskStats::from_config(config.speed()));
-
         // 创建执行器（直接 move writer，避免 Arc 克隆）
         let executor = DownloadWorkerExecutor::new(client, writer);
 
@@ -491,11 +489,6 @@ where
         self.pool.worker_count()
     }
 
-    /// 获取全局统计管理器
-    pub(crate) fn global_stats(&self) -> Arc<TaskStats> {
-        self.global_stats.clone()
-    }
-
     /// 获取结果接收器的可变引用
     pub(crate) fn result_receiver(&mut self) -> &mut tokio::sync::mpsc::Receiver<RangeResult> {
         self.pool.result_receiver()
@@ -506,6 +499,7 @@ where
     /// # Returns
     ///
     /// `(窗口平均速度 bytes/s, 是否有效)`
+    #[allow(dead_code)]
     pub(crate) fn get_total_window_avg_speed(&self) -> (f64, bool) {
         self.global_stats.get_window_avg_speed()
     }
@@ -541,7 +535,8 @@ mod tests {
 
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
+        let global_stats = Arc::new(TaskStats::from_config(config.speed()));
+        let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
 
         assert_eq!(pool.worker_count(), 4);
     }
@@ -558,7 +553,8 @@ mod tests {
 
         let worker_count = 3;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
+        let global_stats = Arc::new(TaskStats::from_config(config.speed()));
+        let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
 
         // 初始统计应该都是 0
         let (total_bytes, total_secs, ranges) = pool.global_stats.get_summary();
@@ -581,7 +577,8 @@ mod tests {
         let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let (mut pool, _handles) = DownloadWorkerPool::new(client.clone(), 2, writer, config).unwrap();
+        let global_stats = Arc::new(TaskStats::from_config(config.speed()));
+        let (mut pool, _handles) = DownloadWorkerPool::new(client.clone(), 2, writer, config, global_stats).unwrap();
 
         // 关闭 workers
         pool.shutdown().await;

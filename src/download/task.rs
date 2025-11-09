@@ -5,9 +5,10 @@ use kestrel_timer::{TaskId, TimerService};
 use ranged_mmap::AllocatedRange;
 use rustc_hash::FxHashMap;
 use arc_swap::ArcSwap;
+use tokio::sync::mpsc;
 use crate::{download::{
     progress_reporter::ProgressReporter,
-    progressive::{LaunchDecision, ProgressiveLauncher, WorkerLaunchExecutor},
+    progressive::{ProgressiveLauncher, WorkerLaunchRequest},
     task_allocator::{FailedRange, TaskAllocator},
     worker_health_checker::{WorkerHealthChecker, WorkerSpeed},
 }, pool::download::DownloadWorkerHandle};
@@ -44,7 +45,9 @@ pub struct DownloadTask<C: HttpClient> {
     /// 下载配置
     config: Arc<crate::config::DownloadConfig>,
     /// 渐进式启动管理器
-    progressive_launcher: ProgressiveLauncher,
+    progressive_launcher: ProgressiveLauncher<C>,
+    /// Worker 启动请求接收器（由 progressive_launcher 发送）
+    launch_request_rx: mpsc::Receiver<WorkerLaunchRequest>,
     /// 定时器服务（用于管理失败任务的重试定时器）
     timer_service: TimerService,
     /// 任务取消 sender（worker_id -> cancel_sender）
@@ -72,8 +75,25 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             config,
         } = params;
 
-        // 创建渐进式启动管理器
-        let progressive_launcher = ProgressiveLauncher::new(&config);
+        // 获取 global_stats
+        let global_stats = Arc::new(crate::utils::stats::TaskStats::from_config(config.speed()));
+        
+        // worker_handles 占位，稍后填充
+        let worker_handles = Arc::new(ArcSwap::from_pointee(im::HashMap::new()));
+        
+        // 创建渐进式启动管理器（actor 模式）
+        let mut progressive_launcher = ProgressiveLauncher::new(
+            Arc::clone(&config),
+            Arc::clone(&worker_handles),
+            writer.total_size(),
+            writer.written_bytes_ref(),
+            Arc::clone(&global_stats),
+            config.speed().instant_speed_window(),
+        );
+        
+        // 取出启动请求接收器
+        let launch_request_rx = progressive_launcher.take_launch_request_rx()
+            .expect("launch_request_rx should be available");
 
         // 第一批 worker 数量
         let initial_worker_count = progressive_launcher.initial_worker_count();
@@ -86,23 +106,23 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             initial_worker_count,
             writer.clone(),
             Arc::clone(&config),
+            Arc::clone(&global_stats),
         )?;
 
-        // 使用实际的 worker_id（从 handle 获取）而不是 enumerate 的索引
-        let worker_handles: im::HashMap<u64, _> = initial_handles.into_iter()
+        // 使用实际的 worker_id（从 handle 获取）填充 worker_handles
+        let initial_worker_handles: im::HashMap<u64, _> = initial_handles.into_iter()
             .map(|handle| (handle.worker_id(), handle))
             .collect();
-        let worker_handles = Arc::new(ArcSwap::from_pointee(worker_handles));
+        worker_handles.store(Arc::new(initial_worker_handles));
         
         let mut task_allocator = TaskAllocator::new(allocator, url);
-        // 获取 global_stats
-        let global_stats = pool.global_stats();
+        
         // 创建进度报告器（使用配置的统计窗口作为更新间隔）
         let progress_reporter = ProgressReporter::new(
             progress_sender,
             total_size,
             Arc::clone(&worker_handles),
-            global_stats,
+            Arc::clone(&global_stats),
             config.speed().instant_speed_window(),
         );
 
@@ -118,6 +138,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             progress_reporter,
             config,
             progressive_launcher,
+            launch_request_rx,
             timer_service,
             cancel_senders: FxHashMap::default(),
             worker_handles,
@@ -147,6 +168,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 _ = management_timer.tick() => self.handle_management_tick().await,
                 Some(notification) = timeout_rx.recv() => self.handle_retry_timeout(notification.task_id()).await,
                 result = self.pool.result_receiver().recv() => self.handle_worker_result(result).await,
+                Some(request) = self.launch_request_rx.recv() => self.handle_launch_request(request).await,
             };
 
             match control {
@@ -160,43 +182,30 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     }
 
 
-    /// 处理管理定时器触发（健康检查和渐进式启动）
+    /// 处理管理定时器触发（仅进行健康检查）
     async fn handle_management_tick(&mut self) -> LoopControl {
         // 执行健康检查，检测并终止异常下载线程
         self.check_and_handle_unhealthy_workers();
 
-        // 检查是否可以启动下一批worker（渐进式启动）
-        if self.progressive_launcher.should_check_next_stage() {
-            // 检测并调整启动阶段（应对 worker 数量变化）
-            let current_worker_count = self.pool.worker_count();
-            self.progressive_launcher.adjust_stage_for_worker_count(current_worker_count);
-
-            // 先做决策（只读操作）
-            let decision = self.progressive_launcher.decide_next_launch(self, &self.config);
-
-            // 根据决策结果执行
-            match decision {
-                LaunchDecision::Launch { count, stage } => {
-                    match self.execute_worker_launch(count, stage).await {
-                        Ok(new_cancel_senders) => {
-                            // 保存新分配任务的取消通道
-                            for (worker_id, cancel_tx) in new_cancel_senders {
-                                self.cancel_senders.insert(worker_id, cancel_tx);
-                            }
-                            // 更新阶段（只有成功执行后才更新）
-                            self.progressive_launcher.advance_stage();
-                        }
-                        Err(e) => {
-                            error!("渐进式启动失败: {:?}", e);
-                        }
-                    }
-                }
-                LaunchDecision::Wait { .. } | LaunchDecision::Complete => {
-                    // 不需要启动
+        LoopControl::Continue
+    }
+    
+    /// 处理 worker 启动请求（由 progressive_launcher actor 发送）
+    async fn handle_launch_request(&mut self, request: WorkerLaunchRequest) -> LoopControl {
+        let WorkerLaunchRequest { count, stage } = request;
+        
+        match self.execute_worker_launch(count, stage).await {
+            Ok(new_cancel_senders) => {
+                // 保存新分配任务的取消通道
+                for (worker_id, cancel_tx) in new_cancel_senders {
+                    self.cancel_senders.insert(worker_id, cancel_tx);
                 }
             }
+            Err(e) => {
+                error!("渐进式启动失败: {:?}", e);
+            }
         }
-
+        
         LoopControl::Continue
     }
 
@@ -524,6 +533,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         
         // 关闭 progress reporter actor
         self.progress_reporter.shutdown();
+        
+        // 关闭 progressive launcher actor 并等待其完全停止
+        self.progressive_launcher.shutdown_and_wait().await;
 
         if let Some(msg) = error_msg {
             return Err(DownloadError::Other(msg));
@@ -572,12 +584,19 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             return;
         }
 
-        // 收集所有 worker 的速度信息
+        // 收集正在执行任务的 worker 的速度信息
+        // 只检查有正在执行任务的 worker（通过 cancel_senders 判断）
+        // 避免对空闲 worker 的旧速度数据反复警告
         let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
 
         // 遍历所有实际的 worker_id（不能假设从 0 开始）
         let handles = self.worker_handles.load();
         for &worker_id in handles.keys() {
+            // 只检查正在执行任务的 worker
+            if !self.cancel_senders.contains_key(&worker_id) {
+                continue;
+            }
+            
             if let Some(handle) = handles.get(&worker_id) {
                 let (speed, valid) = handle.window_avg_speed();
                 // 只考虑有效的速度数据
@@ -636,6 +655,11 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         
         // 关闭 progress reporter actor
         self.progress_reporter.shutdown();
+        
+        // 关闭 progressive launcher actor 并等待其完全停止
+        // 这很重要，因为 actor 持有 written_bytes 的 Arc 引用
+        // 必须等待它释放后才能 finalize writer
+        self.progressive_launcher.shutdown_and_wait().await;
 
         // 完成写入
         self.writer.finalize()?;
@@ -684,32 +708,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     pub fn is_complete(&self) -> bool {
         self.writer.is_complete()
     }
-}
 
-/// 为 DownloadTask 实现 WorkerLaunchExecutor trait
-///
-/// 提供渐进式启动所需的外部能力接口
-impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
-    fn current_worker_count(&self) -> u64 {
-        self.pool.worker_count()
-    }
-
-    fn get_all_worker_ids(&self) -> Vec<u64> {
-        self.worker_handles.load().keys().copied().collect()
-    }
-
-    fn get_worker_instant_speed(&self, worker_id: u64) -> Option<(f64, bool)> {
-        self.get_worker_handle(worker_id).map(|h| h.instant_speed())
-    }
-
-    fn get_total_window_avg_speed(&self) -> (f64, bool) {
-        self.pool.get_total_window_avg_speed()
-    }
-
-    fn get_download_progress(&self) -> (u64, u64) {
-        self.writer.progress()
-    }
-
+    /// 执行 worker 启动（内部方法）
     async fn execute_worker_launch(
         &mut self,
         count: u64,
