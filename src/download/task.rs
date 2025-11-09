@@ -4,8 +4,9 @@ use log::{debug, error, info, warn};
 use kestrel_timer::{TaskId, TimerService};
 use ranged_mmap::AllocatedRange;
 use rustc_hash::FxHashMap;
+use arc_swap::ArcSwap;
 use crate::{download::{
-    progress_reporter::{ProgressReporter, WorkerStatsRef},
+    progress_reporter::ProgressReporter,
     progressive::{LaunchDecision, ProgressiveLauncher, WorkerLaunchExecutor},
     task_allocator::{FailedRange, TaskAllocator},
     worker_health_checker::{WorkerHealthChecker, WorkerSpeed},
@@ -39,7 +40,7 @@ pub struct DownloadTask<C: HttpClient> {
     /// 任务分配器
     task_allocator: TaskAllocator,
     /// 进度报告器
-    progress_reporter: ProgressReporter,
+    progress_reporter: ProgressReporter<C>,
     /// 下载配置
     config: Arc<crate::config::DownloadConfig>,
     /// 渐进式启动管理器
@@ -52,7 +53,8 @@ pub struct DownloadTask<C: HttpClient> {
     /// 当需要中止某个 worker 的任务时，可以通过发送取消信号来实现
     cancel_senders: FxHashMap<u64, tokio::sync::oneshot::Sender<()>>,
     /// Worker 句柄缓存（worker_id -> handle）
-    worker_handles: FxHashMap<u64, DownloadWorkerHandle<C>>,
+    /// 使用 ArcSwap + im::HashMap 实现无锁原子更新和共享
+    worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
 }
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
@@ -87,15 +89,25 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         )?;
 
         // 使用实际的 worker_id（从 handle 获取）而不是 enumerate 的索引
-        let worker_handles: FxHashMap<u64, _> = initial_handles.into_iter()
+        let worker_handles: im::HashMap<u64, _> = initial_handles.into_iter()
             .map(|handle| (handle.worker_id(), handle))
             .collect();
+        let worker_handles = Arc::new(ArcSwap::from_pointee(worker_handles));
         
         let mut task_allocator = TaskAllocator::new(allocator, url);
-        let progress_reporter = ProgressReporter::new(progress_sender, total_size);
+        // 获取 global_stats
+        let global_stats = pool.global_stats();
+        // 创建进度报告器（使用配置的统计窗口作为更新间隔）
+        let progress_reporter = ProgressReporter::new(
+            progress_sender,
+            total_size,
+            Arc::clone(&worker_handles),
+            global_stats,
+            config.speed().instant_speed_window(),
+        );
 
         // 将第一批 workers 加入空闲队列（使用实际的 worker_id）
-        for &worker_id in worker_handles.keys() {
+        for &worker_id in worker_handles.load().keys() {
             task_allocator.mark_worker_idle(worker_id);
         }
 
@@ -115,16 +127,16 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 等待所有 range 完成
     ///
-    /// 动态分配任务，支持失败重试，定期发送进度更新和调整分块大小
+    /// 动态分配任务，支持失败重试
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
     pub(super) async fn wait_for_completion(&mut self) -> crate::Result<Vec<FailedRange>> {
         // 获取定时器超时接收器
         let timeout_rx = self.timer_service.take_receiver()
             .ok_or_else(|| DownloadError::Other("无法获取定时器接收器".to_string()))?;
 
-        // 创建定时器，用于定期更新进度和调整分块大小
-        let mut progress_timer = tokio::time::interval(self.config.speed().instant_speed_window());
-        progress_timer.tick().await; // 跳过首次立即触发
+        // 创建定时器，用于健康检查和渐进式启动
+        let mut management_timer = tokio::time::interval(self.config.speed().instant_speed_window());
+        management_timer.tick().await; // 跳过首次立即触发
 
         // 分配初始任务
         self.allocate_initial_tasks().await?;
@@ -132,7 +144,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 事件循环：分发各种事件到对应的处理器
         loop {
             let control = tokio::select! {
-                _ = progress_timer.tick() => self.handle_progress_tick().await,
+                _ = management_timer.tick() => self.handle_management_tick().await,
                 Some(notification) = timeout_rx.recv() => self.handle_retry_timeout(notification.task_id()).await,
                 result = self.pool.result_receiver().recv() => self.handle_worker_result(result).await,
             };
@@ -147,10 +159,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.check_final_status()
     }
 
-    /// 处理进度更新定时器触发
-    async fn handle_progress_tick(&mut self) -> LoopControl {
-        self.send_progress();
 
+    /// 处理管理定时器触发（健康检查和渐进式启动）
+    async fn handle_management_tick(&mut self) -> LoopControl {
         // 执行健康检查，检测并终止异常下载线程
         self.check_and_handle_unhealthy_workers();
 
@@ -320,38 +331,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         status
     }
 
-    /// 收集 worker 原始统计数据
-    ///
-    /// 从 pool 收集 worker 统计引用，让 actor 内部计算
-    fn collect_worker_stats(&self) -> Vec<WorkerStatsRef> {
-        self.worker_handles
-            .iter()
-            .map(|(worker_id, handle)| {
-                let stats = handle.stats();
-                WorkerStatsRef {
-                    worker_id: *worker_id,
-                    stats,
-                }
-            })
-            .collect()
-    }
-    
-    /// 发送进度更新
-    ///
-    /// 定期发送进度更新（分块大小由各 worker 独立调整）
-    fn send_progress(&self) {
-        let total_avg_speed = self.pool.get_total_speed();
-        let (total_instant_speed, instant_valid) = self.pool.get_total_instant_speed();
-        let (total_bytes, _, _) = self.pool.get_total_stats();
-        let worker_stats = self.collect_worker_stats();
-        
-        self.progress_reporter.send_stats_update(
-            total_bytes,
-            total_avg_speed,
-            if instant_valid { Some(total_instant_speed) } else { None },
-            worker_stats,
-        );
-    }
 
     /// 分配初始任务给所有空闲的 worker
     async fn allocate_initial_tasks(&mut self) -> crate::Result<()> {
@@ -596,8 +575,11 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 收集所有 worker 的速度信息
         let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
 
-        for worker_id in 0..current_worker_count {
-            if let Some((speed, valid)) = self.get_worker_handle(worker_id).map(|h| h.window_avg_speed()) {
+        // 遍历所有实际的 worker_id（不能假设从 0 开始）
+        let handles = self.worker_handles.load();
+        for &worker_id in handles.keys() {
+            if let Some(handle) = handles.get(&worker_id) {
+                let (speed, valid) = handle.window_avg_speed();
                 // 只考虑有效的速度数据
                 if valid && speed > 0.0 {
                     worker_speeds.push(WorkerSpeed { worker_id, speed });
@@ -639,18 +621,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 完成并清理资源
     pub(super) async fn finalize_and_cleanup(mut self, save_path: PathBuf) -> crate::Result<()> {
-        // 收集完成统计数据
-        let total_avg_speed = self.pool.get_total_speed();
-        let (total_bytes, total_secs, _) = self.pool.get_total_stats();
-        let worker_stats = self.collect_worker_stats();
-        
-        // 发送完成统计
-        self.progress_reporter.send_completion(
-            total_bytes,
-            total_avg_speed,
-            total_secs,
-            worker_stats,
-        );
+        // 发送完成统计（Actor 会自动从共享数据源获取统计）
+        self.progress_reporter.send_completion();
 
         // 清理所有取消 sender
         self.cancel_senders.clear();
@@ -690,7 +662,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     /// Worker 句柄的克隆，如果 worker 不存在则返回 `None`
     #[inline]
     fn get_worker_handle(&self, worker_id: u64) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
-        self.worker_handles.get(&worker_id).cloned()
+        self.worker_handles.load().get(&worker_id).cloned()
     }
 
     /// 获取指定 worker 的当前分块大小
@@ -703,7 +675,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 获取进度报告器
     #[inline]
-    pub(super) fn progress_reporter(&self) -> &ProgressReporter {
+    pub(super) fn progress_reporter(&self) -> &ProgressReporter<C> {
         &self.progress_reporter
     }
 
@@ -720,6 +692,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
     fn current_worker_count(&self) -> u64 {
         self.pool.worker_count()
+    }
+
+    fn get_all_worker_ids(&self) -> Vec<u64> {
+        self.worker_handles.load().keys().copied().collect()
     }
 
     fn get_worker_instant_speed(&self, worker_id: u64) -> Option<(f64, bool)> {
@@ -754,11 +730,14 @@ impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
         let new_worker_ids: Vec<u64> = match self.pool.add_workers(count).await {
             Ok(handles) => {
                 let mut ids = Vec::new();
+                // load() 返回 Guard，解引用两次得到 im::HashMap，然后 clone (O(1) 操作)
+                let mut new_handles = (*self.worker_handles.load_full()).clone();
                 for handle in handles {
                     let worker_id = handle.worker_id();
                     ids.push(worker_id);
-                    self.worker_handles.insert(worker_id, handle);
+                    new_handles = new_handles.update(worker_id, handle);
                 }
+                self.worker_handles.store(Arc::new(new_handles));
                 ids
             },
             Err(e) => {

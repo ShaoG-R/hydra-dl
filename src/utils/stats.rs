@@ -507,6 +507,7 @@ impl TaskStats {
     /// let parent = TaskStats::new();
     /// let (bytes, elapsed, ranges) = parent.get_summary();
     /// ```
+    #[allow(dead_code)]
     pub(crate) fn get_summary(&self) -> (u64, f64, usize) {
         let bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
         let ranges = self.aggregator.completed_ranges.load(Ordering::Relaxed);

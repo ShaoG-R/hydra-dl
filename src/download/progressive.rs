@@ -35,6 +35,13 @@ pub(super) trait WorkerLaunchExecutor {
     /// 获取当前 worker 数量
     fn current_worker_count(&self) -> u64;
     
+    /// 获取所有活跃的 worker ID 列表
+    /// 
+    /// # Returns
+    /// 
+    /// 返回当前所有活跃 worker 的 ID 列表
+    fn get_all_worker_ids(&self) -> Vec<u64>;
+    
     /// 获取指定 worker 的瞬时速度
     /// 
     /// # Returns
@@ -173,9 +180,11 @@ impl ProgressiveLauncher {
         
         // 检查所有已启动 Worker 的速度是否达到阈值
         let mut all_ready = true;
-        let mut speeds = Vec::with_capacity(current_worker_count as usize);
+        let worker_ids = executor.get_all_worker_ids();
+        let mut speeds = Vec::with_capacity(worker_ids.len());
         
-        for worker_id in 0..current_worker_count {
+        // 遍历所有实际的 worker_id
+        for worker_id in worker_ids {
             let (instant_speed, valid) = executor.get_worker_instant_speed(worker_id)
                 .unwrap_or((0.0, false));
             speeds.push(instant_speed);

@@ -22,6 +22,8 @@ url = "2.5"
 urlencoding = "2.1"
 rustc-hash = "2.1.1"
 portable-atomic = "1.11.1"
+arc-swap = "1.7.1"
+im = "15.1.0"
 
 # 下面的crates是由本库作者维护
 kestrel-timer = "0.3.1"

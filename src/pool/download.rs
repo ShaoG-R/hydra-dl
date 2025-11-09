@@ -10,6 +10,7 @@
 
 use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
 use crate::Result;
+use crate::pool::common::WorkerHandle;
 use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::{
     chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy},
@@ -88,134 +89,183 @@ where
         context: &mut Self::Context,
         stats: &Self::Stats,
     ) -> Self::Result {
-        match task {
-            RangeTask::Range { url, range, retry_count, cancel_rx } => {
-                let (start, end) = range.as_range_tuple();
-                debug!(
-                    "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
-                    worker_id,
-                    url,
-                    start,
-                    end,
-                    retry_count
+        let RangeTask::Range { url, range, retry_count, cancel_rx } = task;
+        
+        let (start, end) = range.as_range_tuple();
+        debug!(
+            "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
+            worker_id, url, start, end, retry_count
+        );
+
+        // 下载数据（在下载过程中会实时更新 stats）
+        let fetch_result = self.fetch_range(&url, &range, stats, cancel_rx).await;
+
+        match fetch_result {
+            Ok(FetchRangeResult::Complete(data)) => {
+                self.handle_download_complete(worker_id, range, data, context, stats)
+            }
+            Ok(FetchRangeResult::Cancelled { data, bytes_downloaded }) => {
+                self.handle_download_cancelled(worker_id, range, data, bytes_downloaded, retry_count)
+            }
+            Err(e) => {
+                self.handle_download_failed(worker_id, range, retry_count, e)
+            }
+        }
+    }
+}
+
+// ==================== 辅助方法 ====================
+
+impl<C: HttpClient> DownloadWorkerExecutor<C> {
+    /// 执行 Range 下载
+    async fn fetch_range(
+        &self,
+        url: &str,
+        range: &ranged_mmap::AllocatedRange,
+        stats: &WorkerStats,
+        cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
+        use crate::utils::fetch::FetchRange;
+        let fetch_range = FetchRange::from_allocated_range(range)
+            .expect("AllocatedRange 应该总是有效的");
+        RangeFetcher::new(&self.client, url, fetch_range, stats)
+            .fetch_with_cancel(cancel_rx)
+            .await
+    }
+
+    /// 处理下载完成的情况
+    fn handle_download_complete(
+        &self,
+        worker_id: u64,
+        range: ranged_mmap::AllocatedRange,
+        data: bytes::Bytes,
+        context: &mut DownloadWorkerContext,
+        stats: &WorkerStats,
+    ) -> RangeResult {
+        // 写入文件
+        if let Err(e) = self.writer.write_range(range, data.as_ref()) {
+            let error_msg = format!("写入失败: {:?}", e);
+            error!("Worker #{} {}", worker_id, error_msg);
+            return RangeResult::WriteFailed {
+                worker_id,
+                range,
+                error: error_msg,
+            };
+        }
+
+        // 记录 range 完成
+        stats.record_range_complete();
+        
+        // 根据当前速度更新分块大小
+        self.update_chunk_size(context, stats);
+
+        RangeResult::Complete { worker_id }
+    }
+
+    /// 处理下载被取消的情况
+    fn handle_download_cancelled(
+        &self,
+        worker_id: u64,
+        range: ranged_mmap::AllocatedRange,
+        data: bytes::Bytes,
+        bytes_downloaded: u64,
+        retry_count: usize,
+    ) -> RangeResult {
+        let (start, end) = range.as_range_tuple();
+
+        // 没有下载任何数据，返回原始 range 重试
+        if bytes_downloaded == 0 {
+            let error_msg = format!("下载被取消，重试整个 range: {}..{}", start, end);
+            debug!("Worker #{} {}", worker_id, error_msg);
+            return RangeResult::DownloadFailed {
+                worker_id,
+                range,
+                error: error_msg,
+                retry_count,
+            };
+        }
+
+        // 有部分数据下载，尝试保存并返回剩余部分
+        use std::num::NonZeroU64;
+        let bytes_downloaded = NonZeroU64::new(bytes_downloaded).unwrap();
+        
+        match range.split_at(bytes_downloaded) {
+            Ok((downloaded_range, remaining_range)) => {
+                // 尝试写入已下载的部分（忽略写入错误，继续重试剩余部分）
+                if let Err(e) = self.writer.write_range(downloaded_range, data.as_ref()) {
+                    error!("Worker #{} 写入已下载的部分数据失败: {:?}", worker_id, e);
+                } else {
+                    debug!("Worker #{} 成功写入已下载的 {} bytes", worker_id, bytes_downloaded);
+                }
+                
+                // 返回剩余的 range 用于重试
+                let error_msg = format!(
+                    "下载被取消，剩余 range: {}..{}",
+                    remaining_range.start(),
+                    remaining_range.end()
                 );
-
-                // 下载数据（在下载过程中会实时更新 stats）
-                // 将 AllocatedRange 转换为 FetchRange
-                use crate::utils::fetch::FetchRange;
-                let fetch_range = FetchRange::from_allocated_range(&range)
-                    .expect("AllocatedRange 应该总是有效的");
-                let fetch_result = RangeFetcher::new(&self.client, &url, fetch_range, stats).fetch_with_cancel(cancel_rx).await;
-
-                match fetch_result {
-                    Ok(FetchRangeResult::Complete(data)) => {
-                        // 下载完成，直接写入文件
-                        match self.writer.write_range(range, data.as_ref()) {
-                            Ok(_) => {
-                                // 记录 range 完成
-                                stats.record_range_complete();
-                                
-                                // 根据当前速度更新分块大小
-                                let (instant_speed, valid) = stats.get_instant_speed();
-                                let avg_speed = stats.get_speed();
-                                if valid && instant_speed > 0.0 {
-                                    let current_chunk_size = stats.get_current_chunk_size();
-                                    let new_chunk_size = context.chunk_strategy.calculate_chunk_size(current_chunk_size, instant_speed, avg_speed);
-                                    stats.set_current_chunk_size(new_chunk_size);
-                                }
-
-                                // 返回完成结果
-                                RangeResult::Complete { worker_id }
-                            }
-                            Err(e) => {
-                                // 写入失败
-                                let error_msg = format!("写入失败: {:?}", e);
-                                error!("Worker #{} {}", worker_id, error_msg);
-                                RangeResult::WriteFailed {
-                                    worker_id,
-                                    range,
-                                    error: error_msg,
-                                }
-                            }
-                        }
-                    }
-                    Ok(FetchRangeResult::Cancelled { data, bytes_downloaded }) => {
-                        // 下载被取消，先写入已下载的部分数据（如果有）
-                        match bytes_downloaded {
-                            0 => {
-                                // 没有下载任何数据，返回原始 range 重试
-                                let error_msg = format!("下载被取消，重试整个 range: {}..{}", start, end);
-                                debug!("Worker #{} {}", worker_id, error_msg);
-                                RangeResult::DownloadFailed {
-                                    worker_id,
-                                    range,
-                                    error: error_msg,
-                                    retry_count,
-                                }
-                            }
-                            _ => {
-                                // 使用 split_at 拆分 range，得到已下载部分和剩余部分
-                                use std::num::NonZeroU64;
-                                let bytes_downloaded = NonZeroU64::new(bytes_downloaded).unwrap();
-                                match range.split_at(bytes_downloaded) {
-                                    Ok((downloaded_range, remaining_range)) => {
-                                        // 写入已下载的部分
-                                        match self.writer.write_range(downloaded_range, data.as_ref()) {
-                                            Ok(_) => {
-                                                // 写入成功
-                                                debug!("Worker #{} 成功写入已下载的 {} bytes", worker_id, bytes_downloaded);
-                                            }
-                                            Err(e) => {
-                                                // 写入失败
-                                                error!("Worker #{} 写入已下载的部分数据失败: {:?}", worker_id, e);
-                                            }
-                                        }
-                                        
-                                        // 返回剩余的 range 用于重试
-                                        let error_msg = format!("下载被取消，剩余 range: {}..{}", remaining_range.start(), remaining_range.end());
-                                        debug!("Worker #{} {}", worker_id, error_msg);
-                                        return RangeResult::DownloadFailed {
-                                            worker_id,
-                                            range: remaining_range,
-                                            error: error_msg,
-                                            retry_count,
-                                        };
-                                    }
-                                    Err(e) => {
-                                        // pos >= end
-                                        error!("Worker #{} 无法拆分 range: bytes_downloaded={}, range={}..{}", 
-                                            worker_id, bytes_downloaded, start, end);
-                                        RangeResult::DownloadFailed {
-                                            worker_id,
-                                            range,
-                                            error: e.to_string(),
-                                            retry_count,
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // 下载失败
-                        let error_msg = format!("下载失败: {:?}", e);
-                        error!(
-                            "Worker #{} Range {}..{} {}",
-                            worker_id,
-                            start,
-                            end,
-                            error_msg
-                        );
-                        RangeResult::DownloadFailed {
-                            worker_id,
-                            range,
-                            error: error_msg,
-                            retry_count,
-                        }
-                    }
+                debug!("Worker #{} {}", worker_id, error_msg);
+                RangeResult::DownloadFailed {
+                    worker_id,
+                    range: remaining_range,
+                    error: error_msg,
+                    retry_count,
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Worker #{} 无法拆分 range: bytes_downloaded={}, range={}..{}",
+                    worker_id, bytes_downloaded, start, end
+                );
+                RangeResult::DownloadFailed {
+                    worker_id,
+                    range,
+                    error: e.to_string(),
+                    retry_count,
                 }
             }
         }
+    }
+
+    /// 处理下载失败的情况
+    fn handle_download_failed(
+        &self,
+        worker_id: u64,
+        range: ranged_mmap::AllocatedRange,
+        retry_count: usize,
+        error: crate::utils::fetch::FetchError,
+    ) -> RangeResult {
+        let (start, end) = range.as_range_tuple();
+        let error_msg = format!("下载失败: {:?}", error);
+        error!("Worker #{} Range {}..{} {}", worker_id, start, end, error_msg);
+        
+        RangeResult::DownloadFailed {
+            worker_id,
+            range,
+            error: error_msg,
+            retry_count,
+        }
+    }
+
+    /// 根据当前速度更新分块大小
+    fn update_chunk_size(
+        &self,
+        context: &mut DownloadWorkerContext,
+        stats: &WorkerStats,
+    ) {
+        let (instant_speed, valid) = stats.get_instant_speed();
+        if !valid || instant_speed <= 0.0 {
+            return;
+        }
+
+        let avg_speed = stats.get_speed();
+        let current_chunk_size = stats.get_current_chunk_size();
+        let new_chunk_size = context.chunk_strategy.calculate_chunk_size(
+            current_chunk_size,
+            instant_speed,
+            avg_speed,
+        );
+        stats.set_current_chunk_size(new_chunk_size);
     }
 }
 
@@ -234,7 +284,7 @@ where
 /// ```
 pub(crate) struct DownloadWorkerHandle<C: HttpClient> {
     /// 底层通用 worker 句柄
-    handle: super::common::WorkerHandle<DownloadWorkerExecutor<C>>,
+    handle: WorkerHandle<DownloadWorkerExecutor<C>>,
 }
 
 impl<C: HttpClient> Clone for DownloadWorkerHandle<C> {
@@ -251,7 +301,7 @@ impl<C: HttpClient> DownloadWorkerHandle<C> {
     /// # Arguments
     ///
     /// - `handle`: 底层通用 worker 句柄
-    pub(crate) fn new(handle: super::common::WorkerHandle<DownloadWorkerExecutor<C>>) -> Self {
+    pub(crate) fn new(handle: WorkerHandle<DownloadWorkerExecutor<C>>) -> Self {
         Self { handle }
     }
 
@@ -284,7 +334,6 @@ impl<C: HttpClient> DownloadWorkerHandle<C> {
     ///
     /// Worker 统计数据的 Arc 引用
     #[inline]
-    #[allow(unused)]
     pub fn stats(&self) -> Arc<WorkerStats> {
         self.handle.stats()
     }
@@ -329,7 +378,7 @@ pub(crate) struct DownloadWorkerPool<C: HttpClient> {
     /// 底层通用协程池
     pool: WorkerPool<DownloadWorkerExecutor<C>>,
     /// 全局统计管理器（聚合所有 worker 的数据）
-    global_stats: TaskStats,
+    global_stats: Arc<TaskStats>,
     /// 下载配置（用于创建新 worker 的分块策略）
     config: Arc<crate::config::DownloadConfig>,
 }
@@ -357,7 +406,7 @@ where
         config: Arc<crate::config::DownloadConfig>,
     ) -> Result<(Self, Vec<DownloadWorkerHandle<C>>)> {
         // 创建全局统计管理器（使用配置的速度配置）
-        let global_stats = TaskStats::from_config(config.speed());
+        let global_stats = Arc::new(TaskStats::from_config(config.speed()));
 
         // 创建执行器（直接 move writer，避免 Arc 克隆）
         let executor = DownloadWorkerExecutor::new(client, writer);
@@ -442,28 +491,14 @@ where
         self.pool.worker_count()
     }
 
+    /// 获取全局统计管理器
+    pub(crate) fn global_stats(&self) -> Arc<TaskStats> {
+        self.global_stats.clone()
+    }
+
     /// 获取结果接收器的可变引用
     pub(crate) fn result_receiver(&mut self) -> &mut tokio::sync::mpsc::Receiver<RangeResult> {
         self.pool.result_receiver()
-    }
-
-    /// 获取所有 worker 的聚合统计（O(1)，无需遍历）
-    pub(crate) fn get_total_stats(&self) -> (u64, f64, usize) {
-        self.global_stats.get_summary()
-    }
-
-    /// 获取所有 worker 的总体下载速度（平均速度，O(1)）
-    pub(crate) fn get_total_speed(&self) -> f64 {
-        self.global_stats.get_speed()
-    }
-
-    /// 获取所有 worker 的总体实时速度（O(1)，无需遍历）
-    ///
-    /// # Returns
-    ///
-    /// `(实时速度 bytes/s, 是否有效)`
-    pub(crate) fn get_total_instant_speed(&self) -> (f64, bool) {
-        self.global_stats.get_instant_speed()
     }
 
     /// 获取所有 worker 的总体窗口平均速度（O(1)，无需遍历）
@@ -526,12 +561,12 @@ mod tests {
         let (pool, _handles) = DownloadWorkerPool::new(client, worker_count, writer, config).unwrap();
 
         // 初始统计应该都是 0
-        let (total_bytes, total_secs, ranges) = pool.get_total_stats();
+        let (total_bytes, total_secs, ranges) = pool.global_stats.get_summary();
         assert_eq!(total_bytes, 0);
         assert!(total_secs >= 0.0);
         assert_eq!(ranges, 0);
 
-        let speed = pool.get_total_speed();
+        let speed = pool.global_stats.get_speed();
         assert_eq!(speed, 0.0);
     }
 

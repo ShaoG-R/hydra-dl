@@ -7,7 +7,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use log::debug;
-use crate::utils::stats::WorkerStats;
+use arc_swap::ArcSwap;
 
 /// Worker 统计信息
 #[derive(Debug, Clone)]
@@ -71,14 +71,6 @@ pub enum DownloadProgress {
     },
 }
 
-/// Worker 原始统计数据（用于传递给 actor）
-#[derive(Debug, Clone)]
-pub(super) struct WorkerStatsRef {
-    /// Worker ID
-    pub worker_id: u64,
-    /// Worker 统计数据
-    pub stats: Arc<WorkerStats>,
-}
 
 /// Actor 消息类型
 #[derive(Debug)]
@@ -90,20 +82,8 @@ enum ActorMessage {
         worker_count: u64,
         initial_chunk_size: u64,
     },
-    /// 定期统计更新（传递原始统计数据，actor 内部计算）
-    StatsUpdate {
-        total_bytes: u64,
-        total_avg_speed: f64,
-        total_instant_speed: Option<f64>,
-        worker_stats: Vec<WorkerStatsRef>,
-    },
-    /// 发送完成统计
-    SendCompletion {
-        total_bytes: u64,
-        total_avg_speed: f64,
-        total_secs: f64,
-        worker_stats: Vec<WorkerStatsRef>,
-    },
+    /// 发送完成统计（actor 从共享数据源获取所有统计）
+    SendCompletion,
     /// 发送错误事件
     SendError {
         message: String,
@@ -115,7 +95,7 @@ enum ActorMessage {
 /// 进度报告器 Actor
 /// 
 /// 独立运行的 actor，负责管理进度报告和统计信息收集
-struct ProgressReporterActor {
+struct ProgressReporterActor<C: crate::utils::io_traits::HttpClient> {
     /// 进度发送器
     progress_sender: Option<mpsc::Sender<DownloadProgress>>,
     /// 已完成的 range 总数
@@ -124,20 +104,35 @@ struct ProgressReporterActor {
     total_size: NonZeroU64,
     /// 消息接收器（async channel）
     message_rx: mpsc::Receiver<ActorMessage>,
+    /// 共享的 worker handles（用于直接获取统计信息）
+    worker_handles: Arc<ArcSwap<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>>,
+    /// 全局统计管理器（用于获取总体统计数据）
+    global_stats: Arc<crate::utils::stats::TaskStats>,
+    /// 进度更新定时器（内部管理）
+    progress_timer: tokio::time::Interval,
 }
 
-impl ProgressReporterActor {
+impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
     /// 创建新的 actor
-    fn new(
+    async fn new(
         progress_sender: Option<mpsc::Sender<DownloadProgress>>,
         total_size: NonZeroU64,
         message_rx: mpsc::Receiver<ActorMessage>,
+        worker_handles: Arc<ArcSwap<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>>,
+        global_stats: Arc<crate::utils::stats::TaskStats>,
+        update_interval: std::time::Duration,
     ) -> Self {
+        let mut progress_timer = tokio::time::interval(update_interval);
+        progress_timer.tick().await; // 跳过首次立即触发
+        
         Self {
             progress_sender,
             total_ranges_completed: 0,
             total_size,
             message_rx,
+            worker_handles,
+            global_stats,
+            progress_timer,
         }
     }
     
@@ -147,6 +142,11 @@ impl ProgressReporterActor {
         
         loop {
             tokio::select! {
+                // 内部定时器：自主触发进度更新
+                _ = self.progress_timer.tick() => {
+                    self.send_progress_update().await;
+                }
+                // 外部消息
                 msg = self.message_rx.recv() => {
                     match msg {
                         Some(ActorMessage::RecordRangeComplete) => {
@@ -155,11 +155,8 @@ impl ProgressReporterActor {
                         Some(ActorMessage::SendStarted { worker_count, initial_chunk_size }) => {
                             self.send_started_event(worker_count, initial_chunk_size).await;
                         }
-                        Some(ActorMessage::StatsUpdate { total_bytes, total_avg_speed, total_instant_speed, worker_stats }) => {
-                            self.send_progress_update(total_bytes, total_avg_speed, total_instant_speed, worker_stats).await;
-                        }
-                        Some(ActorMessage::SendCompletion { total_bytes, total_avg_speed, total_secs, worker_stats }) => {
-                            self.send_completion_stats(total_bytes, total_avg_speed, total_secs, worker_stats).await;
+                        Some(ActorMessage::SendCompletion) => {
+                            self.send_completion_stats().await;
                         }
                         Some(ActorMessage::SendError { message }) => {
                             self.send_error(&message).await;
@@ -192,15 +189,17 @@ impl ProgressReporterActor {
         }
     }
     
-    /// 计算 worker 统计快照
-    fn compute_worker_snapshots(&self, worker_stats: Vec<WorkerStatsRef>) -> Vec<WorkerStatSnapshot> {
-        worker_stats.into_iter().map(|ws| {
+    /// 计算 worker 统计快照（直接从 worker_handles 中获取）
+    fn compute_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
+        let handles = self.worker_handles.load();
+        handles.iter().map(|(worker_id, handle)| {
+            let stats = handle.stats();
             let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid, _, _) = 
-                ws.stats.get_full_summary();
-            let current_chunk_size = ws.stats.get_current_chunk_size();
+                stats.get_full_summary();
+            let current_chunk_size = stats.get_current_chunk_size();
             
             WorkerStatSnapshot {
-                worker_id: ws.worker_id,
+                worker_id: *worker_id,
                 bytes: worker_bytes,
                 ranges: worker_ranges,
                 avg_speed,
@@ -210,15 +209,13 @@ impl ProgressReporterActor {
         }).collect()
     }
     
-    /// 发送进度更新
-    async fn send_progress_update(
-        &self,
-        total_bytes: u64,
-        total_avg_speed: f64,
-        total_instant_speed: Option<f64>,
-        worker_stats: Vec<WorkerStatsRef>,
-    ) {
+    /// 发送进度更新（从 global_stats 获取所有数据）
+    async fn send_progress_update(&self) {
         if let Some(ref sender) = self.progress_sender {
+            // 从 global_stats 获取总体统计
+            let (total_bytes, _, _, total_avg_speed, total_instant_speed, instant_valid, _, _) = 
+                self.global_stats.get_full_summary();
+            
             // 计算百分比
             let percentage = if self.total_size.get() > 0 {
                 (total_bytes as f64 / self.total_size.get() as f64) * 100.0
@@ -226,31 +223,29 @@ impl ProgressReporterActor {
                 0.0
             };
             
-            // 在 actor 内部计算 worker 快照
-            let worker_snapshots = self.compute_worker_snapshots(worker_stats);
+            // 在 actor 内部从 worker_handles 计算 worker 快照
+            let worker_snapshots = self.compute_worker_snapshots();
             
             let _ = sender.send(DownloadProgress::Progress {
                 bytes_downloaded: total_bytes,
                 total_size: self.total_size,
                 percentage,
                 avg_speed: total_avg_speed,
-                instant_speed: total_instant_speed,
+                instant_speed: if instant_valid { Some(total_instant_speed) } else { None },
                 worker_stats: worker_snapshots,
             }).await;
         }
     }
     
-    /// 发送完成统计
-    async fn send_completion_stats(
-        &self,
-        total_bytes: u64,
-        total_avg_speed: f64,
-        total_secs: f64,
-        worker_stats: Vec<WorkerStatsRef>,
-    ) {
+    /// 发送完成统计（从 global_stats 获取所有数据）
+    async fn send_completion_stats(&self) {
         if let Some(ref sender) = self.progress_sender {
-            // 在 actor 内部计算 worker 快照
-            let worker_snapshots = self.compute_worker_snapshots(worker_stats);
+            // 从 global_stats 获取总体统计
+            let (total_bytes, total_secs, _, total_avg_speed, _, _, _, _) = 
+                self.global_stats.get_full_summary();
+            
+            // 在 actor 内部从 worker_handles 计算 worker 快照
+            let worker_snapshots = self.compute_worker_snapshots();
             
             let _ = sender.send(DownloadProgress::Completed {
                 total_bytes,
@@ -275,30 +270,41 @@ impl ProgressReporterActor {
 /// 
 /// 提供与 ProgressReporterActor 通信的接口
 #[derive(Clone)]
-pub(super) struct ProgressReporter {
+pub(super) struct ProgressReporter<C: crate::utils::io_traits::HttpClient> {
     /// 消息发送器（async channel）
     message_tx: mpsc::Sender<ActorMessage>,
+    /// PhantomData 用于持有泛型参数
+    _phantom: std::marker::PhantomData<C>,
 }
 
-impl ProgressReporter {
+impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
     /// 创建新的进度报告器（启动 actor）
     pub(super) fn new(
         progress_sender: Option<mpsc::Sender<DownloadProgress>>,
         total_size: NonZeroU64,
+        worker_handles: Arc<ArcSwap<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>>,
+        global_stats: Arc<crate::utils::stats::TaskStats>,
+        update_interval: std::time::Duration,
     ) -> Self {
         // 使用有界 channel，容量 100
         let (message_tx, message_rx) = mpsc::channel(100);
         
-        let actor = ProgressReporterActor::new(
-            progress_sender,
-            total_size,
-            message_rx,
-        );
-        
         // 启动 actor 任务
-        tokio::spawn(actor.run());
+        tokio::spawn(async move {
+            ProgressReporterActor::new(
+                progress_sender,
+                total_size,
+                message_rx,
+                worker_handles,
+                global_stats,
+                update_interval,
+            ).await.run().await;
+        });
         
-        Self { message_tx }
+        Self { 
+            message_tx,
+            _phantom: std::marker::PhantomData,
+        }
     }
     
     /// 发送开始事件
@@ -312,41 +318,13 @@ impl ProgressReporter {
         });
     }
     
-    /// 发送统计更新（进度报告）
-    pub(super) fn send_stats_update(
-        &self,
-        total_bytes: u64,
-        total_avg_speed: f64,
-        total_instant_speed: Option<f64>,
-        worker_stats: Vec<WorkerStatsRef>,
-    ) {
-        let tx = self.message_tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(ActorMessage::StatsUpdate {
-                total_bytes,
-                total_avg_speed,
-                total_instant_speed,
-                worker_stats,
-            }).await;
-        });
-    }
     
     /// 发送完成统计
-    pub(super) fn send_completion(
-        &self,
-        total_bytes: u64,
-        total_avg_speed: f64,
-        total_secs: f64,
-        worker_stats: Vec<WorkerStatsRef>,
-    ) {
+    /// Actor 会从共享数据源直接获取所有统计信息
+    pub(super) fn send_completion(&self) {
         let tx = self.message_tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(ActorMessage::SendCompletion {
-                total_bytes,
-                total_avg_speed,
-                total_secs,
-                worker_stats,
-            }).await;
+            let _ = tx.send(ActorMessage::SendCompletion).await;
         });
     }
     
@@ -381,23 +359,59 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    // 辅助函数：创建空的 worker_handles
+    fn create_empty_worker_handles<C: crate::utils::io_traits::HttpClient>() -> Arc<ArcSwap<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>> {
+        Arc::new(ArcSwap::from_pointee(im::HashMap::new()))
+    }
+    
+    // 辅助函数：创建模拟的 global_stats
+    fn create_mock_global_stats() -> Arc<crate::utils::stats::TaskStats> {
+        // 使用默认的配置来创建 TaskStats
+        let config = crate::config::DownloadConfig::default();
+        Arc::new(crate::utils::stats::TaskStats::from_config(config.speed()))
+    }
+
     #[tokio::test]
     async fn test_progress_reporter_creation() {
         let (tx, _rx) = mpsc::channel(10);
-        let _reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
+        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let global_stats = create_mock_global_stats();
+        let _reporter = ProgressReporter::new(
+            Some(tx),
+            NonZeroU64::new(1000).unwrap(),
+            worker_handles,
+            global_stats,
+            std::time::Duration::from_secs(1),
+        );
         // Actor 已启动，只验证创建成功
     }
 
     #[tokio::test]
     async fn test_progress_reporter_without_sender() {
-        let _reporter = ProgressReporter::new(None, NonZeroU64::new(1000).unwrap());
+        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let global_stats = create_mock_global_stats();
+        let _reporter = ProgressReporter::new(
+            None,
+            NonZeroU64::new(1000).unwrap(),
+            worker_handles,
+            global_stats,
+            std::time::Duration::from_secs(1),
+        );
         // Actor 已启动，只验证创建成功
     }
 
     #[tokio::test]
     async fn test_send_started_event() {
         let (tx, mut rx) = mpsc::channel(10);
-        let reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
+        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let global_stats = create_mock_global_stats();
+        let reporter = ProgressReporter::new(
+            Some(tx),
+            NonZeroU64::new(1000).unwrap(),
+            worker_handles,
+            global_stats,
+            std::time::Duration::from_secs(1),
+        );
         
         reporter.send_started_event(4, 256);
         
@@ -419,7 +433,15 @@ mod tests {
     #[tokio::test]
     async fn test_send_error() {
         let (tx, mut rx) = mpsc::channel(10);
-        let reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
+        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let global_stats = create_mock_global_stats();
+        let reporter = ProgressReporter::new(
+            Some(tx),
+            NonZeroU64::new(1000).unwrap(),
+            worker_handles,
+            global_stats,
+            std::time::Duration::from_secs(1),
+        );
         
         reporter.send_error("Test error");
         
@@ -438,7 +460,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_events_without_sender() {
-        let reporter = ProgressReporter::new(None, NonZeroU64::new(1000).unwrap());
+        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let global_stats = create_mock_global_stats();
+        let reporter = ProgressReporter::new(
+            None,
+            NonZeroU64::new(1000).unwrap(),
+            worker_handles,
+            global_stats,
+            std::time::Duration::from_secs(1),
+        );
         
         // 这些调用不应该 panic
         reporter.send_started_event(4, 256);
@@ -451,7 +481,15 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown() {
         let (tx, _rx) = mpsc::channel(10);
-        let reporter = ProgressReporter::new(Some(tx), NonZeroU64::new(1000).unwrap());
+        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let global_stats = create_mock_global_stats();
+        let reporter = ProgressReporter::new(
+            Some(tx),
+            NonZeroU64::new(1000).unwrap(),
+            worker_handles,
+            global_stats,
+            std::time::Duration::from_secs(1),
+        );
         
         reporter.record_range_complete();
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
