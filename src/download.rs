@@ -17,7 +17,7 @@ mod worker_health_checker;
 pub mod task;
 
 pub use progress_reporter::{DownloadProgress, WorkerStatSnapshot};
-pub use worker_health_checker::{WorkerHealthChecker, WorkerSpeed};
+pub use worker_health_checker::WorkerSpeed;
 use task::DownloadTask;
 
 /// 下载任务句柄

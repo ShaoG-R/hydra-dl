@@ -10,7 +10,7 @@ use crate::{download::{
     progress_reporter::ProgressReporter,
     progressive::{ProgressiveLauncher, WorkerLaunchRequest},
     task_allocator::{FailedRange, TaskAllocator},
-    worker_health_checker::{WorkerHealthChecker, WorkerSpeed},
+    worker_health_checker::{WorkerHealthChecker, WorkerCancelRequest},
 }, pool::download::DownloadWorkerHandle};
 use crate::utils::writer::MmapWriter;
 use crate::DownloadError;
@@ -58,6 +58,12 @@ pub struct DownloadTask<C: HttpClient> {
     /// Worker 句柄缓存（worker_id -> handle）
     /// 使用 ArcSwap + im::HashMap 实现无锁原子更新和共享
     worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+    /// 健康检查器（actor 模式）
+    health_checker: WorkerHealthChecker<C>,
+    /// Worker 取消请求接收器（由 health_checker 发送）
+    cancel_request_rx: mpsc::Receiver<WorkerCancelRequest>,
+    /// 正在执行任务的 worker 集合（与 health_checker 共享）
+    active_workers: Arc<ArcSwap<im::HashSet<u64>>>,
 }
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
@@ -94,6 +100,21 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 取出启动请求接收器
         let launch_request_rx = progressive_launcher.take_launch_request_rx()
             .expect("launch_request_rx should be available");
+        
+        // 创建 active_workers 共享状态
+        let active_workers = Arc::new(ArcSwap::from_pointee(im::HashSet::new()));
+        
+        // 创建健康检查器（actor 模式）
+        let mut health_checker = WorkerHealthChecker::new(
+            Arc::clone(&config),
+            Arc::clone(&worker_handles),
+            config.speed().instant_speed_window(),
+            Arc::clone(&active_workers),
+        );
+        
+        // 取出取消请求接收器
+        let cancel_request_rx = health_checker.take_cancel_request_rx()
+            .expect("cancel_request_rx should be available");
 
         // 第一批 worker 数量
         let initial_worker_count = progressive_launcher.initial_worker_count();
@@ -142,6 +163,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             timer_service,
             cancel_senders: FxHashMap::default(),
             worker_handles,
+            health_checker,
+            cancel_request_rx,
+            active_workers,
         })
     }
 
@@ -169,6 +193,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 Some(notification) = timeout_rx.recv() => self.handle_retry_timeout(notification.task_id()).await,
                 result = self.pool.result_receiver().recv() => self.handle_worker_result(result).await,
                 Some(request) = self.launch_request_rx.recv() => self.handle_launch_request(request).await,
+                Some(request) = self.cancel_request_rx.recv() => self.handle_cancel_request(request).await,
             };
 
             match control {
@@ -182,11 +207,24 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     }
 
 
-    /// 处理管理定时器触发（仅进行健康检查）
+    /// 处理管理定时器触发（预留用于其他管理任务）
     async fn handle_management_tick(&mut self) -> LoopControl {
-        // 执行健康检查，检测并终止异常下载线程
-        self.check_and_handle_unhealthy_workers();
-
+        // 健康检查已经由独立的 actor 处理，这里预留给其他管理任务
+        LoopControl::Continue
+    }
+    
+    /// 处理 worker 取消请求（由 health_checker actor 发送）
+    async fn handle_cancel_request(&mut self, request: WorkerCancelRequest) -> LoopControl {
+        let WorkerCancelRequest { worker_id, reason } = request;
+        
+        info!("收到 Worker #{} 取消请求: {}", worker_id, reason);
+        
+        if self.cancel_worker_task(worker_id) {
+            info!("已取消 Worker #{} 的任务，将重新分配", worker_id);
+            // worker 会在任务取消后返回 DownloadFailed 结果，
+            // 触发失败处理流程，自动将该 worker 标记为空闲并重新分配任务
+        }
+        
         LoopControl::Continue
     }
     
@@ -244,6 +282,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 } else {
                     // 保存取消 sender
                     self.cancel_senders.insert(worker_id, cancel_tx);
+                    // 标记为活跃 worker
+                    self.add_active_worker(worker_id);
                 }
             } else {
                 error!("Worker #{} 不存在", worker_id);
@@ -290,6 +330,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 移除该 worker 的取消 sender（任务已完成）
         self.cancel_senders.remove(&worker_id);
+        
+        // 从 active_workers 中移除
+        self.remove_active_worker(worker_id);
 
         // 将完成的 worker 标记为空闲
         self.task_allocator.mark_worker_idle(worker_id);
@@ -321,6 +364,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 移除该 worker 的取消 sender（任务已失败）
         self.cancel_senders.remove(&worker_id);
+        
+        // 从 active_workers 中移除
+        self.remove_active_worker(worker_id);
 
         // 将失败的 worker 标记为空闲
         self.task_allocator.mark_worker_idle(worker_id);
@@ -402,8 +448,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                     // 失败了，将 worker 放回队列
                     self.task_allocator.mark_worker_idle(target_worker);
                 } else {
-                    // 保存取消通道，稍后由调用者保存
+                    // 保存取消通道
                     self.cancel_senders.insert(target_worker, cancel_tx);
+                    // 标记为活跃 worker
+                    self.add_active_worker(target_worker);
                 }
             } else {
                 error!("Worker #{} 不存在", target_worker);
@@ -536,6 +584,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         
         // 关闭 progressive launcher actor 并等待其完全停止
         self.progressive_launcher.shutdown_and_wait().await;
+        
+        // 关闭 health checker actor 并等待其完全停止
+        self.health_checker.shutdown_and_wait().await;
 
         if let Some(msg) = error_msg {
             return Err(DownloadError::Other(msg));
@@ -559,6 +610,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         if let Some(cancel_tx) = self.cancel_senders.remove(&worker_id) {
             // 发送取消信号（忽略发送失败，因为接收端可能已关闭）
             let _ = cancel_tx.send(());
+            // 从 active_workers 中移除
+            self.remove_active_worker(worker_id);
             debug!("已向 Worker #{} 发送取消信号", worker_id);
             true
         } else {
@@ -566,77 +619,23 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             false
         }
     }
-
-    /// 检查并处理不健康的 worker
-    ///
-    /// 使用健康检查器来识别速度异常的 worker 并取消其任务
-    fn check_and_handle_unhealthy_workers(&mut self) {
-        // 检查是否启用健康检查
-        if !self.config.health_check().enabled() {
-            return;
-        }
-
-        let current_worker_count = self.pool.worker_count();
-        let min_workers = self.config.health_check().min_workers_for_check();
-
-        // worker 数量不足，跳过检查
-        if current_worker_count < min_workers {
-            return;
-        }
-
-        // 收集正在执行任务的 worker 的速度信息
-        // 只检查有正在执行任务的 worker（通过 cancel_senders 判断）
-        // 避免对空闲 worker 的旧速度数据反复警告
-        let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
-
-        // 遍历所有实际的 worker_id（不能假设从 0 开始）
-        let handles = self.worker_handles.load();
-        for &worker_id in handles.keys() {
-            // 只检查正在执行任务的 worker
-            if !self.cancel_senders.contains_key(&worker_id) {
-                continue;
-            }
-            
-            if let Some(handle) = handles.get(&worker_id) {
-                let (speed, valid) = handle.window_avg_speed();
-                // 只考虑有效的速度数据
-                if valid && speed > 0.0 {
-                    worker_speeds.push(WorkerSpeed { worker_id, speed });
-                }
-            }
-        }
-
-        // 至少需要 min_workers 个有效速度数据才能进行比较
-        if (worker_speeds.len() as u64) < min_workers {
-            return;
-        }
-
-        // 创建健康检查器
-        let absolute_threshold = self.config.health_check().absolute_speed_threshold() as f64;
-        let checker = WorkerHealthChecker::new(absolute_threshold, 0.5);
-
-        // 执行健康检查
-        let Some(result) = checker.check(&worker_speeds) else {
-            return;
-        };
-
-        // 终止不健康的 worker
-        for (worker_id, speed) in result.unhealthy_workers {
-            warn!(
-                "检测到不健康的 Worker #{}: 速度 {:.2} KB/s (基准: {:.2} KB/s, 阈值: {:.2} KB/s)，准备终止",
-                worker_id,
-                speed / 1024.0,
-                result.health_baseline / 1024.0,
-                absolute_threshold / 1024.0
-            );
-
-            if self.cancel_worker_task(worker_id) {
-                info!("已取消 Worker #{} 的任务，将重新分配", worker_id);
-                // worker 会在任务取消后返回 DownloadFailed 结果，
-                // 触发失败处理流程，自动将该 worker 标记为空闲并重新分配任务
-            }
-        }
+    
+    /// 添加活跃 worker
+    #[inline]
+    fn add_active_worker(&self, worker_id: u64) {
+        let mut active = (*self.active_workers.load_full()).clone();
+        active.insert(worker_id);
+        self.active_workers.store(Arc::new(active));
     }
+    
+    /// 移除活跃 worker
+    #[inline]
+    fn remove_active_worker(&self, worker_id: u64) {
+        let mut active = (*self.active_workers.load_full()).clone();
+        active.remove(&worker_id);
+        self.active_workers.store(Arc::new(active));
+    }
+
 
     /// 完成并清理资源
     pub(super) async fn finalize_and_cleanup(mut self, save_path: PathBuf) -> crate::Result<()> {
@@ -660,6 +659,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 这很重要，因为 actor 持有 written_bytes 的 Arc 引用
         // 必须等待它释放后才能 finalize writer
         self.progressive_launcher.shutdown_and_wait().await;
+        
+        // 关闭 health checker actor 并等待其完全停止
+        self.health_checker.shutdown_and_wait().await;
 
         // 完成写入
         self.writer.finalize()?;
@@ -766,6 +768,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                     } else {
                         // 收集取消通道，稍后由调用者保存
                         new_cancel_senders.push((assigned_worker, cancel_tx));
+                        // 标记为活跃 worker
+                        self.add_active_worker(assigned_worker);
                     }
                 } else {
                     error!("Worker #{} 不存在", assigned_worker);
