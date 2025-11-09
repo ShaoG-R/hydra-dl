@@ -56,11 +56,6 @@ impl ProgressiveLauncherLogic {
             })
             .collect();
         
-        info!(
-            "渐进式启动配置: 目标 {} workers, 阶段: {:?}",
-            total_worker_count, worker_launch_stages
-        );
-        
         Self {
             worker_launch_stages,
             next_launch_stage: 1, // 第一批已启动，下一个是第二批（索引1）
@@ -235,6 +230,12 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
         check_interval: std::time::Duration,
     ) -> Self {
         let logic = ProgressiveLauncherLogic::new(&config);
+        
+        info!(
+            "渐进式启动配置: 目标 {} workers, 阶段: {:?}",
+            config.concurrency().worker_count(),
+            logic.worker_launch_stages
+        );
         
         let mut check_timer = tokio::time::interval(check_interval);
         check_timer.tick().await; // 跳过首次立即触发

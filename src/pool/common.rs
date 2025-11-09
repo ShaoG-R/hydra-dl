@@ -458,8 +458,6 @@ impl<E: WorkerExecutor> WorkerPool<E> {
             
             handles.push(worker_handle);
         }
-        
-        info!("创建协程池，{} 个初始 workers", worker_count);
 
         Ok((pool, handles, result_receiver))
     }

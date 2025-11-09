@@ -34,8 +34,6 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     // 启动下载任务（会自动检测文件名）
     let (mut handle, save_path) = download_ranged(&cli.url, save_dir, config, timer_service).await?;
 
-    info!("保存路径: {:?}", save_path);
-
     if cli.quiet {
         // 静默模式：只等待完成
         handle.wait().await?;
