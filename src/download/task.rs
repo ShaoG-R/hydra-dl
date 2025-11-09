@@ -278,12 +278,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.try_allocate_next_task(worker_id).await;
 
         // 检查是否所有任务已完成
-        let status = self.check_completion_status();
-        if matches!(status, LoopControl::Break) {
-            // 所有任务完成，关闭 workers 以释放 result_sender，让主循环能退出
-            self.pool.shutdown().await;
-        }
-        status
+        self.check_completion_status()
     }
 
     /// 处理任务失败事件

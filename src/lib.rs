@@ -98,7 +98,7 @@
 //!             .initial_size(10 * MB)                  // 初始 10 MB 分块
 //!             .min_size(5 * MB)                       // 最小 5 MB（慢速时）
 //!             .max_size(100 * MB))                    // 最大 100 MB（高速时）
-//!         .build().unwrap();
+//!         .build();
 //!     
 //!     let timer = TimerWheel::with_defaults();
 //!     let timer_service = timer.create_service(ServiceConfig::default());
