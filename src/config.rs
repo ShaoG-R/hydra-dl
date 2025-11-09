@@ -24,9 +24,7 @@ pub struct ConcurrencyDefaults;
 
 impl ConcurrencyDefaults {
     /// 默认 Worker 数量：4
-    pub const WORKER_COUNT: usize = 4;
-    /// 最大 Worker 数量：32
-    pub const MAX_WORKER_COUNT: usize = 32;
+    pub const WORKER_COUNT: u64 = 4;
 }
 
 /// 网络配置常量
@@ -94,16 +92,7 @@ impl HealthCheckDefaults {
     /// 是否启用健康检查
     pub const ENABLED: bool = true;
     /// 最小worker数量阈值（低于此数量不执行健康检查）
-    pub const MIN_WORKERS_FOR_CHECK: usize = 3;
-}
-
-// ==================== 构建配置错误 ====================
-
-/// 构建配置错误
-#[derive(thiserror::Error, Debug)]
-pub enum BuildError {
-    #[error("Worker 数量 {0} 超过最大限制 {1}")]
-    WorkerCountExceeded(usize, usize),
+    pub const MIN_WORKERS_FOR_CHECK: u64 = 3;
 }
 
 // ==================== 子配置结构体 ====================
@@ -154,7 +143,7 @@ impl ChunkConfig {
 #[derive(Debug, Clone)]
 pub struct ConcurrencyConfig {
     /// Worker 并发数量
-    pub worker_count: usize,
+    pub worker_count: u64,
 }
 
 impl Default for ConcurrencyConfig {
@@ -167,7 +156,7 @@ impl Default for ConcurrencyConfig {
 
 impl ConcurrencyConfig {
     #[inline]
-    pub fn worker_count(&self) -> usize {
+    pub fn worker_count(&self) -> u64 {
         self.worker_count
     }
 }
@@ -387,7 +376,7 @@ pub struct HealthCheckConfig {
     /// 绝对速度阈值（bytes/s）
     pub absolute_speed_threshold: u64,
     /// 最小worker数量阈值（低于此数量不执行健康检查）
-    pub min_workers_for_check: usize,
+    pub min_workers_for_check: u64,
 }
 
 impl Default for HealthCheckConfig {
@@ -412,7 +401,7 @@ impl HealthCheckConfig {
     }
 
     #[inline]
-    pub fn min_workers_for_check(&self) -> usize {
+    pub fn min_workers_for_check(&self) -> u64 {
         self.min_workers_for_check
     }
 }
@@ -549,7 +538,7 @@ impl Default for ChunkConfigBuilder {
 /// 并发配置构建器
 #[derive(Debug, Clone)]
 pub struct ConcurrencyConfigBuilder {
-    worker_count: usize,
+    worker_count: u64,
 }
 
 impl ConcurrencyConfigBuilder {
@@ -561,7 +550,7 @@ impl ConcurrencyConfigBuilder {
     }
 
     /// 设置 Worker 并发数量
-    pub fn worker_count(mut self, count: usize) -> Self {
+    pub fn worker_count(mut self, count: u64) -> Self {
         self.worker_count = count.max(1);
         self
     }
@@ -856,7 +845,7 @@ impl Default for RetryConfigBuilder {
 pub struct HealthCheckConfigBuilder {
     enabled: bool,
     absolute_speed_threshold: u64,
-    min_workers_for_check: usize,
+    min_workers_for_check: u64,
 }
 
 impl HealthCheckConfigBuilder {
@@ -882,7 +871,7 @@ impl HealthCheckConfigBuilder {
     }
 
     /// 设置最小worker数量阈值
-    pub fn min_workers_for_check(mut self, count: usize) -> Self {
+    pub fn min_workers_for_check(mut self, count: u64) -> Self {
         self.min_workers_for_check = count.max(2); // 至少需要2个worker才能比较
         self
     }
@@ -1112,21 +1101,13 @@ impl DownloadConfigBuilder {
     // ==================== 构建方法 ====================
     
     /// 构建配置对象
-    pub fn build(self) -> Result<DownloadConfig, BuildError> {
-        // 验证 worker_count 不超过最大限制
-        if self.concurrency.worker_count > ConcurrencyDefaults::MAX_WORKER_COUNT {
-            return Err(BuildError::WorkerCountExceeded(
-                self.concurrency.worker_count,
-                ConcurrencyDefaults::MAX_WORKER_COUNT,
-            ));
-        }
-        
+    pub fn build(self) -> DownloadConfig {
         // 确保配置的合理性：min <= initial <= max
         let mut chunk = self.chunk;
         chunk.initial_size = chunk.initial_size.max(chunk.min_size);
         chunk.max_size = chunk.max_size.max(chunk.initial_size);
         
-        Ok(DownloadConfig {
+        DownloadConfig {
             chunk,
             concurrency: self.concurrency,
             network: self.network,
@@ -1134,7 +1115,7 @@ impl DownloadConfigBuilder {
             progressive: self.progressive,
             retry: self.retry,
             health_check: self.health_check,
-        })
+        }
     }
 }
 
@@ -1161,7 +1142,7 @@ mod tests {
 
     #[test]
     fn test_builder_default() {
-        let config = DownloadConfig::builder().build().unwrap();
+        let config = DownloadConfig::builder().build();
         assert_eq!(config.concurrency().worker_count(), ConcurrencyDefaults::WORKER_COUNT);
         assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
         assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
@@ -1176,7 +1157,7 @@ mod tests {
                 .min_size(1 * 1024 * 1024)
                 .initial_size(10 * 1024 * 1024)
                 .max_size(100 * 1024 * 1024))
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.concurrency().worker_count(), 8);
         assert_eq!(config.chunk().min_size(), 1 * 1024 * 1024);
@@ -1192,7 +1173,7 @@ mod tests {
                 .min_size(0)  // 应该被限制为 1
                 .initial_size(0)  // 应该被限制为 1
                 .max_size(0))  // 应该被限制为 1
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.concurrency().worker_count(), 1);
         assert_eq!(config.chunk().min_size(), 1);
@@ -1208,7 +1189,7 @@ mod tests {
                 .min_size(10 * 1024 * 1024)
                 .initial_size(5 * 1024 * 1024)  // 小于 min
                 .max_size(3 * 1024 * 1024))      // 小于 initial
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.chunk().min_size(), 10 * 1024 * 1024);
         assert_eq!(config.chunk().initial_size(), 10 * 1024 * 1024);  // 调整为 min
@@ -1226,7 +1207,7 @@ mod tests {
     fn test_progressive_worker_ratios_custom() {
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.5, 1.0]))
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
     }
@@ -1236,7 +1217,7 @@ mod tests {
         // 测试自动排序
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![1.0, 0.25, 0.75, 0.5]))
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
     }
@@ -1246,7 +1227,7 @@ mod tests {
         // 测试过滤无效值（<= 0 或 > 1.0）
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.0, 0.5, 1.0, 1.5, -0.1]))
-            .build().unwrap();
+            .build();
         
         // 0.0, 1.5, -0.1 应该被过滤掉
         assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
@@ -1257,7 +1238,7 @@ mod tests {
         // 测试去重
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.5, 0.5, 1.0, 1.0, 0.25]))
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 1.0]);
     }
@@ -1267,13 +1248,13 @@ mod tests {
         // 测试空序列或全部无效值时使用默认值
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![]))
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
         
         let config2 = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.0, -1.0, 2.0]))
-            .build().unwrap();
+            .build();
         
         assert_eq!(config2.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
     }
@@ -1282,7 +1263,7 @@ mod tests {
     fn test_min_speed_threshold() {
         let config = DownloadConfig::builder()
             .progressive(|p| p.min_speed_threshold(5 * 1024 * 1024))  // 5 MB/s
-            .build().unwrap();
+            .build();
         
         assert_eq!(config.progressive().min_speed_threshold(), 5 * 1024 * 1024);
     }
@@ -1297,8 +1278,7 @@ mod tests {
                     Duration::from_secs(2),
                     Duration::from_secs(5),
                 ]))
-            .build()
-            .unwrap();
+            .build();
 
         assert_eq!(config.retry().max_retry_count(), 5);
         assert_eq!(config.retry().retry_delays().len(), 3);
@@ -1322,8 +1302,7 @@ mod tests {
     fn test_retry_delays_empty_uses_default() {
         let config = DownloadConfig::builder()
             .retry(|r| r.retry_delays(vec![]))
-            .build()
-            .unwrap();
+            .build();
 
         assert_eq!(config.retry().retry_delays().len(), 3);
         assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
@@ -1338,28 +1317,11 @@ mod tests {
                 .initial_size(5 * MB)
                 .max_size(20 * MB))
             .concurrency(|c| c.worker_count(8))
-            .build()
-            .unwrap();
+            .build();
         
         assert_eq!(config.chunk.min_size, 1 * MB);
         assert_eq!(config.chunk.initial_size, 5 * MB);
         assert_eq!(config.chunk.max_size, 20 * MB);
         assert_eq!(config.concurrency.worker_count, 8);
-    }
-
-    #[test]
-    fn test_worker_count_exceeds_max() {
-        let result = DownloadConfig::builder()
-            .concurrency(|c| c.worker_count(100))  // 超过最大限制 32
-            .build();
-        
-        assert!(result.is_err());
-        match result {
-            Err(BuildError::WorkerCountExceeded(count, max)) => {
-                assert_eq!(count, 100);
-                assert_eq!(max, ConcurrencyDefaults::MAX_WORKER_COUNT);
-            }
-            Ok(_) => panic!("应该返回错误"),
-        }
     }
 }

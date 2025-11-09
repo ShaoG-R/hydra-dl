@@ -4,12 +4,12 @@ use log::{debug, error, info, warn};
 use kestrel_timer::{TaskId, TimerService};
 use ranged_mmap::AllocatedRange;
 use rustc_hash::FxHashMap;
-use crate::download::{
+use crate::{download::{
     progress_reporter::{ProgressReporter, WorkerStatsRef},
-    progressive::{ProgressiveLauncher, WorkerLaunchExecutor, LaunchDecision},
+    progressive::{LaunchDecision, ProgressiveLauncher, WorkerLaunchExecutor},
     task_allocator::{FailedRange, TaskAllocator},
     worker_health_checker::{WorkerHealthChecker, WorkerSpeed},
-};
+}, pool::download::DownloadWorkerHandle};
 use crate::utils::writer::MmapWriter;
 use crate::DownloadError;
 use crate::pool::download::DownloadWorkerPool;
@@ -50,9 +50,9 @@ pub struct DownloadTask<C: HttpClient> {
     ///
     /// 用于内部管理每个 worker 当前任务的取消功能
     /// 当需要中止某个 worker 的任务时，可以通过发送取消信号来实现
-    cancel_senders: FxHashMap<usize, tokio::sync::oneshot::Sender<()>>,
+    cancel_senders: FxHashMap<u64, tokio::sync::oneshot::Sender<()>>,
     /// Worker 句柄缓存（worker_id -> handle）
-    worker_handles: Vec<crate::pool::download::DownloadWorkerHandle<C>>,
+    worker_handles: FxHashMap<u64, DownloadWorkerHandle<C>>,
 }
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
@@ -86,11 +86,16 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             Arc::clone(&config),
         )?;
 
+        // 使用实际的 worker_id（从 handle 获取）而不是 enumerate 的索引
+        let worker_handles: FxHashMap<u64, _> = initial_handles.into_iter()
+            .map(|handle| (handle.worker_id(), handle))
+            .collect();
+        
         let mut task_allocator = TaskAllocator::new(allocator, url);
         let progress_reporter = ProgressReporter::new(progress_sender, total_size);
 
-        // 将第一批 workers 加入空闲队列
-        for worker_id in 0..initial_worker_count {
+        // 将第一批 workers 加入空闲队列（使用实际的 worker_id）
+        for &worker_id in worker_handles.keys() {
             task_allocator.mark_worker_idle(worker_id);
         }
 
@@ -103,7 +108,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             progressive_launcher,
             timer_service,
             cancel_senders: FxHashMap::default(),
-            worker_handles: initial_handles,
+            worker_handles,
         })
     }
 
@@ -260,7 +265,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     }
 
     /// 处理任务完成事件
-    async fn handle_complete(&mut self, worker_id: usize) -> LoopControl {
+    async fn handle_complete(&mut self, worker_id: u64) -> LoopControl {
         self.progress_reporter.record_range_complete();
 
         // 移除该 worker 的取消 sender（任务已完成）
@@ -273,13 +278,18 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.try_allocate_next_task(worker_id).await;
 
         // 检查是否所有任务已完成
-        self.check_completion_status()
+        let status = self.check_completion_status();
+        if matches!(status, LoopControl::Break) {
+            // 所有任务完成，关闭 workers 以释放 result_sender，让主循环能退出
+            self.pool.shutdown().await;
+        }
+        status
     }
 
     /// 处理任务失败事件
     async fn handle_failed(
         &mut self,
-        worker_id: usize,
+        worker_id: u64,
         range: AllocatedRange,
         error: String,
         retry_count: usize,
@@ -307,21 +317,26 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.try_allocate_next_task(worker_id).await;
 
         // 检查是否所有任务已完成
-        self.check_completion_status()
+        let status = self.check_completion_status();
+        if matches!(status, LoopControl::Break) {
+            // 所有任务完成或出现永久失败，关闭 workers 以释放 result_sender
+            self.pool.shutdown().await;
+        }
+        status
     }
 
     /// 收集 worker 原始统计数据
     ///
     /// 从 pool 收集 worker 统计引用，让 actor 内部计算
     fn collect_worker_stats(&self) -> Vec<WorkerStatsRef> {
-        self.pool.workers()
-            .into_iter()
-            .filter_map(|handle| {
-                let worker_id = handle.worker_id();
-                handle.stats().map(|stats| WorkerStatsRef {
-                    worker_id,
+        self.worker_handles
+            .iter()
+            .map(|(worker_id, handle)| {
+                let stats = handle.stats();
+                WorkerStatsRef {
+                    worker_id: *worker_id,
                     stats,
-                })
+                }
             })
             .collect()
     }
@@ -354,7 +369,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 尝试为所有空闲 worker 分配初始任务
         while let Some(&worker_id) = self.task_allocator.idle_workers.front() {
             let chunk_size = self.get_worker_handle(worker_id)
-                .and_then(|h| h.chunk_size())
+                .map(|h| h.chunk_size())
                 .unwrap_or(self.config.chunk().initial_size());
 
             if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
@@ -386,9 +401,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     /// 尝试为指定 worker 分配下一个任务
     ///
     /// 获取该 worker 的当前分块大小，并尝试分配新任务
-    async fn try_allocate_next_task(&mut self, worker_id: usize) {
+    async fn try_allocate_next_task(&mut self, worker_id: u64) {
         let chunk_size = self.get_worker_handle(worker_id)
-            .and_then(|h| h.chunk_size())
+            .map(|h| h.chunk_size())
             .unwrap_or(self.config.chunk().initial_size());
 
         if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {
@@ -530,11 +545,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 清理所有取消 sender
         self.cancel_senders.clear();
 
-        // 关闭 workers（发送关闭信号，workers 会异步自动清理）
-        self.pool.shutdown();
-
-        // 等待所有 workers 完成自动清理
-        self.pool.wait_for_shutdown().await;
+        // 关闭 workers（发送关闭信号）
+        self.pool.shutdown().await;
         
         // 关闭 progress reporter actor
         self.progress_reporter.shutdown();
@@ -557,7 +569,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     /// # Returns
     ///
     /// 如果成功发送取消信号返回 `true`，否则返回 `false`（worker 可能没有正在执行的任务）
-    fn cancel_worker_task(&mut self, worker_id: usize) -> bool {
+    fn cancel_worker_task(&mut self, worker_id: u64) -> bool {
         if let Some(cancel_tx) = self.cancel_senders.remove(&worker_id) {
             // 发送取消信号（忽略发送失败，因为接收端可能已关闭）
             let _ = cancel_tx.send(());
@@ -590,7 +602,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
 
         for worker_id in 0..current_worker_count {
-            if let Some((speed, valid)) = self.get_worker_handle(worker_id).and_then(|h| h.window_avg_speed()) {
+            if let Some((speed, valid)) = self.get_worker_handle(worker_id).map(|h| h.window_avg_speed()) {
                 // 只考虑有效的速度数据
                 if valid && speed > 0.0 {
                     worker_speeds.push(WorkerSpeed { worker_id, speed });
@@ -599,7 +611,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         }
 
         // 至少需要 min_workers 个有效速度数据才能进行比较
-        if worker_speeds.len() < min_workers {
+        if (worker_speeds.len() as u64) < min_workers {
             return;
         }
 
@@ -650,13 +662,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 优雅关闭所有 workers（发送关闭信号，workers 会异步自动清理）
         let mut pool = self.pool;
-        pool.shutdown();
+        pool.shutdown().await;
 
-        // 等待所有 workers 完成自动清理
-        // 这确保所有对 executor（含 writer）的引用都已释放
-        pool.wait_for_shutdown().await;
-
-        // 释放 pool（它持有 writer 的引用）
+        // 释放 pool（它持有 executor 的引用）
         drop(pool);
         
         // 关闭 progress reporter actor
@@ -672,7 +680,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 获取当前活跃 worker 数量
     #[inline]
-    pub fn worker_count(&self) -> usize {
+    pub fn worker_count(&self) -> u64 {
         self.pool.worker_count()
     }
 
@@ -686,15 +694,15 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     ///
     /// Worker 句柄的克隆，如果 worker 不存在则返回 `None`
     #[inline]
-    fn get_worker_handle(&self, worker_id: usize) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
-        self.worker_handles.get(worker_id).cloned()
+    fn get_worker_handle(&self, worker_id: u64) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
+        self.worker_handles.get(&worker_id).cloned()
     }
 
     /// 获取指定 worker 的当前分块大小
     #[inline]
-    pub fn get_worker_chunk_size(&self, worker_id: usize) -> u64 {
+    pub fn get_worker_chunk_size(&self, worker_id: u64) -> u64 {
         self.get_worker_handle(worker_id)
-            .and_then(|h| h.chunk_size())
+            .map(|h| h.chunk_size())
             .unwrap_or(self.config.chunk().initial_size())
     }
 
@@ -715,12 +723,12 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 ///
 /// 提供渐进式启动所需的外部能力接口
 impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
-    fn current_worker_count(&self) -> usize {
+    fn current_worker_count(&self) -> u64 {
         self.pool.worker_count()
     }
 
-    fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)> {
-        self.get_worker_handle(worker_id).and_then(|h| h.instant_speed())
+    fn get_worker_instant_speed(&self, worker_id: u64) -> Option<(f64, bool)> {
+        self.get_worker_handle(worker_id).map(|h| h.instant_speed())
     }
 
     fn get_total_window_avg_speed(&self) -> (f64, bool) {
@@ -733,9 +741,9 @@ impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
 
     async fn execute_worker_launch(
         &mut self,
-        count: usize,
+        count: u64,
         stage: usize,
-    ) -> crate::Result<Vec<(usize, tokio::sync::oneshot::Sender<()>)>> {
+    ) -> crate::Result<Vec<(u64, tokio::sync::oneshot::Sender<()>)>> {
         let current_worker_count = self.pool.worker_count();
         let next_target = current_worker_count + count;
         let mut new_cancel_senders = Vec::new();
@@ -747,25 +755,30 @@ impl<C: HttpClient + Clone> WorkerLaunchExecutor for DownloadTask<C> {
             next_target
         );
 
-        // 动态添加新 worker
-        let new_handles = match self.pool.add_workers(count).await {
-            Ok(handles) => handles,
+        // 动态添加新 worker，收集实际的 worker_id
+        let new_worker_ids: Vec<u64> = match self.pool.add_workers(count).await {
+            Ok(handles) => {
+                let mut ids = Vec::new();
+                for handle in handles {
+                    let worker_id = handle.worker_id();
+                    ids.push(worker_id);
+                    self.worker_handles.insert(worker_id, handle);
+                }
+                ids
+            },
             Err(e) => {
                 error!("添加新 workers 失败: {:?}", e);
                 return Err(e);
             }
         };
 
-        // 将新 worker 句柄添加到缓存
-        self.worker_handles.extend(new_handles);
-
-        // 为新启动的worker加入队列并分配任务
-        for worker_id in current_worker_count..next_target {
+        // 为新启动的worker加入队列并分配任务（使用实际的 worker_id）
+        for worker_id in new_worker_ids {
             // 将新 worker 加入空闲队列
             self.task_allocator.mark_worker_idle(worker_id);
 
             let chunk_size = self.get_worker_handle(worker_id)
-                .and_then(|h| h.chunk_size())
+                .map(|h| h.chunk_size())
                 .unwrap_or(self.config.chunk().initial_size());
 
             if let Some(allocated) = self.task_allocator.try_allocate_task_to_idle_worker(chunk_size) {

@@ -140,7 +140,7 @@ mod tests {
                 .smoothing_factor(0.5)
                 .instant_weight(0.6)
                 .avg_weight(0.4))
-            .build().unwrap();
+            .build();
 
         let strategy = SpeedBasedChunkStrategy::from_config(&config);
 

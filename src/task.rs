@@ -41,12 +41,12 @@ pub(crate) enum RangeResult {
     /// Range 成功完成
     Complete {
         /// 完成此任务的 worker ID
-        worker_id: usize,
+        worker_id: u64,
     },
     /// 下载失败
     DownloadFailed {
         /// 失败的 worker ID
-        worker_id: usize,
+        worker_id: u64,
         /// 失败的 range
         range: AllocatedRange,
         /// 错误信息
@@ -57,7 +57,7 @@ pub(crate) enum RangeResult {
     /// 写入失败
     WriteFailed {
         /// 失败的 worker ID
-        worker_id: usize,
+        worker_id: u64,
         /// 失败的 range
         range: AllocatedRange,
         /// 错误信息

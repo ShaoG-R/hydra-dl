@@ -438,8 +438,7 @@ mod tests {
                 .initial_size(chunk_size)
                 .min_size(1)  // 设置为 1 以允许小文件测试
                 .max_size(chunk_size))  // 固定分块大小以便测试
-            .build()
-            .unwrap();
+            .build();
         
         let result = download_ranged_generic(
             client.clone(),
@@ -450,6 +449,7 @@ mod tests {
             timer_service,
         )
         .await;
+    
 
         assert!(result.is_ok(), "下载应该成功: {:?}", result);
 
@@ -496,8 +496,7 @@ mod tests {
                 .initial_size(test_data.len() as u64)  // 单次分块完成
                 .min_size(1)
                 .max_size(test_data.len() as u64))
-            .build()
-            .unwrap();
+            .build();
         
         let result = download_ranged_generic(
             client.clone(),
@@ -577,8 +576,7 @@ mod tests {
                 .initial_size(chunk_size)
                 .min_size(1)
                 .max_size(chunk_size))  // 固定分块大小以便测试
-            .build()
-            .unwrap();
+            .build();
         
         let result = download_ranged_generic(
             client.clone(),
@@ -638,8 +636,7 @@ mod tests {
                 .initial_size(1 * 1024 * 1024)  // 1 MB
                 .min_size(512 * 1024)  // 512 KB
                 .max_size(2 * 1024 * 1024))  // 2 MB
-            .build()
-            .unwrap();
+            .build();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -713,8 +710,7 @@ mod tests {
                 .initial_size(chunk_size as u64)
                 .min_size(chunk_size as u64)
                 .max_size(chunk_size as u64))  // 固定 2 MB 分块
-            .build()
-            .unwrap();
+            .build();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -787,8 +783,7 @@ mod tests {
                 .initial_size(chunk_size as u64)
                 .min_size(chunk_size as u64)
                 .max_size(chunk_size as u64))  // 固定 10 MB 分块
-            .build()
-            .unwrap();
+            .build();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -865,8 +860,7 @@ mod tests {
             .progressive(|p| p
                 .worker_ratios(vec![0.5, 1.0])
                 .min_speed_threshold(0))  // 设置为0以便立即启动下一批
-            .build()
-            .unwrap();
+            .build();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -889,8 +883,7 @@ mod tests {
             .progressive(|p| p
                 .worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
                 .min_speed_threshold(5 * 1024 * 1024))  // 5 MB/s
-            .build()
-            .unwrap();
+            .build();
 
         assert_eq!(config.concurrency().worker_count(), 12);
         assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
@@ -909,8 +902,7 @@ mod tests {
                     std::time::Duration::from_secs(5),
                 ])
             )
-            .build()
-            .unwrap();
+            .build();
 
         assert_eq!(config.retry().max_retry_count(), 5);
         assert_eq!(config.retry().retry_delays().len(), 3);
@@ -938,8 +930,7 @@ mod tests {
             .retry(|r| { r
                 .retry_delays(vec![])
             })
-            .build()
-            .unwrap();
+            .build();
             
 
         assert_eq!(config.retry().retry_delays().len(), 3);
@@ -1031,8 +1022,7 @@ mod tests {
                     std::time::Duration::from_millis(200),
                     std::time::Duration::from_millis(300),
                 ]))
-            .build()
-            .unwrap();
+            .build();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -1122,8 +1112,7 @@ mod tests {
                     std::time::Duration::from_millis(50),
                     std::time::Duration::from_millis(50),
                 ]))
-            .build()
-            .unwrap();
+            .build();
 
         let result = download_ranged_generic(
             client.clone(),
@@ -1152,8 +1141,7 @@ mod tests {
                     std::time::Duration::from_secs(1),
                     std::time::Duration::from_secs(2),
                 ]))
-            .build()
-            .unwrap();
+            .build();
 
         let delays = config.retry().retry_delays();
         

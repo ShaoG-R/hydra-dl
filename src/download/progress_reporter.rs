@@ -13,7 +13,7 @@ use crate::utils::stats::WorkerStats;
 #[derive(Debug, Clone)]
 pub struct WorkerStatSnapshot {
     /// Worker ID
-    pub worker_id: usize,
+    pub worker_id: u64,
     /// 该 worker 下载的字节数
     pub bytes: u64,
     /// 该 worker 完成的 range 数量
@@ -34,7 +34,7 @@ pub enum DownloadProgress {
         /// 文件总大小（bytes）
         total_size: NonZeroU64,
         /// Worker 数量
-        worker_count: usize,
+        worker_count: u64,
         /// 初始分块大小（bytes）
         initial_chunk_size: u64,
     },
@@ -75,7 +75,7 @@ pub enum DownloadProgress {
 #[derive(Debug, Clone)]
 pub(super) struct WorkerStatsRef {
     /// Worker ID
-    pub worker_id: usize,
+    pub worker_id: u64,
     /// Worker 统计数据
     pub stats: Arc<WorkerStats>,
 }
@@ -87,7 +87,7 @@ enum ActorMessage {
     RecordRangeComplete,
     /// 发送开始事件
     SendStarted {
-        worker_count: usize,
+        worker_count: u64,
         initial_chunk_size: u64,
     },
     /// 定期统计更新（传递原始统计数据，actor 内部计算）
@@ -182,7 +182,7 @@ impl ProgressReporterActor {
     }
     
     /// 发送开始事件
-    async fn send_started_event(&self, worker_count: usize, initial_chunk_size: u64) {
+    async fn send_started_event(&self, worker_count: u64, initial_chunk_size: u64) {
         if let Some(ref sender) = self.progress_sender {
             let _ = sender.send(DownloadProgress::Started {
                 total_size: self.total_size,
@@ -302,7 +302,7 @@ impl ProgressReporter {
     }
     
     /// 发送开始事件
-    pub(super) fn send_started_event(&self, worker_count: usize, initial_chunk_size: u64) {
+    pub(super) fn send_started_event(&self, worker_count: u64, initial_chunk_size: u64) {
         let tx = self.message_tx.clone();
         tokio::spawn(async move {
             let _ = tx.send(ActorMessage::SendStarted {

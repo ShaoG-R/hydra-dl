@@ -19,14 +19,14 @@ pub(super) struct AllocatedTask {
     /// 任务本身
     task: WorkerTask,
     /// 分配到的 worker ID
-    worker_id: usize,
+    worker_id: u64,
     /// 取消信号发送器
     cancel_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 impl AllocatedTask {
     /// 解构为独立部分
-    pub(super) fn into_parts(self) -> (WorkerTask, usize, tokio::sync::oneshot::Sender<()>) {
+    pub(super) fn into_parts(self) -> (WorkerTask, u64, tokio::sync::oneshot::Sender<()>) {
         (self.task, self.worker_id, self.cancel_tx)
     }
 }
@@ -51,7 +51,7 @@ pub(super) struct TaskAllocator {
     /// 下载 URL
     url: String,
     /// 空闲 worker ID 队列
-    pub(super) idle_workers: VecDeque<usize>,
+    pub(super) idle_workers: VecDeque<u64>,
     /// 待重试的失败任务映射（定时器 TaskId -> 失败任务信息）
     failed_tasks: FxHashMap<TaskId, FailedTaskInfo>,
     /// 已就绪的重试任务队列（定时器已触发但尚未分配）
@@ -160,7 +160,7 @@ impl TaskAllocator {
     /// # Arguments
     /// 
     /// * `worker_id` - 要标记为空闲的 worker ID
-    pub(super) fn mark_worker_idle(&mut self, worker_id: usize) {
+    pub(super) fn mark_worker_idle(&mut self, worker_id: u64) {
         self.idle_workers.push_back(worker_id);
     }
     

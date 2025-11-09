@@ -7,7 +7,7 @@ use log::debug;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorkerSpeed {
     /// Worker ID
-    pub worker_id: usize,
+    pub worker_id: u64,
     /// 速度（字节/秒）
     pub speed: f64,
 }
@@ -16,7 +16,7 @@ pub struct WorkerSpeed {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HealthCheckResult {
     /// 需要终止的 worker 列表（worker_id, speed）
-    pub unhealthy_workers: Vec<(usize, f64)>,
+    pub unhealthy_workers: Vec<(u64, f64)>,
     /// 健康基准速度（字节/秒）
     pub health_baseline: f64,
     /// 最大间隙值
@@ -197,7 +197,7 @@ impl WorkerHealthChecker {
         slow_indices: &[usize],
         worker_speeds: &[WorkerSpeed],
         health_baseline: f64,
-    ) -> Vec<(usize, f64)> {
+    ) -> Vec<(u64, f64)> {
         let threshold_speed = health_baseline * self.relative_threshold;
         
         slow_indices
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(result.unhealthy_workers.len(), 2);
         
         // 验证检测到的是 worker 0 和 1
-        let mut worker_ids: Vec<usize> = result.unhealthy_workers.iter().map(|&(id, _)| id).collect();
+        let mut worker_ids: Vec<u64> = result.unhealthy_workers.iter().map(|&(id, _)| id).collect();
         worker_ids.sort();
         assert_eq!(worker_ids, vec![0, 1]);
     }

@@ -20,7 +20,7 @@ pub(super) enum LaunchDecision {
     /// 启动新 worker
     Launch { 
         /// 要启动的 worker 数量
-        count: usize,
+        count: u64,
         /// 当前阶段索引
         stage: usize,
     },
@@ -33,14 +33,14 @@ pub(super) enum LaunchDecision {
 /// 定义渐进式启动器所需的外部能力接口，实现决策逻辑与执行逻辑的解耦
 pub(super) trait WorkerLaunchExecutor {
     /// 获取当前 worker 数量
-    fn current_worker_count(&self) -> usize;
+    fn current_worker_count(&self) -> u64;
     
     /// 获取指定 worker 的瞬时速度
     /// 
     /// # Returns
     /// 
     /// 返回 `Some((速度, 是否有效))`，如果 worker 不存在则返回 None
-    fn get_worker_instant_speed(&self, worker_id: usize) -> Option<(f64, bool)>;
+    fn get_worker_instant_speed(&self, worker_id: u64) -> Option<(f64, bool)>;
     
     /// 获取总体窗口平均速度
     /// 
@@ -68,9 +68,9 @@ pub(super) trait WorkerLaunchExecutor {
     /// 成功返回新分配任务的取消通道列表 `Vec<(worker_id, cancel_tx)>`
     async fn execute_worker_launch(
         &mut self, 
-        count: usize, 
+        count: u64, 
         stage: usize,
-    ) -> Result<Vec<(usize, tokio::sync::oneshot::Sender<()>)>>;
+    ) -> Result<Vec<(u64, tokio::sync::oneshot::Sender<()>)>>;
 }
 
 /// 渐进式启动管理器
@@ -78,7 +78,7 @@ pub(super) trait WorkerLaunchExecutor {
 /// 封装了 Worker 渐进式启动的状态和逻辑
 pub(super) struct ProgressiveLauncher {
     /// 渐进式启动阶段序列（预计算的目标worker数量序列，如 [3, 6, 9, 12]）
-    worker_launch_stages: Vec<usize>,
+    worker_launch_stages: Vec<u64>,
     /// 下一个启动阶段的索引（0 表示已完成第一批，1 表示准备启动第二批）
     next_launch_stage: usize,
 }
@@ -97,10 +97,10 @@ impl ProgressiveLauncher {
         let total_worker_count = config.concurrency().worker_count();
         
         // 根据配置的比例序列计算渐进式启动阶段
-        let worker_launch_stages: Vec<usize> = config.progressive().worker_ratios()
+        let worker_launch_stages: Vec<u64> = config.progressive().worker_ratios()
             .iter()
             .map(|&ratio| {
-                let stage_count = ((total_worker_count as f64 * ratio).ceil() as usize).min(total_worker_count);
+                let stage_count = ((total_worker_count as f64 * ratio).ceil() as u64).min(total_worker_count);
                 // 确保至少启动1个worker
                 stage_count.max(1)
             })
@@ -122,7 +122,7 @@ impl ProgressiveLauncher {
     /// # Returns
     /// 
     /// 返回初始启动的 Worker 数量
-    pub(super) fn initial_worker_count(&self) -> usize {
+    pub(super) fn initial_worker_count(&self) -> u64 {
         self.worker_launch_stages[0]
     }
     
@@ -173,7 +173,7 @@ impl ProgressiveLauncher {
         
         // 检查所有已启动 Worker 的速度是否达到阈值
         let mut all_ready = true;
-        let mut speeds = Vec::with_capacity(current_worker_count);
+        let mut speeds = Vec::with_capacity(current_worker_count as usize);
         
         for worker_id in 0..current_worker_count {
             let (instant_speed, valid) = executor.get_worker_instant_speed(worker_id)
@@ -252,7 +252,7 @@ impl ProgressiveLauncher {
     /// 检测并调整启动阶段（应对 worker 数量变化）
     /// 
     /// 当 worker 数量少于预期时（如部分 worker 被手动关闭），自动降级到合适的阶段
-    pub(super) fn adjust_stage_for_worker_count(&mut self, current_worker_count: usize) {
+    pub(super) fn adjust_stage_for_worker_count(&mut self, current_worker_count: u64) {
         if self.next_launch_stage > 0 {
             let current_target = self.worker_launch_stages[self.next_launch_stage - 1];
             if current_worker_count < current_target {

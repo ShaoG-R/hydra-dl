@@ -14,7 +14,7 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     let config = DownloadConfig::builder()
         .concurrency(|c| c.worker_count(cli.workers))
         .chunk(|c| c.initial_size(cli.chunk_size * 1024 * 1024).min_size(cli.min_chunk * 1024 * 1024).max_size(cli.max_chunk * 1024 * 1024))
-        .build()?;
+        .build();
 
     let timer = TimerWheel::with_defaults();
     let timer_service = timer.create_service(ServiceConfig::default());

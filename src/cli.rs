@@ -10,10 +10,6 @@ pub use logger::{init_logger, set_progress_bar, clear_progress_bar};
 /// CLI 错误类型
 #[derive(thiserror::Error, Debug)]
 pub enum CliError {
-    /// 构建配置错误
-    #[error(transparent)]
-    BuildConfig(#[from] crate::config::BuildError),
-
     /// 下载错误
     #[error(transparent)]
     Download(#[from] crate::DownloadError),
@@ -57,7 +53,7 @@ pub struct Cli {
 
     /// Worker 并发数
     #[arg(short = 'n', long, default_value = "4")]
-    pub workers: usize,
+    pub workers: u64,
 
     /// 初始分块大小（MB）
     #[arg(long, default_value = "5")]

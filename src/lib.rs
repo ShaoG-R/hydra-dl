@@ -133,7 +133,6 @@ pub mod cli;
 pub mod pool {
     pub mod common;
     pub mod download;
-    pub mod worker_mask;
 }
 pub mod utils {
     pub(crate) mod chunk_strategy;
@@ -178,7 +177,6 @@ pub use config::{
     ProgressiveConfig, ProgressiveConfigBuilder,
     RetryConfig, RetryConfigBuilder,
     ChunkDefaults, ConcurrencyDefaults, NetworkDefaults, SpeedDefaults, ProgressiveDefaults, RetryDefaults,
-    BuildError,
 };
 pub use download::{
     download_ranged, DownloadHandle, WorkerStatSnapshot,
