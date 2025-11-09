@@ -217,13 +217,11 @@ pub(crate) async fn run_worker<E: WorkerExecutor>(config: WorkerConfig<E>) {
             
             else => {
                 // task channel 关闭，正常退出
-                info!("Worker #{} 任务通道关闭，退出", id);
+                debug!("Worker #{} 任务通道关闭，退出", id);
                 break;
             }
         }
     }
-
-    info!("Worker #{} 退出", id);
 }
 
 /// 单个 Worker 的槽位
@@ -393,7 +391,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
             })
             .await;
             
-            info!("Worker #{} 退出", key);
+            debug!("Worker #{} 退出", key);
         });
         
         let task_sender = Arc::new(task_sender);
