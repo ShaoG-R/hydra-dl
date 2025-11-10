@@ -141,6 +141,7 @@ pub mod utils {
     pub(crate) mod stats;
     pub mod io_traits;
     pub mod writer;
+    pub mod ringbuf;
 }
 
 /// 常用单位常量

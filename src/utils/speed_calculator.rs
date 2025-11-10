@@ -1,169 +1,14 @@
+#[cfg(test)]
+mod tests;
+
 use std::sync::atomic::{AtomicU64, Ordering};
-use portable_atomic::AtomicU128;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::ringbuf::RingBuffer;
+
 /// 线性回归所需的最小采样点数
 const MIN_SAMPLES_FOR_REGRESSION: usize = 3;
-
-/// 采样点
-/// 
-/// 包含一个时间戳和对应的累计字节数，用于速度计算
-/// 
-/// # 线程安全
-/// 
-/// 使用 `portable_atomic::AtomicU128` 保证时间戳和字节数的读写完全原子化，避免数据不一致。
-/// 
-/// # 数据布局
-/// 
-/// 使用 128 位原子类型存储：
-/// - 高 64 位：时间戳（纳秒，相对于 start_time）
-/// - 低 64 位：累计下载字节数
-#[derive(Debug)]
-pub(super) struct Sample {
-    /// 打包的数据：高64位为时间戳（纳秒），低64位为字节数
-    data: AtomicU128,
-}
-
-impl Sample {
-    /// 创建新的采样点（初始值为 0）
-    pub(super) fn new() -> Self {
-        Self {
-            data: AtomicU128::new(0),
-        }
-    }
-    
-    /// 读取采样点数据（原子化快照）
-    /// 
-    /// # Returns
-    /// 
-    /// `Option<(时间戳纳秒, 字节数)>`，如果时间戳为 0 则返回 None
-    fn read(&self) -> Option<(u64, u64)> {
-        let packed = self.data.load(Ordering::Acquire);
-        
-        // 解包：高64位是时间戳，低64位是字节数
-        let timestamp_ns = (packed >> 64) as u64;
-        let bytes = packed as u64;
-        
-        if timestamp_ns == 0 {
-            return None;
-        }
-        
-        Some((timestamp_ns, bytes))
-    }
-    
-    /// 写入采样点数据（原子化写入）
-    fn write(&self, timestamp_ns: u64, bytes: u64) {
-        // 打包：高64位是时间戳，低64位是字节数
-        let packed = ((timestamp_ns as u128) << 64) | (bytes as u128);
-        self.data.store(packed, Ordering::Release);
-    }
-}
-
-/// 无锁环形缓冲区
-/// 
-/// 用于存储采样点的固定大小环形缓冲区，支持多线程并发读写。
-/// 
-/// # 核心特性
-/// 
-/// - **固定大小**：初始化时确定大小，不可动态扩容
-/// - **自动覆盖**：缓冲区满时自动覆盖最旧的数据
-/// - **完全无锁**：使用原子操作实现，支持高并发场景
-/// - **Send + Sync**：线程安全，可在多线程间共享
-/// 
-/// # 工作原理
-/// 
-/// 使用单调递增的写入索引，通过模运算映射到实际的环形缓冲区位置：
-/// ```text
-/// physical_index = write_index % buffer_size
-/// ```
-/// 
-/// 这种设计避免了索引回绕的复杂性，同时保持了 O(1) 的写入性能。
-#[derive(Debug)]
-pub(super) struct RingBuffer {
-    /// 采样点缓冲区
-    samples: Box<[Sample]>,
-    /// 写入索引（单调递增）
-    write_index: AtomicU64,
-    /// 已写入的样本总数（可能大于缓冲区大小）
-    samples_written: AtomicU64,
-}
-
-impl RingBuffer {
-    /// 创建指定大小的环形缓冲区
-    /// 
-    /// # Arguments
-    /// 
-    /// * `capacity` - 缓冲区容量（采样点数量）
-    /// 
-    /// # Examples
-    /// 
-    /// ```ignore
-    /// let buffer = RingBuffer::new(100);
-    /// ```
-    pub(super) fn new(capacity: usize) -> Self {
-        let mut samples = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            samples.push(Sample::new());
-        }
-        
-        Self {
-            samples: samples.into_boxed_slice(),
-            write_index: AtomicU64::new(0),
-            samples_written: AtomicU64::new(0),
-        }
-    }
-    
-    /// 写入采样点（无锁并发写入）
-    /// 
-    /// 多个线程可以并发调用此方法，每个线程获得唯一的写入位置。
-    /// 
-    /// # Arguments
-    /// 
-    /// * `timestamp_ns` - 时间戳（纳秒）
-    /// * `bytes` - 字节数
-    pub(super) fn push(&self, timestamp_ns: u64, bytes: u64) {
-        // 原子获取写入位置（单调递增）
-        let index = self.write_index.fetch_add(1, Ordering::Relaxed);
-        
-        // 映射到环形缓冲区（模运算）
-        let slot_index = (index % self.samples.len() as u64) as usize;
-        let slot = &self.samples[slot_index];
-        
-        // 原子化写入采样点
-        slot.write(timestamp_ns, bytes);
-        
-        // 更新已写入样本数
-        self.samples_written.fetch_add(1, Ordering::Relaxed);
-    }
-    
-    /// 读取所有有效采样点
-    /// 
-    /// 返回缓冲区中所有有效的采样点（时间戳不为 0），按时间排序。
-    /// 
-    /// # Returns
-    /// 
-    /// `Vec<(时间戳纳秒, 字节数)>`
-    pub(super) fn read_all(&self) -> Vec<(u64, u64)> {
-        let total_written = self.samples_written.load(Ordering::Relaxed);
-        let samples_to_read = total_written.min(self.samples.len() as u64);
-        let mut samples = Vec::with_capacity(samples_to_read as usize);
-        
-        // 只读取实际写入的样本
-        for i in 0..samples_to_read {
-            let index = (i % self.samples.len() as u64) as usize;
-            let sample = &self.samples[index];
-            if let Some((timestamp_ns, bytes)) = sample.read() {
-                samples.push((timestamp_ns, bytes));
-            }
-        }
-        
-        // 按时间戳排序（从旧到新）
-        samples.sort_by_key(|&(ts, _)| ts);
-        
-        samples
-    }
-}
 
 /// 速度计算器（基于环形缓冲区和线性回归）
 /// 
@@ -198,7 +43,7 @@ impl RingBuffer {
 #[derive(Debug)]
 pub(crate) struct SpeedCalculator {
     /// 环形缓冲区，存储最近的采样点
-    ring_buffer: RingBuffer,
+    ring_buffer: RingBuffer<64>,
     /// 线性回归所需的最小采样点数
     min_samples_for_regression: usize,
     /// 瞬时速度的时间窗口
@@ -293,16 +138,20 @@ impl SpeedCalculator {
         
         // 检查是否需要采样（距离上次采样超过配置的采样间隔，或者是首次采样）
         if last_sample_ns == 0 || current_elapsed_ns.saturating_sub(last_sample_ns) >= self.sample_interval_ns {
+            // 确保时间戳不为 0（避免被 Sample::read() 过滤掉）
+            // 如果 elapsed 为 0，使用 1 纳秒作为最小值
+            let timestamp_ns = current_elapsed_ns.max(1);
+            
             // 尝试更新采样时间戳（使用 compare_exchange 避免重复采样）
             // 允许多个线程竞争，只有一个会成功，这样可以避免过度采样
             if self.last_sample_timestamp_ns.compare_exchange(
                 last_sample_ns,
-                current_elapsed_ns,
+                timestamp_ns,
                 Ordering::Relaxed,
                 Ordering::Relaxed
             ).is_ok() {
                 // 成功获取采样权限，记录采样点
-                self.ring_buffer.push(current_elapsed_ns, current_bytes);
+                self.ring_buffer.push(timestamp_ns, current_bytes);
             }
         }
     }
