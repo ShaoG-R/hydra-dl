@@ -16,6 +16,7 @@ use crate::download::worker_health_checker::WorkerCancelRequest;
 use crate::pool::download::DownloadWorkerHandle;
 use crate::utils::io_traits::HttpClient;
 use arc_swap::ArcSwap;
+use parking_lot::RwLock;
 
 /// 失败的 Range 信息
 pub(super) type FailedRange = (AllocatedRange, String);
@@ -340,8 +341,8 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
     worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
     /// 任务取消 sender 映射
     cancel_senders: FxHashMap<u64, oneshot::Sender<()>>,
-    /// 活跃 worker 集合
-    active_workers: im::HashSet<u64>,
+    /// 活跃 worker 集合（与 WorkerHealthChecker 共享）
+    active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
     /// 完成通知发送器（当所有任务完成时发送）
     completion_tx: Option<oneshot::Sender<CompletionResult>>,
 }
@@ -356,6 +357,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         cancel_rx: mpsc::Receiver<WorkerCancelRequest>,
         config: Arc<crate::config::DownloadConfig>,
         worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+        active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
     ) -> (TaskAllocatorHandle, oneshot::Receiver<CompletionResult>) {
         let (message_tx, message_rx) = mpsc::channel(100);
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -372,7 +374,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
             config,
             worker_handles,
             cancel_senders: FxHashMap::default(),
-            active_workers: im::HashSet::new(),
+            active_workers,
             completion_tx: Some(completion_tx),
         };
         
@@ -440,7 +442,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
                     // 将新 worker 加入空闲队列
                     self.state.mark_worker_idle(worker_id);
                     // 标记为活跃
-                    self.active_workers.insert(worker_id);
+                    self.active_workers.write().insert(worker_id, ());
                 }
             }
             AllocatorMessage::AllocateInitialTasks => {
@@ -483,7 +485,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
                     self.state.push_ready_retry_task(info);
                 } else {
                     self.cancel_senders.insert(worker_id, cancel_tx);
-                    self.active_workers.insert(worker_id);
+                    self.active_workers.write().insert(worker_id, ());
                 }
             } else {
                 error!("Worker #{} 不存在", worker_id);
@@ -529,7 +531,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         // 检查是否所有任务已完成
         if self.state.remaining() == 0
             && self.state.pending_retry_count() == 0
-            && self.active_workers.is_empty() {
+            && self.active_workers.read().is_empty() {
             info!("所有任务已成功完成");
             // 发送成功通知
             if let Some(tx) = self.completion_tx.take() {
@@ -545,7 +547,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
     async fn handle_complete(&mut self, worker_id: u64) {
         // 移除取消 sender
         self.cancel_senders.remove(&worker_id);
-        self.active_workers.remove(&worker_id);
+        self.active_workers.write().remove(&worker_id);
         
         // 标记为空闲
         self.state.mark_worker_idle(worker_id);
@@ -570,7 +572,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         
         // 移除取消 sender
         self.cancel_senders.remove(&worker_id);
-        self.active_workers.remove(&worker_id);
+        self.active_workers.write().remove(&worker_id);
         
         // 标记为空闲
         self.state.mark_worker_idle(worker_id);
@@ -590,7 +592,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         
         if let Some(cancel_tx) = self.cancel_senders.remove(&worker_id) {
             let _ = cancel_tx.send(());
-            self.active_workers.remove(&worker_id);
+            self.active_workers.write().remove(&worker_id);
             info!("已取消 Worker #{} 的任务", worker_id);
         }
     }
@@ -614,7 +616,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
                         self.state.mark_worker_idle(worker_id);
                     } else {
                         self.cancel_senders.insert(worker_id, cancel_tx);
-                        self.active_workers.insert(worker_id);
+                        self.active_workers.write().insert(worker_id, ());
                     }
                 } else {
                     error!("Worker #{} 不存在", worker_id);
@@ -646,7 +648,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
                     self.state.mark_worker_idle(target_worker);
                 } else {
                     self.cancel_senders.insert(target_worker, cancel_tx);
-                    self.active_workers.insert(target_worker);
+                    self.active_workers.write().insert(target_worker, ());
                 }
             } else {
                 error!("Worker #{} 不存在", target_worker);

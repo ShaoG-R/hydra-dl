@@ -6,6 +6,8 @@
 use log::{debug, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use arc_swap::ArcSwap;
 use crate::pool::download::DownloadWorkerHandle;
 use crate::config::DownloadConfig;
@@ -221,7 +223,7 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
     /// 检查定时器（内部管理）
     check_timer: tokio::time::Interval,
     /// 正在执行任务的 worker 集合（由外部更新）
-    active_workers: Arc<ArcSwap<im::HashSet<u64>>>,
+    active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
 }
 
 impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
@@ -232,7 +234,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
         worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
         check_interval: std::time::Duration,
-        active_workers: Arc<ArcSwap<im::HashSet<u64>>>,
+        active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
     ) -> Self {
         let absolute_threshold = config.health_check().absolute_speed_threshold() as f64;
         let logic = WorkerHealthCheckerLogic::new(absolute_threshold, 0.5);
@@ -298,22 +300,28 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
         }
         
         // 收集正在执行任务的 worker 的速度信息
-        let active_workers = self.active_workers.load();
         let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
         
-        for &worker_id in handles.keys() {
-            // 只检查正在执行任务的 worker
-            if !active_workers.contains(&worker_id) {
-                continue;
-            }
+        // 使用内部作用域确保锁在 await 之前释放
+        {
+            // 获取活跃 worker 列表
+            let active_workers = self.active_workers.read();
             
-            if let Some(handle) = handles.get(&worker_id) {
-                let (speed, valid) = handle.window_avg_speed();
-                // 只考虑有效的速度数据
-                if valid && speed > 0.0 {
-                    worker_speeds.push(WorkerSpeed { worker_id, speed });
+            for &worker_id in handles.keys() {
+                // 只检查正在执行任务的 worker
+                if !active_workers.contains_key(&worker_id) {
+                    continue;
+                }
+                
+                if let Some(handle) = handles.get(&worker_id) {
+                    let (speed, valid) = handle.window_avg_speed();
+                    // 只考虑有效的速度数据
+                    if valid && speed > 0.0 {
+                        worker_speeds.push(WorkerSpeed { worker_id, speed });
+                    }
                 }
             }
+            // active_workers 的读锁在这里自动释放
         }
         
         // 至少需要 min_workers 个有效速度数据才能进行比较
@@ -365,7 +373,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
         config: Arc<DownloadConfig>,
         worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
         check_interval: std::time::Duration,
-        active_workers: Arc<ArcSwap<im::HashSet<u64>>>,
+        active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
     ) -> Self {
         // 使用有界 channel，容量 10
         let (message_tx, message_rx) = mpsc::channel(10);

@@ -19,7 +19,7 @@ use tokio::sync::Barrier;
 async fn test_single_worker_many_tasks() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(1);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let task_count = 100;
     
@@ -35,7 +35,7 @@ async fn test_single_worker_many_tasks() {
     // 接收所有结果
     let mut received = 0;
     while received < task_count {
-        if let Some(result) = pool.result_receiver().recv().await {
+        if let Some(result) = result_receiver.recv().await {
             match result {
                 TestResult::Success { .. } => received += 1,
                 _ => panic!("Unexpected failure"),
@@ -53,7 +53,7 @@ async fn test_many_workers() {
     let executor = TestExecutor;
     let worker_count = 50;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     assert_eq!(pool.worker_count(), worker_count as u64);
     
@@ -69,7 +69,7 @@ async fn test_many_workers() {
     // 接收所有结果
     let mut received = 0;
     while received < worker_count {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -83,7 +83,7 @@ async fn test_many_workers() {
 async fn test_operations_on_empty_pool() {
     let executor = TestExecutor;
     let contexts = vec![];
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     assert_eq!(pool.worker_count(), 0);
     assert_eq!(handles.len(), 0);
@@ -98,7 +98,7 @@ async fn test_operations_on_empty_pool() {
 async fn test_multiple_shutdowns() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, _) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, _handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 第一次关闭
     pool.shutdown().await;
@@ -114,7 +114,7 @@ async fn test_multiple_shutdowns() {
 async fn test_large_data_task() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(1);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 创建包含大量数据的任务
     let large_data = "x".repeat(1_000_000); // 1MB 的数据
@@ -126,7 +126,7 @@ async fn test_large_data_task() {
     handles[0].send_task(task).await.unwrap();
     
     // 接收结果
-    if let Some(result) = pool.result_receiver().recv().await {
+    if let Some(result) = result_receiver.recv().await {
         match result {
             TestResult::Success { task_id, .. } => {
                 assert_eq!(task_id, 1);
@@ -149,7 +149,7 @@ async fn test_concurrent_task_processing() {
     let worker_count = 8;
     let tasks_per_worker = 20;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let total_tasks = worker_count * tasks_per_worker;
     
@@ -175,7 +175,7 @@ async fn test_concurrent_task_processing() {
     // 接收所有结果
     let mut received = 0;
     while received < total_tasks {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -189,7 +189,7 @@ async fn test_concurrent_task_processing() {
 async fn test_concurrent_handle_usage() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(4);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let task_count = 50;
     let handle = handles[0].clone();
@@ -214,7 +214,7 @@ async fn test_concurrent_handle_usage() {
     // 接收所有结果
     let mut received = 0;
     while received < task_count {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -228,7 +228,7 @@ async fn test_concurrent_handle_usage() {
 async fn test_dynamic_scaling() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, initial_handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, initial_handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 发送一些任务到初始 workers
     for i in 0..10 {
@@ -251,7 +251,7 @@ async fn test_dynamic_scaling() {
     // 接收所有结果
     let mut received = 0;
     while received < 25 {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -265,7 +265,7 @@ async fn test_dynamic_scaling() {
 async fn test_concurrent_add_workers() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(1);
-    let (mut pool, _) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, _handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 注意：add_workers 需要 &mut self，所以不能真正并发调用
     // 这里测试顺序添加多批 workers
@@ -285,7 +285,7 @@ async fn test_load_balancing() {
     let worker_count = 4;
     let contexts = create_contexts_with_stats(worker_count);
     let stats_refs: Vec<_> = contexts.iter().map(|(_, s)| s.clone()).collect();
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let total_tasks = 100;
     
@@ -301,7 +301,7 @@ async fn test_load_balancing() {
     // 接收所有结果
     let mut received = 0;
     while received < total_tasks {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -325,7 +325,7 @@ async fn test_load_balancing() {
 async fn test_all_tasks_fail() {
     let executor = FailingExecutor;
     let contexts = create_contexts_with_stats(3);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 发送任务
     for i in 0..10 {
@@ -340,7 +340,7 @@ async fn test_all_tasks_fail() {
     let mut received = 0;
     let mut failed = 0;
     while received < 10 {
-        if let Some(result) = pool.result_receiver().recv().await {
+        if let Some(result) = result_receiver.recv().await {
             received += 1;
             if let TestResult::Failed { .. } = result {
                 failed += 1;
@@ -357,7 +357,7 @@ async fn test_all_tasks_fail() {
 async fn test_send_after_shutdown() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let handle_clone = handles[0].clone();
     
@@ -401,7 +401,7 @@ async fn test_shutdown_while_processing() {
     
     let executor = SlowExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 发送一些任务
     for i in 0..10 {
@@ -425,7 +425,7 @@ async fn test_shutdown_while_processing() {
 async fn test_result_channel_full() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 发送大量任务但不接收结果
     // 注意：channel 容量是 100，所以发送超过这个数量可能会阻塞
@@ -443,7 +443,7 @@ async fn test_result_channel_full() {
     // 现在开始接收结果
     let mut received = 0;
     while received < 50 {
-        if let Some(_) = timeout(Duration::from_secs(5), pool.result_receiver().recv()).await.ok().flatten() {
+        if let Some(_) = timeout(Duration::from_secs(5), result_receiver.recv()).await.ok().flatten() {
             received += 1;
         } else {
             break;
@@ -488,7 +488,7 @@ async fn test_mixed_success_and_failure() {
     
     let executor = RandomFailExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 发送任务
     for i in 0..20 {
@@ -504,7 +504,7 @@ async fn test_mixed_success_and_failure() {
     let mut failure_count = 0;
     
     for _ in 0..20 {
-        if let Some(result) = pool.result_receiver().recv().await {
+        if let Some(result) = result_receiver.recv().await {
             match result {
                 TestResult::Success { .. } => success_count += 1,
                 TestResult::Failed { .. } => failure_count += 1,
@@ -527,7 +527,7 @@ async fn test_mixed_success_and_failure() {
 async fn test_task_chaining() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let handles_clone = handles.clone();
     
@@ -553,7 +553,7 @@ async fn test_task_chaining() {
     // 接收所有结果
     let mut received = 0;
     while received < 5 {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -566,7 +566,7 @@ async fn test_task_chaining() {
 async fn test_producer_consumer_pattern() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(4);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let producer_count = 3;
     let tasks_per_producer = 20;
@@ -594,7 +594,7 @@ async fn test_producer_consumer_pattern() {
     let consumer = tokio::spawn(async move {
         let mut count = 0;
         while count < total_tasks {
-            if pool.result_receiver().recv().await.is_some() {
+            if result_receiver.recv().await.is_some() {
                 count += 1;
                 consumed_clone.fetch_add(1, Ordering::SeqCst);
             }
@@ -610,6 +610,9 @@ async fn test_producer_consumer_pattern() {
     consumer.await.unwrap();
     
     assert_eq!(consumed.load(Ordering::SeqCst), total_tasks);
+    
+    // 关闭协程池
+    pool.shutdown().await;
 }
 
 /// 测试带同步屏障的并发场景
@@ -618,7 +621,7 @@ async fn test_synchronized_workers() {
     let executor = TestExecutor;
     let worker_count = 5;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let barrier = Arc::new(Barrier::new(worker_count));
     
@@ -647,7 +650,7 @@ async fn test_synchronized_workers() {
     // 接收所有结果
     let mut received = 0;
     while received < worker_count {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -661,7 +664,7 @@ async fn test_synchronized_workers() {
 async fn test_long_running_scenario() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(3);
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     let duration = Duration::from_secs(2);
     let start = tokio::time::Instant::now();
@@ -684,7 +687,7 @@ async fn test_long_running_scenario() {
     // 接收所有结果
     let mut received = 0;
     while received < task_id {
-        if timeout(Duration::from_secs(5), pool.result_receiver().recv()).await.ok().flatten().is_some() {
+        if timeout(Duration::from_secs(5), result_receiver.recv()).await.ok().flatten().is_some() {
             received += 1;
         } else {
             break;
@@ -704,7 +707,7 @@ async fn test_statistics_accuracy() {
     let worker_count = 4;
     let contexts = create_contexts_with_stats(worker_count);
     let stats_refs: Vec<_> = contexts.iter().map(|(_, s)| s.clone()).collect();
-    let (mut pool, handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     
     // 为每个 worker 发送已知数量的任务
     let tasks_per_worker = vec![10, 20, 15, 25];
@@ -723,7 +726,7 @@ async fn test_statistics_accuracy() {
     let total: usize = tasks_per_worker.iter().sum();
     let mut received = 0;
     while received < total {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
@@ -744,7 +747,7 @@ async fn test_dynamic_resize() {
     
     // 开始时有 2 个 workers
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, initial_handles) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, initial_handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
     assert_eq!(pool.worker_count(), 2);
     
     // 发送一些任务
@@ -767,7 +770,7 @@ async fn test_dynamic_resize() {
     // 接收所有结果
     let mut received = 0;
     while received < 30 {
-        if pool.result_receiver().recv().await.is_some() {
+        if result_receiver.recv().await.is_some() {
             received += 1;
         }
     }
