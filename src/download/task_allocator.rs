@@ -111,17 +111,7 @@ impl TaskAllocatorState {
         }
     }
     
-    /// 尝试为空闲 worker 分配任务
-    /// 
-    /// 优先从重试队列中取任务，如果队列为空则分配新任务
-    /// 
-    /// # Arguments
-    /// 
-    /// * `chunk_size` - 要分配的分块大小（仅用于新任务）
-    /// 
-    /// # Returns
-    /// 
-    /// 返回 AllocatedTask（封装了任务、worker_id 和取消发送器），如果没有空闲 worker 或没有剩余空间则返回 None
+    /// 尝试为空闲 worker 分配任务（优先重试队列，其次新任务）
     pub(super) fn try_allocate_task_to_idle_worker(&mut self, chunk_size: u64) -> Option<AllocatedTask> {
         // 从队列中获取空闲 worker
         let worker_id = self.idle_workers.pop_front()?;
@@ -191,35 +181,16 @@ impl TaskAllocatorState {
     }
     
     /// 标记 worker 为空闲状态
-    /// 
-    /// # Arguments
-    /// 
-    /// * `worker_id` - 要标记为空闲的 worker ID
     pub(super) fn mark_worker_idle(&mut self, worker_id: u64) {
         self.idle_workers.push_back(worker_id);
     }
     
-    /// 根据定时器 TaskId 取出失败任务信息
-    /// 
-    /// # Arguments
-    /// 
-    /// * `timer_id` - 定时器任务 ID
-    /// 
-    /// # Returns
-    /// 
-    /// 返回对应的失败任务信息，如果不存在则返回 None
+    /// 根据定时器 ID 取出失败任务信息
     pub(super) fn pop_failed_task(&mut self, timer_id: TaskId) -> Option<FailedTaskInfo> {
         self.failed_tasks.remove(&timer_id)
     }
     
-    /// 将失败任务推入就绪重试队列
-    /// 
-    /// 当定时器触发但没有空闲 worker 时，将任务推入此队列
-    /// 任务会在下次有 worker 空闲时优先分配
-    /// 
-    /// # Arguments
-    /// 
-    /// * `task_info` - 失败任务信息
+    /// 将失败任务推入就绪重试队列（当定时器触发但无空闲 worker 时）
     pub(super) fn push_ready_retry_task(&mut self, task_info: FailedTaskInfo) {
         let (start, end) = task_info.range.as_range_tuple();
         debug!(
@@ -231,18 +202,7 @@ impl TaskAllocatorState {
         self.ready_retry_queue.push_back(task_info);
     }
     
-    /// 记录失败任务
-    /// 
-    /// # Arguments
-    /// 
-    /// * `range` - 失败的 range
-    /// * `retry_count` - 当前重试次数
-    /// * `delay` - 延迟重试的时间
-    /// * `timer_service` - 定时器服务
-    /// 
-    /// # Returns
-    /// 
-    /// 成功返回 Ok(())，失败返回错误
+    /// 记录失败任务并注册定时器
     pub(super) fn record_failed_task(
         &mut self,
         range: AllocatedRange,
@@ -279,11 +239,6 @@ impl TaskAllocatorState {
     }
     
     /// 记录永久失败的任务
-    /// 
-    /// # Arguments
-    /// 
-    /// * `range` - 失败的 range
-    /// * `error` - 错误信息
     pub(super) fn record_permanent_failure(&mut self, range: AllocatedRange, error: String) {
         let (start, end) = range.as_range_tuple();
         error!(
@@ -305,9 +260,7 @@ impl TaskAllocatorState {
         &self.permanently_failed
     }
     
-    /// 获取待重试的任务数量
-    /// 
-    /// 包括定时器等待中的任务和已就绪等待分配的任务
+    /// 获取待重试的任务数量（包括定时器等待中和已就绪的）
     pub(super) fn pending_retry_count(&self) -> usize {
         self.failed_tasks.len() + self.ready_retry_queue.len()
     }
@@ -389,6 +342,68 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         (handle, completion_rx)
     }
     
+    /// 发送任务给指定的 worker
+    /// 
+    /// 统一的任务发送逻辑，处理错误和状态更新
+    async fn send_task_to_worker(
+        &mut self,
+        worker_id: u64,
+        task: WorkerTask,
+        cancel_tx: oneshot::Sender<()>,
+    ) -> bool {
+        if let Some(handle) = self.worker_handles.load().get(&worker_id) {
+            if let Err(e) = handle.send_task(task).await {
+                error!("分配任务失败: {:?}", e);
+                self.state.mark_worker_idle(worker_id);
+                return false;
+            }
+            self.cancel_senders.insert(worker_id, cancel_tx);
+            self.active_workers.write().insert(worker_id);
+            true
+        } else {
+            error!("Worker #{} 不存在", worker_id);
+            self.state.mark_worker_idle(worker_id);
+            false
+        }
+    }
+    
+    /// 从失败任务信息创建 WorkerTask
+    fn create_retry_task(&self, info: &FailedTaskInfo, cancel_rx: oneshot::Receiver<()>) -> WorkerTask {
+        WorkerTask::Range {
+            url: self.state.url().to_string(),
+            range: info.range.clone(),
+            retry_count: info.retry_count,
+            cancel_rx,
+        }
+    }
+    
+    /// 清理 worker 状态并标记为空闲
+    fn cleanup_worker(&mut self, worker_id: u64) {
+        self.cancel_senders.remove(&worker_id);
+        self.active_workers.write().remove(&worker_id);
+        self.state.mark_worker_idle(worker_id);
+    }
+    
+    /// 检查是否所有任务已完成
+    fn check_completion(&mut self) -> Option<CompletionResult> {
+        // 先检查永久失败
+        if self.state.has_permanent_failures() {
+            let failures = self.state.get_permanent_failures().to_vec();
+            info!("遇到永久失败，终止下载：{} 个任务失败", failures.len());
+            return Some(CompletionResult::PermanentFailure { failures });
+        }
+        
+        // 检查是否所有任务已成功完成
+        if self.state.remaining() == 0
+            && self.state.pending_retry_count() == 0
+            && self.active_workers.read().is_empty() {
+            info!("所有任务已成功完成");
+            return Some(CompletionResult::Success);
+        }
+        
+        None
+    }
+    
     /// 运行 Actor 主循环
     pub(super) async fn run(mut self) {
         info!("TaskAllocator Actor 启动");
@@ -465,29 +480,13 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
             start, end, info.retry_count
         );
 
-        // 从空闲队列获取 worker
+        // 尝试分配给空闲 worker
         if let Some(worker_id) = self.state.idle_workers.pop_front() {
-            // 有空闲 worker，创建任务和取消通道
             let (cancel_tx, cancel_rx) = oneshot::channel();
-            let task = WorkerTask::Range {
-                url: self.state.url().to_string(),
-                range: info.range,
-                retry_count: info.retry_count,
-                cancel_rx,
-            };
-
-            if let Some(handle) = self.worker_handles.load().get(&worker_id) {
-                if let Err(e) = handle.send_task(task).await {
-                    error!("分配重试任务失败: {:?}", e);
-                    self.state.mark_worker_idle(worker_id);
-                    self.state.push_ready_retry_task(info);
-                } else {
-                    self.cancel_senders.insert(worker_id, cancel_tx);
-                    self.active_workers.write().insert(worker_id);
-                }
-            } else {
-                error!("Worker #{} 不存在", worker_id);
-                self.state.mark_worker_idle(worker_id);
+            let task = self.create_retry_task(&info, cancel_rx);
+            
+            if !self.send_task_to_worker(worker_id, task, cancel_tx).await {
+                // 发送失败，推入就绪队列
                 self.state.push_ready_retry_task(info);
             }
         } else {
@@ -515,25 +514,10 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
             }
         }
         
-        // 检查是否有永久失败
-        if self.state.has_permanent_failures() {
-            let failures = self.state.get_permanent_failures().to_vec();
-            info!("遇到永久失败，终止下载：{} 个任务失败", failures.len());
-            // 发送失败通知
+        // 检查完成条件
+        if let Some(completion) = self.check_completion() {
             if let Some(tx) = self.completion_tx.take() {
-                let _ = tx.send(CompletionResult::PermanentFailure { failures });
-            }
-            return false;
-        }
-        
-        // 检查是否所有任务已完成
-        if self.state.remaining() == 0
-            && self.state.pending_retry_count() == 0
-            && self.active_workers.read().is_empty() {
-            info!("所有任务已成功完成");
-            // 发送成功通知
-            if let Some(tx) = self.completion_tx.take() {
-                let _ = tx.send(CompletionResult::Success);
+                let _ = tx.send(completion);
             }
             return false;
         }
@@ -543,14 +527,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
     
     /// 处理任务完成
     async fn handle_complete(&mut self, worker_id: u64) {
-        // 移除取消 sender
-        self.cancel_senders.remove(&worker_id);
-        self.active_workers.write().remove(&worker_id);
-        
-        // 标记为空闲
-        self.state.mark_worker_idle(worker_id);
-        
-        // 尝试分配新任务
+        self.cleanup_worker(worker_id);
         self.try_allocate_next_task(worker_id).await;
     }
     
@@ -568,17 +545,8 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
             worker_id, start, end, retry_count, error
         );
         
-        // 移除取消 sender
-        self.cancel_senders.remove(&worker_id);
-        self.active_workers.write().remove(&worker_id);
-        
-        // 标记为空闲
-        self.state.mark_worker_idle(worker_id);
-        
-        // 调度重试
+        self.cleanup_worker(worker_id);
         self.schedule_retry_task(range, retry_count);
-        
-        // 尝试分配新任务
         self.try_allocate_next_task(worker_id).await;
     }
     
@@ -608,18 +576,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
                 let (task, worker_id, cancel_tx) = allocated.into_parts();
                 info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
                 
-                if let Some(handle) = self.worker_handles.load().get(&worker_id) {
-                    if let Err(e) = handle.send_task(task).await {
-                        error!("初始任务分配失败: {:?}", e);
-                        self.state.mark_worker_idle(worker_id);
-                    } else {
-                        self.cancel_senders.insert(worker_id, cancel_tx);
-                        self.active_workers.write().insert(worker_id);
-                    }
-                } else {
-                    error!("Worker #{} 不存在", worker_id);
-                    self.state.mark_worker_idle(worker_id);
-                }
+                self.send_task_to_worker(worker_id, task, cancel_tx).await;
             } else {
                 info!("没有足够的数据为空闲 workers 分配更多任务");
                 break;
@@ -640,18 +597,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
                 worker_id, target_worker, chunk_size
             );
             
-            if let Some(handle) = self.worker_handles.load().get(&target_worker) {
-                if let Err(e) = handle.send_task(task).await {
-                    error!("分配新任务失败: {:?}", e);
-                    self.state.mark_worker_idle(target_worker);
-                } else {
-                    self.cancel_senders.insert(target_worker, cancel_tx);
-                    self.active_workers.write().insert(target_worker);
-                }
-            } else {
-                error!("Worker #{} 不存在", target_worker);
-                self.state.mark_worker_idle(target_worker);
-            }
+            self.send_task_to_worker(target_worker, task, cancel_tx).await;
         } else {
             debug!("Worker #{} 完成任务，但没有更多任务可分配", worker_id);
         }
@@ -662,77 +608,50 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         let max_retry = self.config.retry().max_retry_count();
         let (start, end) = range.as_range_tuple();
         
-        if retry_count < max_retry {
-            let retry_delays = self.config.retry().retry_delays();
-            let delay = if retry_count < retry_delays.len() {
-                retry_delays[retry_count]
-            } else {
-                *retry_delays.last().unwrap_or(&std::time::Duration::from_secs(3))
-            };
-            
-            info!(
-                "任务 range {}..{} 将在 {:.1}s 后进行第 {} 次重试",
-                start, end, delay.as_secs_f64(), retry_count + 1
-            );
-            
-            if let Err(e) = self.state.record_failed_task(
-                range,
-                retry_count + 1,
-                delay,
-                &self.timer_service,
-            ) {
-                error!("注册重试定时器失败: {:?}", e);
-                self.state.record_permanent_failure(
-                    range,
-                    format!("注册定时器失败: {}", e)
-                );
-            }
-        } else {
-            error!(
-                "任务 range {}..{} 已达到最大重试次数 {}，标记为永久失败",
-                start, end, max_retry
-            );
+        if retry_count >= max_retry {
+            error!("任务 range {}..{} 已达到最大重试次数 {}，标记为永久失败", start, end, max_retry);
             self.state.record_permanent_failure(range, "达到最大重试次数".to_string());
+            return;
+        }
+        
+        // 计算重试延迟
+        let retry_delays = self.config.retry().retry_delays();
+        let delay = retry_delays.get(retry_count)
+            .copied()
+            .or_else(|| retry_delays.last().copied())
+            .unwrap_or(std::time::Duration::from_secs(3));
+        
+        info!("任务 range {}..{} 将在 {:.1}s 后进行第 {} 次重试", start, end, delay.as_secs_f64(), retry_count + 1);
+        
+        // 注册重试任务
+        if let Err(e) = self.state.record_failed_task(range, retry_count + 1, delay, &self.timer_service) {
+            error!("注册重试定时器失败: {:?}", e);
+            self.state.record_permanent_failure(range, format!("注册定时器失败: {}", e));
         }
     }
 }
 
-/// TaskAllocator Handle
-/// 
-/// 用于与 TaskAllocator Actor 通信的句柄
+/// TaskAllocator Actor 的通信句柄
 pub(super) struct TaskAllocatorHandle {
     message_tx: mpsc::Sender<AllocatorMessage>,
-    /// Actor 任务句柄（使用 Arc 包裹以支持 clone）
     actor_handle: tokio::task::JoinHandle<()>,
 }
 
 impl TaskAllocatorHandle {
-    
-    /// 标记 worker 为空闲
     pub(super) async fn mark_worker_idle(&self, worker_id: u64) {
-        let _ = self.message_tx.send(AllocatorMessage::MarkWorkerIdle {
-            worker_id,
-        }).await;
+        let _ = self.message_tx.send(AllocatorMessage::MarkWorkerIdle { worker_id }).await;
     }
     
-    /// 批量注册新启动的 workers（标记为空闲并添加到活跃集合）
     pub(super) async fn register_new_workers(&self, worker_ids: Vec<u64>) {
-        let _ = self.message_tx.send(AllocatorMessage::RegisterNewWorkers {
-            worker_ids,
-        }).await;
+        let _ = self.message_tx.send(AllocatorMessage::RegisterNewWorkers { worker_ids }).await;
     }
     
-    /// 分配初始任务
     pub(super) async fn allocate_initial_tasks(&self) {
         let _ = self.message_tx.send(AllocatorMessage::AllocateInitialTasks).await;
     }
     
-    /// 关闭 Actor 并等待其完全停止
     pub(super) async fn shutdown_and_wait(self) {
-        // 发送关闭消息
         let _ = self.message_tx.send(AllocatorMessage::Shutdown).await;
-        
-        // 等待 Actor 停止
         let _ = self.actor_handle.await;
     }
 }
