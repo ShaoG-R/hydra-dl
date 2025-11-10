@@ -328,7 +328,7 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
     /// 定时器服务
     timer_service: TimerService,
     /// 定时器超时接收器
-    timeout_rx: Option<spsc::Receiver<TaskNotification, 32>>,
+    timeout_rx: spsc::Receiver<TaskNotification, 32>,
     /// Worker 结果接收器
     result_rx: mpsc::Receiver<RangeResult>,
     /// 取消请求接收器
@@ -362,7 +362,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         let (message_tx, message_rx) = mpsc::channel(100);
         let (completion_tx, completion_rx) = oneshot::channel();
         
-        let timeout_rx = timer_service.take_receiver();
+        let timeout_rx = timer_service.take_receiver().expect("Failed to take timer receiver");
         
         let actor = Self {
             state: TaskAllocatorState::new(allocator, url),
@@ -383,7 +383,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         
         let handle = TaskAllocatorHandle {
             message_tx,
-            actor_handle: Arc::new(tokio::sync::Mutex::new(Some(actor_handle))),
+            actor_handle,
         };
         
         (handle, completion_rx)
@@ -396,9 +396,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         loop {
             tokio::select! {
                 // 处理定时器超时事件
-                Some(notification) = async {
-                    self.timeout_rx.as_mut()?.recv().await
-                }, if self.timeout_rx.is_some() => {
+                Some(notification) = self.timeout_rx.recv() => {
                     self.handle_retry_timeout(notification.task_id()).await;
                 }
                 
@@ -705,7 +703,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
 pub(super) struct TaskAllocatorHandle {
     message_tx: mpsc::Sender<AllocatorMessage>,
     /// Actor 任务句柄（使用 Arc 包裹以支持 clone）
-    actor_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    actor_handle: tokio::task::JoinHandle<()>,
 }
 
 impl TaskAllocatorHandle {
@@ -730,23 +728,12 @@ impl TaskAllocatorHandle {
     }
     
     /// 关闭 Actor 并等待其完全停止
-    pub(super) async fn shutdown_and_wait(&self) {
+    pub(super) async fn shutdown_and_wait(self) {
         // 发送关闭消息
         let _ = self.message_tx.send(AllocatorMessage::Shutdown).await;
         
         // 等待 Actor 停止
-        if let Some(handle) = self.actor_handle.lock().await.take() {
-            let _ = handle.await;
-        }
-    }
-}
-
-impl Clone for TaskAllocatorHandle {
-    fn clone(&self) -> Self {
-        Self {
-            message_tx: self.message_tx.clone(),
-            actor_handle: Arc::clone(&self.actor_handle),
-        }
+        let _ = self.actor_handle.await;
     }
 }
 

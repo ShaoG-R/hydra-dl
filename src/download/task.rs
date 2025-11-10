@@ -255,7 +255,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let mut pool = self.pool;
         pool.shutdown().await;
 
-        // 释放 pool（它持有 executor 的引用）
+        // 释放 pool（它持有 writer 的共享）
         drop(pool);
         
         // 关闭 progress reporter actor
