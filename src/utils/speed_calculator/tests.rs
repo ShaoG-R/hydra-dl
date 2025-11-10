@@ -125,9 +125,9 @@ fn test_speed_calculator_from_config() {
     // 需要的采样点数 = max(1s, 5s) / 100ms = 50
     // 实际缓冲区大小 = 50 * 1.2 = 60
     // 但至少需要 MIN_SAMPLES_FOR_REGRESSION * 2 = 6 个采样点
-    assert!(calculator.samples.len() >= 6);
+    assert!(calculator.ring_buffer.capacity() >= 6);
     // 验证新增的字段存在
-    assert_eq!(calculator.samples_written.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(calculator.ring_buffer.total_written(), 0);
 }
 
 #[test]
@@ -149,8 +149,8 @@ fn test_speed_calculator_record_sample_basic() {
     
     // 应该至少有 1 个采样点（第一个）
     assert!(samples.len() >= 1);
-    // 验证 samples_written 计数器
-    assert!(calculator.samples_written.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    // 验证 total_written 计数器
+    assert!(calculator.ring_buffer.total_written() >= 1);
 }
 
 #[test]
@@ -168,8 +168,8 @@ fn test_speed_calculator_record_sample_respects_interval() {
     // 读取采样点（应该只有 1 个，因为采样间隔未到）
     let samples = calculator.read_recent_samples();
     assert_eq!(samples.len(), 1);
-    // 验证 samples_written 计数器
-    assert_eq!(calculator.samples_written.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // 验证 total_written 计数器
+    assert_eq!(calculator.ring_buffer.total_written(), 1);
     
     // 等待采样间隔
     thread::sleep(Duration::from_millis(250));
@@ -180,8 +180,8 @@ fn test_speed_calculator_record_sample_respects_interval() {
     // 现在应该有 2 个采样点
     let samples = calculator.read_recent_samples();
     assert_eq!(samples.len(), 2);
-    // 验证 samples_written 计数器
-    assert_eq!(calculator.samples_written.load(std::sync::atomic::Ordering::Relaxed), 2);
+    // 验证 total_written 计数器
+    assert_eq!(calculator.ring_buffer.total_written(), 2);
 }
 
 #[test]
@@ -206,9 +206,9 @@ fn test_speed_calculator_ring_buffer_wrapping() {
     let samples = calculator.read_recent_samples();
     
     // 由于环形缓冲区覆盖，采样点数量不应超过缓冲区大小
-    assert!(samples.len() <= calculator.samples.len());
-    // 验证 samples_written 计数器
-    assert_eq!(calculator.samples_written.load(std::sync::atomic::Ordering::Relaxed), 20);
+    assert!(samples.len() <= calculator.ring_buffer.capacity());
+    // 验证 total_written 计数器
+    assert_eq!(calculator.ring_buffer.total_written(), 20);
     
     // 采样点应该按时间排序
     for i in 1..samples.len() {
@@ -238,8 +238,8 @@ fn test_speed_calculator_read_recent_samples_sorted() {
             i, samples[i].0, i - 1, samples[i - 1].0);
     }
     
-    // 验证 samples_written 计数器
-    assert_eq!(calculator.samples_written.load(std::sync::atomic::Ordering::Relaxed), 5);
+    // 验证 total_written 计数器
+    assert_eq!(calculator.ring_buffer.total_written(), 5);
 }
 
 // ============================================================================
@@ -578,7 +578,7 @@ fn test_very_small_buffer() {
     let calculator = SpeedCalculator::from_config(&config);
     
     // 缓冲区应该至少有 MIN_SAMPLES_FOR_REGRESSION * 2 个采样点
-    assert!(calculator.samples.len() >= 6);
+    assert!(calculator.ring_buffer.capacity() >= 6);
 }
 
 #[test]
@@ -593,7 +593,7 @@ fn test_very_large_buffer() {
     let calculator = SpeedCalculator::from_config(&config);
     
     // 缓冲区大小 = 10s / 10ms * 2.0 = 2000
-    assert!(calculator.samples.len() >= 1000);
+    assert!(calculator.ring_buffer.capacity() >= 1000);
 }
 
 #[test]
@@ -717,7 +717,7 @@ fn test_different_window_configurations() {
         let calculator = SpeedCalculator::from_config(&config);
         
         // 验证缓冲区创建成功
-        assert!(calculator.samples.len() >= 6);
+        assert!(calculator.ring_buffer.capacity() >= 6);
         
         // 验证速度计算能正常工作
         let (_instant, _) = calculator.get_instant_speed();
@@ -756,4 +756,278 @@ fn test_different_sample_intervals() {
         
         assert_eq!(samples_before.len(), samples_after.len());
     }
+}
+
+// ============================================================================
+// RingBuffer 结构测试
+// ============================================================================
+
+#[test]
+fn test_ring_buffer_new() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    let buffer = RingBuffer::new(10);
+    
+    // 验证容量
+    assert_eq!(buffer.capacity(), 10);
+    // 初始没有写入任何数据
+    assert_eq!(buffer.total_written(), 0);
+    // 初始读取为空
+    assert_eq!(buffer.read_all().len(), 0);
+}
+
+#[test]
+fn test_ring_buffer_push_and_read() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    let buffer = RingBuffer::new(5);
+    
+    // 写入一个采样点
+    buffer.push(1_000_000_000, 1024);
+    
+    // 读取采样点
+    let samples = buffer.read_all();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0], (1_000_000_000, 1024));
+    
+    // 验证总写入数
+    assert_eq!(buffer.total_written(), 1);
+}
+
+#[test]
+fn test_ring_buffer_multiple_push() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    let buffer = RingBuffer::new(10);
+    
+    // 写入多个采样点
+    for i in 0..5 {
+        buffer.push((i + 1) * 1_000_000_000, (i + 1) * 1024);
+    }
+    
+    // 读取采样点
+    let samples = buffer.read_all();
+    assert_eq!(samples.len(), 5);
+    
+    // 验证数据正确性和排序
+    for (i, &(ts, bytes)) in samples.iter().enumerate() {
+        assert_eq!(ts, (i as u64 + 1) * 1_000_000_000);
+        assert_eq!(bytes, (i as u64 + 1) * 1024);
+    }
+    
+    // 验证总写入数
+    assert_eq!(buffer.total_written(), 5);
+}
+
+#[test]
+fn test_ring_buffer_wrapping() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    let buffer = RingBuffer::new(5);
+    
+    // 写入超过容量的采样点（触发环形覆盖）
+    for i in 0..10 {
+        buffer.push((i + 1) * 1_000_000_000, (i + 1) * 1024);
+    }
+    
+    // 读取采样点
+    let samples = buffer.read_all();
+    
+    // 采样点数量不应超过容量
+    assert!(samples.len() <= buffer.capacity());
+    
+    // 总写入数应该是 10
+    assert_eq!(buffer.total_written(), 10);
+    
+    // 验证采样点按时间排序
+    for i in 1..samples.len() {
+        assert!(samples[i].0 > samples[i - 1].0);
+    }
+}
+
+#[test]
+fn test_ring_buffer_sorted_output() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    let buffer = RingBuffer::new(10);
+    
+    // 写入采样点（可能乱序写入，但读取时应该排序）
+    buffer.push(3_000_000_000, 3072);
+    buffer.push(1_000_000_000, 1024);
+    buffer.push(2_000_000_000, 2048);
+    buffer.push(5_000_000_000, 5120);
+    buffer.push(4_000_000_000, 4096);
+    
+    // 读取采样点
+    let samples = buffer.read_all();
+    
+    // 验证排序
+    assert_eq!(samples.len(), 5);
+    for i in 1..samples.len() {
+        assert!(samples[i].0 > samples[i - 1].0,
+            "时间戳应该递增: samples[{}].0 = {}, samples[{}].0 = {}",
+            i, samples[i].0, i - 1, samples[i - 1].0);
+    }
+}
+
+#[test]
+fn test_ring_buffer_concurrent_push() {
+    use crate::utils::speed_calculator::RingBuffer;
+    use std::sync::Arc;
+    use std::thread;
+    
+    let buffer = Arc::new(RingBuffer::new(100));
+    let mut handles = vec![];
+    
+    // 启动多个线程并发写入
+    for thread_id in 0..4 {
+        let buffer_clone = Arc::clone(&buffer);
+        let handle = thread::spawn(move || {
+            for i in 0..25 {
+                let timestamp = (thread_id * 25 + i + 1) * 1_000_000;
+                let bytes = (thread_id * 25 + i + 1) * 1024;
+                buffer_clone.push(timestamp, bytes);
+            }
+        });
+        handles.push(handle);
+    }
+    
+    // 等待所有线程完成
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    
+    // 验证总写入数
+    assert_eq!(buffer.total_written(), 100);
+    
+    // 读取采样点
+    let samples = buffer.read_all();
+    
+    // 应该有 100 个采样点（缓冲区容量为 100）
+    assert_eq!(samples.len(), 100);
+    
+    // 验证排序
+    for i in 1..samples.len() {
+        assert!(samples[i].0 > samples[i - 1].0);
+    }
+}
+
+#[test]
+fn test_ring_buffer_concurrent_read_write() {
+    use crate::utils::speed_calculator::RingBuffer;
+    use std::sync::Arc;
+    use std::thread;
+    
+    let buffer = Arc::new(RingBuffer::new(50));
+    let mut handles = vec![];
+    
+    // 写入线程
+    for thread_id in 0..2 {
+        let buffer_clone = Arc::clone(&buffer);
+        let handle = thread::spawn(move || {
+            for i in 0..30 {
+                let timestamp = (thread_id * 30 + i + 1) * 1_000_000;
+                let bytes = (thread_id * 30 + i + 1) * 1024;
+                buffer_clone.push(timestamp, bytes);
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        handles.push(handle);
+    }
+    
+    // 读取线程
+    for _ in 0..2 {
+        let buffer_clone = Arc::clone(&buffer);
+        let handle = thread::spawn(move || {
+            for _ in 0..20 {
+                let _samples = buffer_clone.read_all();
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        handles.push(handle);
+    }
+    
+    // 等待所有线程完成
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    
+    // 验证最终状态
+    assert_eq!(buffer.total_written(), 60);
+    let samples = buffer.read_all();
+    assert!(samples.len() > 0);
+}
+
+#[test]
+fn test_ring_buffer_zero_timestamp_filtered() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    let buffer = RingBuffer::new(5);
+    
+    // 写入正常采样点
+    buffer.push(1_000_000_000, 1024);
+    buffer.push(2_000_000_000, 2048);
+    
+    // 写入时间戳为 0 的采样点（应该被过滤）
+    buffer.push(0, 3072);
+    
+    // 写入更多正常采样点
+    buffer.push(3_000_000_000, 4096);
+    
+    // 读取采样点
+    let samples = buffer.read_all();
+    
+    // 应该只有 3 个有效采样点（时间戳为 0 的被过滤掉）
+    assert_eq!(samples.len(), 3);
+    
+    // 验证没有时间戳为 0 的采样点
+    for &(ts, _) in &samples {
+        assert!(ts > 0);
+    }
+}
+
+#[test]
+fn test_ring_buffer_capacity_boundaries() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    // 测试不同容量的缓冲区
+    let capacities = vec![1, 5, 10, 50, 100, 1000];
+    
+    for capacity in capacities {
+        let buffer = RingBuffer::new(capacity);
+        assert_eq!(buffer.capacity(), capacity);
+        
+        // 写入容量 + 10 个采样点
+        for i in 0..(capacity + 10) {
+            buffer.push((i as u64 + 1) * 1_000_000, (i as u64 + 1) * 1024);
+        }
+        
+        // 读取的采样点数量不应超过容量
+        let samples = buffer.read_all();
+        assert!(samples.len() <= capacity);
+        
+        // 总写入数应该是 capacity + 10
+        assert_eq!(buffer.total_written() as usize, capacity + 10);
+    }
+}
+
+#[test]
+fn test_ring_buffer_max_values() {
+    use crate::utils::speed_calculator::RingBuffer;
+    
+    let buffer = RingBuffer::new(3);
+    
+    // 写入最大值
+    buffer.push(u64::MAX, u64::MAX);
+    buffer.push(u64::MAX - 1, u64::MAX - 1);
+    
+    // 读取采样点
+    let samples = buffer.read_all();
+    
+    // 应该有 2 个采样点
+    assert_eq!(samples.len(), 2);
+    
+    // 验证值正确
+    assert!(samples.iter().any(|&(ts, bytes)| ts == u64::MAX && bytes == u64::MAX));
+    assert!(samples.iter().any(|&(ts, bytes)| ts == u64::MAX - 1 && bytes == u64::MAX - 1));
 }

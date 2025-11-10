@@ -535,6 +535,7 @@ dependencies = [
  "kestrel-timer",
  "log",
  "parking_lot",
+ "portable-atomic",
  "ranged-mmap",
  "reqwest",
  "rustc-hash",
