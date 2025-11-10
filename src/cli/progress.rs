@@ -84,26 +84,26 @@ impl ProgressManager {
                 bytes_downloaded,
                 total_size,
                 percentage: _,
-                avg_speed,
                 instant_speed,
                 worker_stats,
+                ..
             } => {
                 // 更新主进度条
                 self.main_bar.set_position(bytes_downloaded);
                 
-                let speed_str = if let Some(instant) = instant_speed {
-                    format!("{} (瞬时: {})", format_speed(avg_speed), format_speed(instant))
+                // 只在有实时速度时显示速度和 ETA
+                let (speed_str, eta) = if let Some(instant) = instant_speed {
+                    let speed_display = format_speed(instant);
+                    let eta_display = if instant > 0.0 {
+                        let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded) as f64;
+                        let eta_secs = remaining_bytes / instant;
+                        format!(", ETA: {}", format_duration(eta_secs))
+                    } else {
+                        String::new()
+                    };
+                    (speed_display, eta_display)
                 } else {
-                    format_speed(avg_speed)
-                };
-
-                // 计算 ETA
-                let eta = if avg_speed > 0.0 {
-                    let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded) as f64;
-                    let eta_secs = remaining_bytes / avg_speed;
-                    format!(", ETA: {}", format_duration(eta_secs))
-                } else {
-                    String::new()
+                    (String::new(), String::new())
                 };
 
                 // 计算分块大小范围（显示最小和最大值）
@@ -119,12 +119,13 @@ impl ProgressManager {
                     String::new()
                 };
 
-                self.main_bar.set_message(format!(
-                    "{}{}{}", 
-                    speed_str,
-                    chunk_info,
-                    eta
-                ));
+                // 组合消息，避免空字符串开头
+                let message = if speed_str.is_empty() {
+                    format!("{}{}", chunk_info.trim_start_matches(", "), eta)
+                } else {
+                    format!("{}{}{}", speed_str, chunk_info, eta)
+                };
+                self.main_bar.set_message(message);
 
                 // 详细模式：更新每个 worker 的进度条
                 if self.verbose {

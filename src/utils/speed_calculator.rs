@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use portable_atomic::AtomicU128;
 
@@ -18,14 +19,14 @@ const MIN_SAMPLES_FOR_REGRESSION: usize = 3;
 /// - 高 64 位：时间戳（纳秒，相对于 start_time）
 /// - 低 64 位：累计下载字节数
 #[derive(Debug)]
-struct Sample {
+pub(super) struct Sample {
     /// 原子化存储：高 64 位为 timestamp_ns，低 64 位为 bytes
     data: AtomicU128,
 }
 
 impl Sample {
     /// 创建新的采样点（初始值为 0）
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             data: AtomicU128::new(0),
         }
@@ -37,7 +38,7 @@ impl Sample {
     /// 
     /// `Option<(时间戳纳秒, 字节数)>`，如果时间戳为 0 则返回 None
     fn read(&self) -> Option<(u64, u64)> {
-        let packed = self.data.load(Ordering::Relaxed);
+        let packed = self.data.load(Ordering::Acquire);
         
         // 解包：高 64 位为 timestamp_ns，低 64 位为 bytes
         let timestamp_ns = (packed >> 64) as u64;
@@ -54,7 +55,7 @@ impl Sample {
     fn write(&self, timestamp_ns: u64, bytes: u64) {
         // 打包：高 64 位为 timestamp_ns，低 64 位为 bytes
         let packed = ((timestamp_ns as u128) << 64) | (bytes as u128);
-        self.data.store(packed, Ordering::Relaxed);
+        self.data.store(packed, Ordering::Release);
     }
 }
 
@@ -100,6 +101,12 @@ pub(crate) struct SpeedCalculator {
     instant_speed_window: Duration,
     /// 窗口平均速度的时间窗口
     window_avg_duration: Duration,
+    /// 下载开始时间（只初始化一次）
+    start_time: OnceLock<Instant>,
+    /// 上次采样时间戳（纳秒，相对于 start_time）
+    last_sample_timestamp_ns: AtomicU64,
+    /// 采样间隔（纳秒）
+    sample_interval_ns: u64,
 }
 
 impl SpeedCalculator {
@@ -155,42 +162,57 @@ impl SpeedCalculator {
             min_samples_for_regression: MIN_SAMPLES_FOR_REGRESSION,
             instant_speed_window,
             window_avg_duration,
+            start_time: OnceLock::new(),
+            last_sample_timestamp_ns: AtomicU64::new(0),
+            sample_interval_ns: sample_interval.as_nanos() as u64,
         }
     }
 
     /// 记录采样点（无锁并发写入）
     /// 
-    /// 将当前的时间戳和字节数写入环形缓冲区。多个线程可以并发调用此方法，
-    /// 通过 fetch_add 原子操作获取不同的写入位置。
+    /// 根据配置的采样间隔自动判断是否需要记录采样点。
+    /// 多个线程可以并发调用此方法，通过原子操作保证线程安全。
     /// 
     /// # Arguments
     /// 
     /// * `current_bytes` - 当前累计下载的总字节数
-    /// * `start_time` - 下载开始时间
     /// 
     /// # Examples
     /// 
     /// ```ignore
-    /// let calculator = SpeedCalculator::new(
-    ///     Duration::from_secs(1),
-    ///     Duration::from_secs(5),
-    /// );
-    /// 
-    /// let start_time = Instant::now();
-    /// calculator.record_sample(1024 * 1024, start_time);
+    /// let calculator = SpeedCalculator::from_config(&config);
+    /// calculator.record_sample(1024 * 1024);
     /// ```
-    pub(crate) fn record_sample(&self, current_bytes: u64, start_time: Instant) {
+    pub(crate) fn record_sample(&self, current_bytes: u64) {
+        // 第一次调用时初始化开始时间
+        let start_time = *self.start_time.get_or_init(Instant::now);
+        
+        // 自动采样逻辑：根据配置的采样间隔记录采样点
         let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
+        let last_sample_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
         
-        // 原子获取写入位置（单调递增）
-        let index = self.write_index.fetch_add(1, Ordering::Relaxed);
-        
-        // 映射到环形缓冲区（模运算）
-        let slot_index = (index % self.samples.len() as u64) as usize;
-        let slot = &self.samples[slot_index];
-        
-        // 原子化写入采样点（时间戳和字节数同时更新）
-        slot.write(current_elapsed_ns, current_bytes);
+        // 检查是否需要采样（距离上次采样超过配置的采样间隔，或者是首次采样）
+        if last_sample_ns == 0 || current_elapsed_ns.saturating_sub(last_sample_ns) >= self.sample_interval_ns {
+            // 尝试更新采样时间戳（使用 compare_exchange 避免重复采样）
+            // 允许多个线程竞争，只有一个会成功，这样可以避免过度采样
+            if self.last_sample_timestamp_ns.compare_exchange(
+                last_sample_ns,
+                current_elapsed_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed
+            ).is_ok() {
+                // 成功获取采样权限，记录采样点
+                // 原子获取写入位置（单调递增）
+                let index = self.write_index.fetch_add(1, Ordering::Relaxed);
+                
+                // 映射到环形缓冲区（模运算）
+                let slot_index = (index % self.samples.len() as u64) as usize;
+                let slot = &self.samples[slot_index];
+                
+                // 原子化写入采样点（时间戳和字节数同时更新）
+                slot.write(current_elapsed_ns, current_bytes);
+            }
+        }
     }
     
     /// 读取最近的有效采样点
@@ -305,10 +327,6 @@ impl SpeedCalculator {
     /// 基于瞬时速度时间窗口内的采样点，使用线性回归计算速度。
     /// 相比旧版本的两点差分法，线性回归提供更平滑、更稳定的速度估计。
     /// 
-    /// # Arguments
-    /// 
-    /// * `start_time` - 下载开始时间
-    /// 
     /// # Returns
     /// 
     /// `(瞬时速度, 是否有效)`：
@@ -318,18 +336,14 @@ impl SpeedCalculator {
     /// # Examples
     /// 
     /// ```ignore
-    /// let calculator = SpeedCalculator::new(
-    ///     Duration::from_secs(1),
-    ///     Duration::from_secs(5),
-    /// );
-    /// 
-    /// let start_time = Instant::now();
-    /// let (speed, valid) = calculator.get_instant_speed(start_time);
+    /// let calculator = SpeedCalculator::from_config(&config);
+    /// let (speed, valid) = calculator.get_instant_speed();
     /// if valid {
     ///     println!("瞬时速度: {:.2} MB/s", speed / 1024.0 / 1024.0);
     /// }
     /// ```
-    pub(crate) fn get_instant_speed(&self, start_time: Instant) -> (f64, bool) {
+    pub(crate) fn get_instant_speed(&self) -> (f64, bool) {
+        let start_time = self.start_time.get().copied().unwrap_or_else(Instant::now);
         // 读取瞬时速度窗口内的采样点
         let samples = self.read_samples_in_window(self.instant_speed_window, start_time);
         
@@ -345,10 +359,6 @@ impl SpeedCalculator {
     /// 基于窗口平均时间窗口内的采样点，使用线性回归计算速度。
     /// 相比旧版本的两点差分法，线性回归提供更平滑、更稳定的速度估计。
     /// 
-    /// # Arguments
-    /// 
-    /// * `start_time` - 下载开始时间
-    /// 
     /// # Returns
     /// 
     /// `(窗口平均速度, 是否有效)`：
@@ -358,18 +368,14 @@ impl SpeedCalculator {
     /// # Examples
     /// 
     /// ```ignore
-    /// let calculator = SpeedCalculator::new(
-    ///     Duration::from_secs(1),
-    ///     Duration::from_secs(5),
-    /// );
-    /// 
-    /// let start_time = Instant::now();
-    /// let (speed, valid) = calculator.get_window_avg_speed(start_time);
+    /// let calculator = SpeedCalculator::from_config(&config);
+    /// let (speed, valid) = calculator.get_window_avg_speed();
     /// if valid {
     ///     println!("窗口平均速度: {:.2} MB/s", speed / 1024.0 / 1024.0);
     /// }
     /// ```
-    pub(crate) fn get_window_avg_speed(&self, start_time: Instant) -> (f64, bool) {
+    pub(crate) fn get_window_avg_speed(&self) -> (f64, bool) {
+        let start_time = self.start_time.get().copied().unwrap_or_else(Instant::now);
         // 读取窗口平均速度窗口内的采样点
         let samples = self.read_samples_in_window(self.window_avg_duration, start_time);
         
@@ -380,427 +386,3 @@ impl SpeedCalculator {
         (speed, valid)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-
-    // 测试辅助常量
-    const TEST_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-    const TEST_BUFFER_MARGIN: f64 = 1.2;
-
-    #[test]
-    fn test_sample_creation_and_read() {
-        let sample = Sample::new();
-        
-        // 初始状态应该返回 None
-        assert!(sample.read().is_none());
-        
-        // 写入数据后应该能读取
-        sample.write(1000, 2048);
-        let data = sample.read();
-        assert!(data.is_some());
-        assert_eq!(data.unwrap(), (1000, 2048));
-    }
-
-    #[test]
-    fn test_ring_buffer_creation() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        // 验证缓冲区大小（5秒窗口 / 100ms采样 * 1.2 = 60）
-        let expected_size = ((5_000 / 100) as f64 * TEST_BUFFER_MARGIN) as usize;
-        assert_eq!(calculator.samples.len(), expected_size);
-        assert_eq!(calculator.write_index.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn test_record_sample() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        let start_time = Instant::now();
-        
-        // 记录第一个采样点
-        calculator.record_sample(1024, start_time);
-        assert_eq!(calculator.write_index.load(Ordering::Relaxed), 1);
-        
-        // 记录第二个采样点
-        thread::sleep(Duration::from_millis(10));
-        calculator.record_sample(2048, start_time);
-        assert_eq!(calculator.write_index.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn test_ring_buffer_wraparound() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        let start_time = Instant::now();
-        let buffer_size = calculator.samples.len();
-        
-        // 写入超过缓冲区大小的采样点
-        for i in 0..(buffer_size + 5) {
-            calculator.record_sample((i * 1024) as u64, start_time);
-            if i < buffer_size {
-                thread::sleep(Duration::from_micros(100));
-            }
-        }
-        
-        // 验证写入索引继续递增
-        assert_eq!(
-            calculator.write_index.load(Ordering::Relaxed),
-            (buffer_size + 5) as u64
-        );
-    }
-
-    #[test]
-    fn test_linear_regression_with_perfect_line() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        // 完美的线性数据：速度 = 1000 bytes/s
-        let samples = vec![
-            (0.0, 0.0),
-            (1.0, 1000.0),
-            (2.0, 2000.0),
-            (3.0, 3000.0),
-            (4.0, 4000.0),
-        ];
-        
-        let speed = calculator.linear_regression(&samples);
-        
-        // 应该准确计算出速度 1000 bytes/s
-        assert!((speed - 1000.0).abs() < 0.1, "速度应该接近 1000, 实际: {}", speed);
-    }
-
-    #[test]
-    fn test_linear_regression_with_noise() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        // 带噪声的线性数据：速度约 1000 bytes/s
-        let samples = vec![
-            (0.0, 0.0),
-            (1.0, 950.0),   // -50
-            (2.0, 2100.0),  // +100
-            (3.0, 2900.0),  // -100
-            (4.0, 4050.0),  // +50
-        ];
-        
-        let speed = calculator.linear_regression(&samples);
-        
-        // 线性回归应该给出接近 1000 的结果
-        assert!(speed > 900.0 && speed < 1100.0, "速度应该接近 1000, 实际: {}", speed);
-    }
-
-    #[test]
-    fn test_linear_regression_insufficient_samples() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        // 只有 2 个采样点，少于最小要求
-        let samples = vec![
-            (0.0, 0.0),
-            (1.0, 1000.0),
-        ];
-        
-        let speed = calculator.linear_regression(&samples);
-        
-        // 应该降级使用平均速度
-        assert!((speed - 1000.0).abs() < 0.1, "速度应该是 1000, 实际: {}", speed);
-    }
-
-    #[test]
-    fn test_linear_regression_zero_variance() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        // 所有采样点时间相同（方差为 0）
-        let samples = vec![
-            (1.0, 100.0),
-            (1.0, 200.0),
-            (1.0, 300.0),
-        ];
-        
-        let speed = calculator.linear_regression(&samples);
-        
-        // 应该返回 0
-        assert_eq!(speed, 0.0);
-    }
-
-    #[test]
-    fn test_instant_speed_with_samples() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_millis(200))
-            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .window_avg_multiplier(std::num::NonZeroU32::new(25).unwrap()) // 5秒
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        let start_time = Instant::now();
-        
-        // 记录多个采样点，模拟 1 MB/s 的速度
-        for i in 0..5 {
-            let elapsed_ms = i * 50;
-            thread::sleep(Duration::from_millis(50));
-            let bytes = (elapsed_ms as u64 * 1024 * 1024) / 1000; // 1 MB/s
-            calculator.record_sample(bytes, start_time);
-        }
-        
-        // 获取瞬时速度（最近 200ms 窗口）
-        let (speed, valid) = calculator.get_instant_speed(start_time);
-        
-        if valid {
-            let speed_mbs = speed / 1024.0 / 1024.0;
-            // 速度应该接近 1 MB/s
-            assert!(
-                speed_mbs > 0.5 && speed_mbs < 1.5,
-                "速度应该接近 1 MB/s, 实际: {:.2} MB/s",
-                speed_mbs
-            );
-        }
-    }
-
-    #[test]
-    fn test_window_avg_speed_with_samples() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .window_avg_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        let start_time = Instant::now();
-        
-        // 记录多个采样点
-        for i in 0..5 {
-            thread::sleep(Duration::from_millis(50));
-            let bytes = i as u64 * 100 * 1024; // 变化的字节数
-            calculator.record_sample(bytes, start_time);
-        }
-        
-        // 获取窗口平均速度
-        let (speed, valid) = calculator.get_window_avg_speed(start_time);
-        
-        if valid {
-            assert!(speed > 0.0, "速度应该大于 0");
-        }
-    }
-
-    #[test]
-    fn test_concurrent_record_sample() {
-        use std::sync::Arc;
-        use crate::config::SpeedConfigBuilder;
-        
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = Arc::new(SpeedCalculator::from_config(&config));
-        
-        let start_time = Instant::now();
-        let mut handles = vec![];
-        
-        // 启动 4 个线程，每个记录 10 个采样点
-        for thread_id in 0..4 {
-            let calc = Arc::clone(&calculator);
-            let handle = thread::spawn(move || {
-                for i in 0..10 {
-                    let bytes = (thread_id * 10 + i) * 1024;
-                    calc.record_sample(bytes as u64, start_time);
-                    thread::sleep(Duration::from_micros(100));
-                }
-            });
-            handles.push(handle);
-        }
-        
-        // 等待所有线程完成
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        
-        // 验证所有采样点都已记录
-        assert_eq!(calculator.write_index.load(Ordering::Relaxed), 40);
-    }
-
-    #[test]
-    fn test_read_samples_in_window() {
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_millis(100))
-            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .window_avg_multiplier(std::num::NonZeroU32::new(50).unwrap()) // 5秒
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        let start_time = Instant::now();
-        
-        // 记录一些采样点
-        for i in 0..5 {
-            thread::sleep(Duration::from_millis(30));
-            calculator.record_sample((i * 1024) as u64, start_time);
-        }
-        
-        // 读取最近 100ms 窗口内的采样点
-        let samples = calculator.read_samples_in_window(Duration::from_millis(100), start_time);
-        
-        // 应该只包含最近的采样点
-        assert!(samples.len() > 0, "应该有采样点");
-        assert!(samples.len() <= 5, "采样点数量应该合理");
-    }
-
-    #[test]
-    fn test_backward_compatibility() {
-        // 验证 API 仍然可用
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(1))
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap())
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        let start_time = Instant::now();
-        
-        // 记录一些采样点
-        calculator.record_sample(1024, start_time);
-        thread::sleep(Duration::from_millis(50));
-        calculator.record_sample(2048, start_time);
-        
-        // API 应该正常工作
-        let (_speed, _valid) = calculator.get_instant_speed(start_time);
-        let (_speed2, _valid2) = calculator.get_window_avg_speed(start_time);
-    }
-
-    #[test]
-    fn test_buffer_size_calculation() {
-        use crate::config::SpeedConfigBuilder;
-        
-        // 测试 1: 小窗口
-        let config1 = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_millis(500))
-            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .window_avg_multiplier(std::num::NonZeroU32::new(2).unwrap()) // 1秒
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calc1 = SpeedCalculator::from_config(&config1);
-        // max(500ms, 1000ms) = 1000ms
-        // 1000ms / 100ms = 10 采样点
-        // 10 * 1.2 = 12 采样点
-        assert_eq!(calc1.samples.len(), 12);
-        
-        // 测试 2: 大窗口
-        let config2 = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(2))
-            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap()) // 10秒
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calc2 = SpeedCalculator::from_config(&config2);
-        // max(2s, 10s) = 10s
-        // 10000ms / 100ms = 100 采样点
-        // 100 * 1.2 = 120 采样点
-        assert_eq!(calc2.samples.len(), 120);
-        
-        // 测试 3: 极小窗口（确保至少有 MIN_SAMPLES_FOR_REGRESSION * 2）
-        let config3 = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_millis(10))
-            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .window_avg_multiplier(std::num::NonZeroU32::new(5).unwrap()) // 50ms
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calc3 = SpeedCalculator::from_config(&config3);
-        // max(10ms, 50ms) = 50ms
-        // 50ms / 100ms = 0.5 采样点 -> 0
-        // 0 * 1.2 = 0，但会被限制为 MIN_SAMPLES_FOR_REGRESSION * 2 = 6
-        assert_eq!(calc3.samples.len(), MIN_SAMPLES_FOR_REGRESSION * 2);
-    }
-
-    #[test]
-    fn test_buffer_size_sufficient_for_window() {
-        // 验证缓冲区大小足以容纳整个时间窗口的数据
-        use crate::config::SpeedConfigBuilder;
-        let config = SpeedConfigBuilder::new()
-            .base_interval(Duration::from_secs(8))
-            .instant_window_multiplier(std::num::NonZeroU32::new(1).unwrap())
-            .window_avg_multiplier(std::num::NonZeroU32::new(1).unwrap()) // 8秒, 2秒中取最大
-            .sample_interval(TEST_SAMPLE_INTERVAL)
-            .buffer_size_margin(TEST_BUFFER_MARGIN)
-            .build();
-        let calculator = SpeedCalculator::from_config(&config);
-        
-        let start_time = Instant::now();
-        
-        // 在 8 秒窗口内，以 100ms 间隔记录采样点
-        // 理论上需要 80 个采样点
-        // 实际分配 80 * 1.2 = 96 个
-        for i in 0..85 {
-            calculator.record_sample((i * 1024) as u64, start_time);
-            thread::sleep(Duration::from_micros(100));
-        }
-        
-        // 验证缓冲区足够大
-        let expected_min_size = (8000 / 100) as usize; // 至少 80 个
-        assert!(calculator.samples.len() >= expected_min_size,
-                "缓冲区大小 {} 应该至少为 {}", calculator.samples.len(), expected_min_size);
-    }
-}
-

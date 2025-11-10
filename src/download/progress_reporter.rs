@@ -50,6 +50,8 @@ pub enum DownloadProgress {
         avg_speed: f64,
         /// 实时速度 (bytes/s)，如果无效则为 None
         instant_speed: Option<f64>,
+        /// 窗口平均速度 (bytes/s)，如果无效则为 None
+        window_avg_speed: Option<f64>,
         /// 所有 worker 的统计信息（包含各自的分块大小）
         worker_stats: Vec<WorkerStatSnapshot>,
     },
@@ -188,16 +190,15 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
         let handles = self.worker_handles.load();
         handles.iter().map(|(worker_id, handle)| {
             let stats = handle.stats();
-            let (worker_bytes, _, worker_ranges, avg_speed, instant_speed, instant_valid, _, _) = 
-                stats.get_full_summary();
+            let summary = stats.get_full_summary();
             let current_chunk_size = stats.get_current_chunk_size();
             
             WorkerStatSnapshot {
                 worker_id: *worker_id,
-                bytes: worker_bytes,
-                ranges: worker_ranges,
-                avg_speed,
-                instant_speed: if instant_valid { Some(instant_speed) } else { None },
+                bytes: summary.total_bytes,
+                ranges: summary.completed_ranges,
+                avg_speed: summary.avg_speed,
+                instant_speed: summary.instant_speed,
                 current_chunk_size,
             }
         }).collect()
@@ -207,26 +208,26 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
     async fn send_progress_update(&self) {
         if let Some(ref sender) = self.progress_sender {
             // 从 global_stats 获取总体统计
-            let (total_bytes, _, _, total_avg_speed, total_instant_speed, instant_valid, _, _) = 
-                self.global_stats.get_full_summary();
+            let summary = self.global_stats.get_full_summary();
             
             // 计算百分比
             let percentage = if self.total_size.get() > 0 {
-                (total_bytes as f64 / self.total_size.get() as f64) * 100.0
+                (summary.total_bytes as f64 / self.total_size.get() as f64) * 100.0
             } else {
                 0.0
             };
             
             // 在 actor 内部从 worker_handles 计算 worker 快照
-            let worker_snapshots = self.compute_worker_snapshots();
+            let workers_snapshots = self.compute_worker_snapshots();
             
             let _ = sender.send(DownloadProgress::Progress {
-                bytes_downloaded: total_bytes,
+                bytes_downloaded: summary.total_bytes,
                 total_size: self.total_size,
                 percentage,
-                avg_speed: total_avg_speed,
-                instant_speed: if instant_valid { Some(total_instant_speed) } else { None },
-                worker_stats: worker_snapshots,
+                avg_speed: summary.avg_speed,
+                instant_speed: summary.instant_speed,
+                window_avg_speed: summary.window_avg_speed,
+                worker_stats: workers_snapshots,
             }).await;
         }
     }
@@ -235,17 +236,16 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
     async fn send_completion_stats(&self) {
         if let Some(ref sender) = self.progress_sender {
             // 从 global_stats 获取总体统计
-            let (total_bytes, total_secs, _, total_avg_speed, _, _, _, _) = 
-                self.global_stats.get_full_summary();
+            let summary = self.global_stats.get_full_summary();
             
             // 在 actor 内部从 worker_handles 计算 worker 快照
-            let worker_snapshots = self.compute_worker_snapshots();
+            let workers_snapshots = self.compute_worker_snapshots();
             
             let _ = sender.send(DownloadProgress::Completed {
-                total_bytes,
-                total_time: total_secs,
-                avg_speed: total_avg_speed,
-                worker_stats: worker_snapshots,
+                total_bytes: summary.total_bytes,
+                total_time: summary.elapsed_secs,
+                avg_speed: summary.avg_speed,
+                worker_stats: workers_snapshots,
             }).await;
         }
     }
