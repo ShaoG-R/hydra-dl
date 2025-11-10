@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
