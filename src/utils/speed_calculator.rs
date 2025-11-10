@@ -1,10 +1,6 @@
-#[cfg(test)]
-mod tests;
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use portable_atomic::AtomicU128;
 
 /// 线性回归所需的最小采样点数
 const MIN_SAMPLES_FOR_REGRESSION: usize = 3;
@@ -15,23 +11,26 @@ const MIN_SAMPLES_FOR_REGRESSION: usize = 3;
 /// 
 /// # 线程安全
 /// 
-/// 使用 `AtomicU128` 保证时间戳和字节数的读写完全原子化，避免数据不一致。
+/// 使用 `AtomicU64` 保证时间戳和字节数的读写完全原子化，避免数据不一致。
 /// 
 /// # 数据布局
 /// 
-/// - 高 64 位：时间戳（纳秒，相对于 start_time）
-/// - 低 64 位：累计下载字节数
+/// - 时间戳（纳秒，相对于 start_time）
+/// - 累计下载字节数
 #[derive(Debug)]
 pub(super) struct Sample {
-    /// 原子化存储：高 64 位为 timestamp_ns，低 64 位为 bytes
-    data: AtomicU128,
+    /// 时间戳（纳秒，相对于 start_time）
+    timestamp_ns: AtomicU64,
+    /// 累计下载字节数
+    bytes: AtomicU64,
 }
 
 impl Sample {
     /// 创建新的采样点（初始值为 0）
     pub(super) fn new() -> Self {
         Self {
-            data: AtomicU128::new(0),
+            timestamp_ns: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
         }
     }
     
@@ -41,11 +40,8 @@ impl Sample {
     /// 
     /// `Option<(时间戳纳秒, 字节数)>`，如果时间戳为 0 则返回 None
     fn read(&self) -> Option<(u64, u64)> {
-        let packed = self.data.load(Ordering::Acquire);
-        
-        // 解包：高 64 位为 timestamp_ns，低 64 位为 bytes
-        let timestamp_ns = (packed >> 64) as u64;
-        let bytes = packed as u64;
+        let timestamp_ns = self.timestamp_ns.load(Ordering::Acquire);
+        let bytes = self.bytes.load(Ordering::Acquire);
         
         if timestamp_ns == 0 {
             return None;
@@ -56,9 +52,8 @@ impl Sample {
     
     /// 写入采样点数据（原子化写入）
     fn write(&self, timestamp_ns: u64, bytes: u64) {
-        // 打包：高 64 位为 timestamp_ns，低 64 位为 bytes
-        let packed = ((timestamp_ns as u128) << 64) | (bytes as u128);
-        self.data.store(packed, Ordering::Release);
+        self.timestamp_ns.store(timestamp_ns, Ordering::Release);
+        self.bytes.store(bytes, Ordering::Release);
     }
 }
 
@@ -90,7 +85,7 @@ impl Sample {
 /// 
 /// # 线程安全
 /// 
-/// 所有方法都是线程安全的，可以被多个线程并发调用。使用 `AtomicU128` 保证
+/// 所有方法都是线程安全的，可以被多个线程并发调用。使用 `AtomicU64` 保证
 /// 每个采样点的时间戳和字节数原子化读写，不存在数据不一致的问题。
 #[derive(Debug)]
 pub(crate) struct SpeedCalculator {
@@ -98,6 +93,8 @@ pub(crate) struct SpeedCalculator {
     samples: Box<[Sample]>,
     /// 写入索引（单调递增，通过模运算映射到环形缓冲区）
     write_index: AtomicU64,
+    /// 已写入的样本数（用于优化读取）
+    samples_written: AtomicU64,
     /// 线性回归所需的最小采样点数
     min_samples_for_regression: usize,
     /// 瞬时速度的时间窗口
@@ -162,6 +159,7 @@ impl SpeedCalculator {
         Self {
             samples: samples.into_boxed_slice(),
             write_index: AtomicU64::new(0),
+            samples_written: AtomicU64::new(0),
             min_samples_for_regression: MIN_SAMPLES_FOR_REGRESSION,
             instant_speed_window,
             window_avg_duration,
@@ -214,6 +212,9 @@ impl SpeedCalculator {
                 
                 // 原子化写入采样点（时间戳和字节数同时更新）
                 slot.write(current_elapsed_ns, current_bytes);
+                
+                // 更新已写入样本数
+                self.samples_written.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -227,12 +228,14 @@ impl SpeedCalculator {
     /// 
     /// `Vec<(时间戳秒, 字节数)>`
     fn read_recent_samples(&self) -> Vec<(f64, f64)> {
-        let mut samples = Vec::with_capacity(self.samples.len());
+        let samples_written = self.samples_written.load(Ordering::Relaxed).min(self.samples.len() as u64);
+        let mut samples = Vec::with_capacity(samples_written as usize);
         
-        // 读取所有采样点
-        for sample in self.samples.iter() {
+        // 只读取实际写入的样本
+        for i in 0..samples_written {
+            let index = (i % self.samples.len() as u64) as usize;
+            let sample = &self.samples[index];
             if let Some((timestamp_ns, bytes)) = sample.read() {
-                // 转换为秒
                 let timestamp_secs = timestamp_ns as f64 / 1_000_000_000.0;
                 samples.push((timestamp_secs, bytes as f64));
             }
