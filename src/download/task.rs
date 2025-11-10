@@ -4,7 +4,7 @@ use log::{error, info};
 use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use crate::{download::{
     progress_reporter::ProgressReporter,
     progressive::{ProgressiveLauncher, WorkerLaunchRequest},
@@ -80,7 +80,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             .expect("launch_request_rx should be available");
         
         // 创建 active_workers 共享状态（使用 RwLock 确保 TaskAllocator 和 HealthChecker 同步）
-        let active_workers = Arc::new(RwLock::new(FxHashMap::default()));
+        let active_workers = Arc::new(RwLock::new(FxHashSet::default()));
         
         // 创建健康检查器（actor 模式）
         let mut health_checker = WorkerHealthChecker::new(

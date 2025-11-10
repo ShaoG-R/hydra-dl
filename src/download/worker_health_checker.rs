@@ -7,7 +7,7 @@ use log::{debug, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use arc_swap::ArcSwap;
 use crate::pool::download::DownloadWorkerHandle;
 use crate::config::DownloadConfig;
@@ -223,7 +223,7 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
     /// 检查定时器（内部管理）
     check_timer: tokio::time::Interval,
     /// 正在执行任务的 worker 集合（由外部更新）
-    active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
+    active_workers: Arc<RwLock<FxHashSet<u64>>>,
 }
 
 impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
@@ -234,7 +234,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
         worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
         check_interval: std::time::Duration,
-        active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
+        active_workers: Arc<RwLock<FxHashSet<u64>>>,
     ) -> Self {
         let absolute_threshold = config.health_check().absolute_speed_threshold() as f64;
         let logic = WorkerHealthCheckerLogic::new(absolute_threshold, 0.5);
@@ -309,7 +309,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
             
             for &worker_id in handles.keys() {
                 // 只检查正在执行任务的 worker
-                if !active_workers.contains_key(&worker_id) {
+                if !active_workers.contains(&worker_id) {
                     continue;
                 }
                 
@@ -373,7 +373,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
         config: Arc<DownloadConfig>,
         worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
         check_interval: std::time::Duration,
-        active_workers: Arc<RwLock<FxHashMap<u64, ()>>>,
+        active_workers: Arc<RwLock<FxHashSet<u64>>>,
     ) -> Self {
         // 使用有界 channel，容量 10
         let (message_tx, message_rx) = mpsc::channel(10);
