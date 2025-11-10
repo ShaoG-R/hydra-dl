@@ -300,41 +300,33 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
     }
     
     /// 发送开始事件
-    pub(super) fn send_started_event(&self, worker_count: u64, initial_chunk_size: u64) {
+    pub(super) async fn send_started_event(&self, worker_count: u64, initial_chunk_size: u64) {
         let tx = self.message_tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(ActorMessage::SendStarted {
-                worker_count,
-                initial_chunk_size,
-            }).await;
-        });
+        let _ = tx.send(ActorMessage::SendStarted {
+            worker_count,
+            initial_chunk_size,
+        }).await;
     }
     
     
     /// 发送完成统计
     /// Actor 会从共享数据源直接获取所有统计信息
-    pub(super) fn send_completion(&self) {
+    pub(super) async fn send_completion(&self) {
         let tx = self.message_tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(ActorMessage::SendCompletion).await;
-        });
+        let _ = tx.send(ActorMessage::SendCompletion).await;
     }
     
     /// 发送错误事件
-    pub(super) fn send_error(&self, error_msg: &str) {
+    pub(super) async fn send_error(&self, error_msg: &str) {
         let tx = self.message_tx.clone();
         let message = error_msg.to_string();
-        tokio::spawn(async move {
-            let _ = tx.send(ActorMessage::SendError { message }).await;
-        });
+        let _ = tx.send(ActorMessage::SendError { message }).await;
     }
     
     /// 关闭 actor
-    pub(super) fn shutdown(&self) {
+    pub(super) async fn shutdown(&self) {
         let tx = self.message_tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(ActorMessage::Shutdown).await;
-        });
+        let _ = tx.send(ActorMessage::Shutdown).await;
     }
 }
 
@@ -397,7 +389,7 @@ mod tests {
             std::time::Duration::from_secs(1),
         );
         
-        reporter.send_started_event(4, 256);
+        reporter.send_started_event(4, 256).await;
         
         // 接收事件
         if let Some(progress) = rx.recv().await {
@@ -427,7 +419,7 @@ mod tests {
             std::time::Duration::from_secs(1),
         );
         
-        reporter.send_error("Test error");
+        reporter.send_error("Test error").await;
         
         // 接收事件
         if let Some(progress) = rx.recv().await {
@@ -455,8 +447,8 @@ mod tests {
         );
         
         // 这些调用不应该 panic
-        reporter.send_started_event(4, 256);
-        reporter.send_error("Test error");
+        reporter.send_started_event(4, 256).await;
+        reporter.send_error("Test error").await;
         
         // 给 actor 一些时间处理消息
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;

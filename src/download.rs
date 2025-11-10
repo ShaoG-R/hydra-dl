@@ -216,7 +216,7 @@ where
     // 发送开始事件（使用第一个 worker 的初始分块大小）
     let current_worker_count = task.worker_count();
     let initial_chunk_size = task.get_worker_chunk_size(0);
-    task.progress_reporter().send_started_event(current_worker_count, initial_chunk_size);
+    task.progress_reporter().send_started_event(current_worker_count, initial_chunk_size).await;
 
     // 等待所有任务完成（内部会动态分配任务）
     let failed_ranges = task.wait_for_completion().await?;

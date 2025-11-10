@@ -218,14 +218,14 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     pub(super) async fn shutdown_and_cleanup(mut self, error_msg: Option<String>) -> crate::Result<()> {
         // 发送错误事件
         if let Some(ref msg) = error_msg {
-            self.progress_reporter.send_error(msg);
+            self.progress_reporter.send_error(msg).await;
         }
 
         // 关闭 workers（发送关闭信号）
         self.pool.shutdown().await;
         
         // 关闭 progress reporter actor
-        self.progress_reporter.shutdown();
+        self.progress_reporter.shutdown().await;
         
         // 关闭 progressive launcher actor 并等待其完全停止
         self.progressive_launcher.shutdown_and_wait().await;
@@ -246,7 +246,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     /// 完成并清理资源
     pub(super) async fn finalize_and_cleanup(self, save_path: PathBuf) -> crate::Result<()> {
         // 发送完成统计（Actor 会自动从共享数据源获取统计）
-        self.progress_reporter.send_completion();
+        self.progress_reporter.send_completion().await;
 
         // 优雅关闭所有 workers（发送关闭信号，workers 会异步自动清理）
         let mut pool = self.pool;
@@ -256,7 +256,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         drop(pool);
         
         // 关闭 progress reporter actor
-        self.progress_reporter.shutdown();
+        self.progress_reporter.shutdown().await;
         
         // 关闭 progressive launcher actor 并等待其完全停止
         // 这很重要，因为 actor 持有 written_bytes 的 Arc 引用
