@@ -34,17 +34,10 @@ pub(super) enum CompletionResult {
 
 /// TaskAllocator Actor 的消息类型
 pub(super) enum AllocatorMessage {
-    /// 标记 worker 为空闲
-    MarkWorkerIdle {
-        worker_id: u64,
-    },
-    /// 注册新启动的 workers（批量标记为空闲并添加到活跃集合）
+    /// 注册新启动的 workers（标记为空闲并自动触发任务分配）
     RegisterNewWorkers {
         worker_ids: Vec<u64>,
     },
-    /// 获取永久失败的任务
-    /// 分配初始任务
-    AllocateInitialTasks,
     /// 关闭 Actor
     Shutdown,
 }
@@ -447,19 +440,14 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
     /// 处理消息
     async fn handle_message(&mut self, msg: AllocatorMessage) -> bool {
         match msg {
-            AllocatorMessage::MarkWorkerIdle { worker_id } => {
-                self.state.mark_worker_idle(worker_id);
-            }
             AllocatorMessage::RegisterNewWorkers { worker_ids } => {
                 for worker_id in worker_ids {
-                    // 将新 worker 加入空闲队列
+                    // 只标记为空闲，不立即标记为活跃
+                    // worker 只有在真正接收任务时才会被标记为活跃
                     self.state.mark_worker_idle(worker_id);
-                    // 标记为活跃
-                    self.active_workers.write().insert(worker_id);
                 }
-            }
-            AllocatorMessage::AllocateInitialTasks => {
-                self.allocate_initial_tasks().await;
+                // 注册完成后立即尝试为空闲 workers 分配任务
+                self.allocate_tasks_to_idle_workers().await;
             }
             AllocatorMessage::Shutdown => {
                 return false;
@@ -563,9 +551,11 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         }
     }
     
-    /// 分配初始任务
-    async fn allocate_initial_tasks(&mut self) {
-        info!("开始分配初始任务");
+    /// 为所有空闲 workers 分配任务
+    /// 
+    /// 这是注册 workers 后自动触发的统一任务分配入口
+    async fn allocate_tasks_to_idle_workers(&mut self) {
+        info!("开始为空闲 workers 分配任务");
         
         while let Some(&worker_id) = self.state.idle_workers.front() {
             let chunk_size = self.worker_handles.load().get(&worker_id)
@@ -574,11 +564,11 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
             
             if let Some(allocated) = self.state.try_allocate_task_to_idle_worker(chunk_size) {
                 let (task, worker_id, cancel_tx) = allocated.into_parts();
-                info!("为 Worker #{} 分配初始任务，分块大小 {} bytes", worker_id, chunk_size);
+                debug!("为 Worker #{} 分配任务，分块大小 {} bytes", worker_id, chunk_size);
                 
                 self.send_task_to_worker(worker_id, task, cancel_tx).await;
             } else {
-                info!("没有足够的数据为空闲 workers 分配更多任务");
+                debug!("没有足够的数据为空闲 workers 分配更多任务");
                 break;
             }
         }
@@ -638,16 +628,13 @@ pub(super) struct TaskAllocatorHandle {
 }
 
 impl TaskAllocatorHandle {
-    pub(super) async fn mark_worker_idle(&self, worker_id: u64) {
-        let _ = self.message_tx.send(AllocatorMessage::MarkWorkerIdle { worker_id }).await;
-    }
-    
+    /// 注册新的 workers（标记为空闲并自动触发任务分配）
+    /// 
+    /// 这是统一的 worker 注册入口，适用于：
+    /// - 初始 workers 的注册
+    /// - 动态添加的新 workers 的注册
     pub(super) async fn register_new_workers(&self, worker_ids: Vec<u64>) {
         let _ = self.message_tx.send(AllocatorMessage::RegisterNewWorkers { worker_ids }).await;
-    }
-    
-    pub(super) async fn allocate_initial_tasks(&self) {
-        let _ = self.message_tx.send(AllocatorMessage::AllocateInitialTasks).await;
     }
     
     pub(super) async fn shutdown_and_wait(self) {

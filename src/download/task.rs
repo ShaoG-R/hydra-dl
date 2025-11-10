@@ -135,10 +135,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             config.speed().instant_speed_window(),
         );
 
-        // 将第一批 workers 加入空闲队列（使用实际的 worker_id）
-        for &worker_id in worker_handles.load().keys() {
-            task_allocator_handle.mark_worker_idle(worker_id).await;
-        }
+        // 注册第一批 workers（会自动触发任务分配）
+        task_allocator_handle.register_new_workers(worker_handles.load().keys().cloned().collect()).await;
 
         Ok(Self {
             pool,
@@ -160,9 +158,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     /// 动态分配任务，支持失败重试
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
     pub(super) async fn wait_for_completion(&mut self) -> crate::Result<Vec<FailedRange>> {
-        // 分配初始任务
-        self.task_allocator.allocate_initial_tasks().await;
-
+        // 注意：任务分配已在注册 workers 时自动触发，这里直接进入事件循环
+        
         // 事件循环：分发各种事件到对应的处理器
         let completion_result = loop {
             tokio::select! {
