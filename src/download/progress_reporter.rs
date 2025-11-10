@@ -117,9 +117,11 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
         worker_handles: Arc<ArcSwap<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>>,
         global_stats: Arc<crate::utils::stats::TaskStats>,
         update_interval: std::time::Duration,
+        start_offset: std::time::Duration,
     ) -> Self {
-        let mut progress_timer = tokio::time::interval(update_interval);
-        progress_timer.tick().await; // 跳过首次立即触发
+        debug!("ProgressReporter 启动偏移: {:?}", start_offset);
+        let start_time = tokio::time::Instant::now() + start_offset;
+        let progress_timer = tokio::time::interval_at(start_time, update_interval);
         
         Self {
             progress_sender,
@@ -277,6 +279,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
         worker_handles: Arc<ArcSwap<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>>,
         global_stats: Arc<crate::utils::stats::TaskStats>,
         update_interval: std::time::Duration,
+        start_offset: std::time::Duration,
     ) -> Self {
         // 使用有界 channel，容量 100
         let (message_tx, message_rx) = mpsc::channel(100);
@@ -290,6 +293,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
                 worker_handles,
                 global_stats,
                 update_interval,
+                start_offset,
             ).await.run().await;
         });
         
@@ -358,6 +362,7 @@ mod tests {
             worker_handles,
             global_stats,
             std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
         );
         // Actor 已启动，只验证创建成功
     }
@@ -372,6 +377,7 @@ mod tests {
             worker_handles,
             global_stats,
             std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
         );
         // Actor 已启动，只验证创建成功
     }
@@ -387,6 +393,7 @@ mod tests {
             worker_handles,
             global_stats,
             std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
         );
         
         reporter.send_started_event(4, 256).await;
@@ -417,6 +424,7 @@ mod tests {
             worker_handles,
             global_stats,
             std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
         );
         
         reporter.send_error("Test error").await;
@@ -444,6 +452,7 @@ mod tests {
             worker_handles,
             global_stats,
             std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
         );
         
         // 这些调用不应该 panic

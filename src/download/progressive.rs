@@ -228,17 +228,19 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
         global_stats: Arc<crate::utils::stats::TaskStats>,
         launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
         check_interval: std::time::Duration,
+        start_offset: std::time::Duration,
     ) -> Self {
         let logic = ProgressiveLauncherLogic::new(&config);
         
         info!(
-            "渐进式启动配置: 目标 {} workers, 阶段: {:?}",
+            "渐进式启动配置: 目标 {} workers, 阶段: {:?}, 启动偏移: {:?}",
             config.concurrency().worker_count(),
-            logic.worker_launch_stages
+            logic.worker_launch_stages,
+            start_offset
         );
         
-        let mut check_timer = tokio::time::interval(check_interval);
-        check_timer.tick().await; // 跳过首次立即触发
+        let start_time = tokio::time::Instant::now() + start_offset;
+        let check_timer = tokio::time::interval_at(start_time, check_interval);
         
         Self {
             logic,
@@ -345,6 +347,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
         written_bytes: Arc<AtomicU64>,
         global_stats: Arc<crate::utils::stats::TaskStats>,
         check_interval: std::time::Duration,
+        start_offset: std::time::Duration,
     ) -> Self {
         // 先创建临时逻辑对象获取初始 worker 数量
         let temp_logic = ProgressiveLauncherLogic::new(&config);
@@ -365,6 +368,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
                 global_stats,
                 launch_request_tx,
                 check_interval,
+                start_offset,
             ).await.run().await;
         });
         

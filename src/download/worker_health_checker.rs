@@ -235,12 +235,14 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
         check_interval: std::time::Duration,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
+        start_offset: std::time::Duration,
     ) -> Self {
         let absolute_threshold = config.health_check().absolute_speed_threshold() as f64;
         let logic = WorkerHealthCheckerLogic::new(absolute_threshold, 0.5);
         
-        let mut check_timer = tokio::time::interval(check_interval);
-        check_timer.tick().await; // 跳过首次立即触发
+        debug!("WorkerHealthChecker 启动偏移: {:?}", start_offset);
+        let start_time = tokio::time::Instant::now() + start_offset;
+        let check_timer = tokio::time::interval_at(start_time, check_interval);
         
         Self {
             logic,
@@ -374,6 +376,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
         worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
         check_interval: std::time::Duration,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
+        start_offset: std::time::Duration,
     ) -> Self {
         // 使用有界 channel，容量 10
         let (message_tx, message_rx) = mpsc::channel(10);
@@ -388,6 +391,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
                 cancel_request_tx,
                 check_interval,
                 active_workers,
+                start_offset,
             ).await.run().await;
         });
         

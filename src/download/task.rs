@@ -65,7 +65,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // worker_handles 占位，稍后填充
         let worker_handles = Arc::new(ArcSwap::from_pointee(im::HashMap::new()));
         
-        // 创建渐进式启动管理器（actor 模式）
+        // 基准时间间隔：50ms
+        let base_offset = std::time::Duration::from_millis(50);
+        
+        // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
         let mut progressive_launcher = ProgressiveLauncher::new(
             Arc::clone(&config),
             Arc::clone(&worker_handles),
@@ -73,6 +76,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             writer.written_bytes_ref(),
             Arc::clone(&global_stats),
             config.speed().instant_speed_window(),
+            std::time::Duration::ZERO,
         );
         
         // 取出启动请求接收器
@@ -82,12 +86,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建 active_workers 共享状态（使用 RwLock 确保 TaskAllocator 和 HealthChecker 同步）
         let active_workers = Arc::new(RwLock::new(FxHashSet::default()));
         
-        // 创建健康检查器（actor 模式）
+        // 创建健康检查器（actor 模式） - 偏移 50ms
         let mut health_checker = WorkerHealthChecker::new(
             Arc::clone(&config),
             Arc::clone(&worker_handles),
             config.speed().instant_speed_window(),
             Arc::clone(&active_workers),
+            base_offset,
         );
         
         // 取出取消请求接收器
@@ -126,13 +131,14 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             Arc::clone(&active_workers),
         );
         
-        // 创建进度报告器（使用配置的统计窗口作为更新间隔）
+        // 创建进度报告器（使用配置的统计窗口作为更新间隔） - 偏移 100ms
         let progress_reporter = ProgressReporter::new(
             progress_sender,
             total_size,
             Arc::clone(&worker_handles),
             Arc::clone(&global_stats),
             config.speed().instant_speed_window(),
+            base_offset * 2,
         );
 
         // 注册第一批 workers（会自动触发任务分配）
