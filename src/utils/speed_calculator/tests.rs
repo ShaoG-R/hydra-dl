@@ -1,7 +1,6 @@
 use crate::SpeedConfigBuilder;
 use crate::config::SpeedConfig;
-use crate::utils::ringbuf::Sample;
-use crate::utils::speed_calculator::SpeedCalculator;
+use crate::utils::speed_calculator::{Sample, SpeedCalculator};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -115,8 +114,8 @@ fn test_speed_calculator_from_config() {
     // 实际缓冲区大小 = 50 * 1.2 = 60
     // 但至少需要 MIN_SAMPLES_FOR_REGRESSION * 2 = 6 个采样点
     assert!(calculator.ring_buffer.capacity() >= 6);
-    // 验证新增的字段存在
-    assert_eq!(calculator.ring_buffer.total_written(), 0);
+    // 验证缓冲区为空
+    assert_eq!(calculator.ring_buffer.len(), 0);
 }
 
 #[test]
@@ -138,8 +137,6 @@ fn test_speed_calculator_record_sample_basic() {
     
     // 应该至少有 1 个采样点（第一个）
     assert!(samples.len() >= 1);
-    // 验证 total_written 计数器
-    assert!(calculator.ring_buffer.total_written() >= 1);
 }
 
 #[test]
@@ -157,8 +154,6 @@ fn test_speed_calculator_record_sample_respects_interval() {
     // 读取采样点（应该只有 1 个，因为采样间隔未到）
     let samples = calculator.read_recent_samples();
     assert_eq!(samples.len(), 1);
-    // 验证 total_written 计数器
-    assert_eq!(calculator.ring_buffer.total_written(), 1);
     
     // 等待采样间隔
     thread::sleep(Duration::from_millis(250));
@@ -169,8 +164,6 @@ fn test_speed_calculator_record_sample_respects_interval() {
     // 现在应该有 2 个采样点
     let samples = calculator.read_recent_samples();
     assert_eq!(samples.len(), 2);
-    // 验证 total_written 计数器
-    assert_eq!(calculator.ring_buffer.total_written(), 2);
 }
 
 #[test]
@@ -196,8 +189,6 @@ fn test_speed_calculator_ring_buffer_wrapping() {
     
     // 由于环形缓冲区覆盖，采样点数量不应超过缓冲区大小
     assert!(samples.len() <= calculator.ring_buffer.capacity());
-    // 验证 total_written 计数器
-    assert_eq!(calculator.ring_buffer.total_written(), 20);
     
     // 采样点应该按时间排序
     for i in 1..samples.len() {
@@ -225,9 +216,6 @@ fn test_speed_calculator_read_recent_samples_sorted() {
             "样本 {} 的时间戳 {} 应该大于样本 {} 的时间戳 {}", 
             i, samples[i].0, i - 1, samples[i - 1].0);
     }
-    
-    // 验证 total_written 计数器
-    assert_eq!(calculator.ring_buffer.total_written(), 5);
 }
 
 // ============================================================================

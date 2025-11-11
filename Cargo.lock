@@ -539,6 +539,7 @@ dependencies = [
  "ranged-mmap",
  "reqwest",
  "rustc-hash",
+ "smallring",
  "tempfile",
  "thiserror",
  "tokio",
@@ -829,9 +830,9 @@ dependencies = [
 
 [[package]]
 name = "kestrel-timer"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc6e31eb29784c219b944e2b5df23a49e7896b39697c00f2a6946dbb5b6fc2d6"
+checksum = "08c4837c82e1dd5cd3a42a92564c7c23f2202e5bb44d79d343805ac6b5da9157"
 dependencies = [
  "deferred-map",
  "futures",
@@ -854,9 +855,9 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "lite-sync"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96312bdc603ca354f9453b61ac102e166a0ceadfae1b05fb27e359c4f551059b"
+checksum = "309a8841bcd912729bf10ac545ab5b6690c38b3a7df52523027fda5b63b7e2f4"
 dependencies = [
  "crossbeam-queue",
  "smallring",
@@ -1383,9 +1384,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "smallring"
-version = "0.1.1"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40d1041d947bb4c4e29fc20269dc212123ea85e8c4d3526a338ddf54045ba985"
+checksum = "af9ca9ce61f7f2bf0f112009014f2e61c3b79e284026fe8a656b81b8d7f1f6ac"
 
 [[package]]
 name = "smallvec"

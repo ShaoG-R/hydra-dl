@@ -4,8 +4,130 @@ mod tests;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use portable_atomic::AtomicU128;
+use smallring::atomic::{AtomicRingBuf, AtomicElement};
 
-use super::ringbuf::RingBuffer;
+/// 采样点数据
+///
+/// 使用 128 位原子类型存储时间戳和字节数，确保原子化读写。
+///
+/// # 数据布局
+///
+/// - 高 64 位：时间戳（纳秒）
+/// - 低 64 位：字节数
+#[derive(Debug)]
+pub(crate) struct Sample {
+    /// 打包的数据：高 64 位为时间戳，低 64 位为字节数
+    data: AtomicU128,
+}
+
+impl Default for Sample {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sample {
+    /// 创建新的采样点（初始值为 0）
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            data: AtomicU128::new(0),
+        }
+    }
+
+    /// 读取采样点数据（原子化读取）
+    ///
+    /// # Returns
+    ///
+    /// `Option<(时间戳纳秒, 字节数)>`，如果时间戳为 0 则返回 None
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn read(&self) -> Option<(u64, u64)> {
+        let packed = self.data.load(Ordering::Acquire);
+
+        // 解包：高 64 位是时间戳，低 64 位是字节数
+        let timestamp_ns = (packed >> 64) as u64;
+        let bytes = packed as u64;
+
+        if timestamp_ns == 0 {
+            return None;
+        }
+
+        Some((timestamp_ns, bytes))
+    }
+
+    /// 写入采样点数据（原子化写入）
+    #[inline]
+    pub(crate) fn write(&self, timestamp_ns: u64, bytes: u64) {
+        // 打包：高 64 位是时间戳，低 64 位是字节数
+        let packed = ((timestamp_ns as u128) << 64) | (bytes as u128);
+        self.data.store(packed, Ordering::Release);
+    }
+}
+
+/// 为 Sample 实现 AtomicElement trait
+/// 
+/// 这允许 Sample 直接用于 AtomicRingBuf，而不需要额外的包装
+impl AtomicElement for Sample {
+    type Primitive = (u64, u64);
+    
+    #[inline]
+    fn new(val: Self::Primitive) -> Self {
+        let sample = Self::default();
+        sample.write(val.0, val.1);
+        sample
+    }
+    
+    #[inline]
+    fn load(&self, order: Ordering) -> Self::Primitive {
+        let packed = self.data.load(order);
+        let timestamp_ns = (packed >> 64) as u64;
+        let bytes = packed as u64;
+        (timestamp_ns, bytes)
+    }
+    
+    #[inline]
+    fn store(&self, val: Self::Primitive, order: Ordering) {
+        let packed = ((val.0 as u128) << 64) | (val.1 as u128);
+        self.data.store(packed, order);
+    }
+    
+    #[inline]
+    fn swap(&self, val: Self::Primitive, order: Ordering) -> Self::Primitive {
+        let new_packed = ((val.0 as u128) << 64) | (val.1 as u128);
+        let old_packed = self.data.swap(new_packed, order);
+        let timestamp_ns = (old_packed >> 64) as u64;
+        let bytes = old_packed as u64;
+        (timestamp_ns, bytes)
+    }
+    
+    #[inline]
+    fn compare_exchange(
+        &self,
+        current: Self::Primitive,
+        new: Self::Primitive,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Self::Primitive, Self::Primitive> {
+        let current_packed = ((current.0 as u128) << 64) | (current.1 as u128);
+        let new_packed = ((new.0 as u128) << 64) | (new.1 as u128);
+        
+        match self.data.compare_exchange(current_packed, new_packed, success, failure) {
+            Ok(old_packed) => {
+                let timestamp_ns = (old_packed >> 64) as u64;
+                let bytes = old_packed as u64;
+                Ok((timestamp_ns, bytes))
+            }
+            Err(old_packed) => {
+                let timestamp_ns = (old_packed >> 64) as u64;
+                let bytes = old_packed as u64;
+                Err((timestamp_ns, bytes))
+            }
+        }
+    }
+}
 
 /// 线性回归所需的最小采样点数
 const MIN_SAMPLES_FOR_REGRESSION: usize = 3;
@@ -43,7 +165,7 @@ const MIN_SAMPLES_FOR_REGRESSION: usize = 3;
 #[derive(Debug)]
 pub(crate) struct SpeedCalculator {
     /// 环形缓冲区，存储最近的采样点
-    ring_buffer: RingBuffer<64>,
+    ring_buffer: AtomicRingBuf<Sample, 64, true>,
     /// 线性回归所需的最小采样点数
     min_samples_for_regression: usize,
     /// 瞬时速度的时间窗口
@@ -100,7 +222,7 @@ impl SpeedCalculator {
             .max(MIN_SAMPLES_FOR_REGRESSION * 2);
         
         // 创建环形缓冲区
-        let ring_buffer = RingBuffer::new(buffer_size);
+        let ring_buffer = AtomicRingBuf::new(buffer_size);
         
         Self {
             ring_buffer,
@@ -151,7 +273,7 @@ impl SpeedCalculator {
                 Ordering::Relaxed
             ).is_ok() {
                 // 成功获取采样权限，记录采样点
-                self.ring_buffer.push(timestamp_ns, current_bytes);
+                let _ = self.ring_buffer.push((timestamp_ns, current_bytes), Ordering::Relaxed);
             }
         }
     }
@@ -165,15 +287,22 @@ impl SpeedCalculator {
     /// 
     /// `Vec<(时间戳秒, 字节数)>`
     fn read_recent_samples(&self) -> Vec<(f64, f64)> {
-        // 从环形缓冲区读取所有有效采样点
-        self.ring_buffer
-            .read_all()
+        // 使用 read_all 方法从环形缓冲区读取所有采样点
+        let all_samples = self.ring_buffer.read_all(Ordering::Acquire);
+        
+        // 转换为 (时间戳秒, 字节数) 格式，并过滤掉时间戳为 0 的采样点
+        let mut samples: Vec<(f64, f64)> = all_samples
             .into_iter()
             .map(|(timestamp_ns, bytes)| {
                 let timestamp_secs = timestamp_ns as f64 / 1_000_000_000.0;
                 (timestamp_secs, bytes as f64)
             })
-            .collect()
+            .filter(|(timestamp_secs, _)| *timestamp_secs > 0.0)
+            .collect();
+        
+        // 按时间戳排序（从旧到新）
+        samples.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        samples
     }
     
     /// 使用最小二乘法线性回归计算速度
