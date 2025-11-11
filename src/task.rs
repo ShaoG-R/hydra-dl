@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use ranged_mmap::AllocatedRange;
+use lite_sync::oneshot::lite;
 
 /// 完整文件下载任务
 #[derive(Debug, Clone)]
@@ -24,7 +25,7 @@ pub(crate) enum WorkerTask {
         /// 取消信号接收器
         /// 
         /// 当接收到信号时，worker 将中止当前下载任务
-        cancel_rx: tokio::sync::oneshot::Receiver<()>,
+        cancel_rx: lite::Receiver<()>,
     },
 }
 

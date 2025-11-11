@@ -21,6 +21,8 @@ use crate::utils::{
 };
 use async_trait::async_trait;
 use log::{debug, error, info};
+use lite_sync::oneshot::lite;
+
 use std::sync::Arc;
 
 // ==================== Task 和 Result 实现 ====================
@@ -123,7 +125,7 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         url: &str,
         range: &ranged_mmap::AllocatedRange,
         stats: &WorkerStats,
-        cancel_rx: tokio::sync::oneshot::Receiver<()>,
+        cancel_rx: lite::Receiver<()>,
     ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
         use crate::utils::fetch::FetchRange;
         let fetch_range = FetchRange::from_allocated_range(range)
@@ -626,7 +628,7 @@ mod tests {
         };
 
         // 执行任务
-        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (_cancel_tx, cancel_rx) = lite::channel();
         let task = RangeTask::Range {
             url: test_url.to_string(),
             range,
@@ -687,7 +689,7 @@ mod tests {
             chunk_strategy,
         };
 
-        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (_cancel_tx, cancel_rx) = lite::channel();
         let task = RangeTask::Range {
             url: test_url.to_string(),
             range,

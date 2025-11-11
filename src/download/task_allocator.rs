@@ -17,6 +17,7 @@ use crate::pool::download::DownloadWorkerHandle;
 use crate::utils::io_traits::HttpClient;
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
+use lite_sync::oneshot::lite;
 
 /// 失败的 Range 信息
 pub(super) type FailedRange = (AllocatedRange, String);
@@ -49,12 +50,12 @@ pub(super) struct AllocatedTask {
     /// 分配到的 worker ID
     worker_id: u64,
     /// 取消信号发送器
-    cancel_tx: tokio::sync::oneshot::Sender<()>,
+    cancel_tx: lite::Sender<()>,
 }
 
 impl AllocatedTask {
     /// 解构为独立部分
-    pub(super) fn into_parts(self) -> (WorkerTask, u64, tokio::sync::oneshot::Sender<()>) {
+    pub(super) fn into_parts(self) -> (WorkerTask, u64, lite::Sender<()>) {
         (self.task, self.worker_id, self.cancel_tx)
     }
 }
@@ -120,7 +121,7 @@ impl TaskAllocatorState {
             );
             
             // 创建取消通道
-            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            let (cancel_tx, cancel_rx) = lite::channel();
             
             let task = WorkerTask::Range {
                 url: self.url.clone(),
@@ -151,7 +152,7 @@ impl TaskAllocatorState {
         let range = self.allocator.allocate(NonZeroU64::new(alloc_size).unwrap()).ok()?;
         
         // 创建取消通道
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = lite::channel();
         
         // 创建任务（首次分配，重试次数为 0）
         let task = WorkerTask::Range {
@@ -286,7 +287,7 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
     /// Worker 句柄映射
     worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
     /// 任务取消 sender 映射
-    cancel_senders: FxHashMap<u64, oneshot::Sender<()>>,
+    cancel_senders: FxHashMap<u64, lite::Sender<()>>,
     /// 活跃 worker 集合（与 WorkerHealthChecker 共享）
     active_workers: Arc<RwLock<FxHashSet<u64>>>,
     /// 完成通知发送器（当所有任务完成时发送）
@@ -342,7 +343,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         &mut self,
         worker_id: u64,
         task: WorkerTask,
-        cancel_tx: oneshot::Sender<()>,
+        cancel_tx: lite::Sender<()>,
     ) -> bool {
         if let Some(handle) = self.worker_handles.load().get(&worker_id) {
             if let Err(e) = handle.send_task(task).await {
@@ -361,7 +362,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
     }
     
     /// 从失败任务信息创建 WorkerTask
-    fn create_retry_task(&self, info: &FailedTaskInfo, cancel_rx: oneshot::Receiver<()>) -> WorkerTask {
+    fn create_retry_task(&self, info: &FailedTaskInfo, cancel_rx: lite::Receiver<()>) -> WorkerTask {
         WorkerTask::Range {
             url: self.state.url().to_string(),
             range: info.range.clone(),
@@ -470,7 +471,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
 
         // 尝试分配给空闲 worker
         if let Some(worker_id) = self.state.idle_workers.pop_front() {
-            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let (cancel_tx, cancel_rx) = lite::channel();
             let task = self.create_retry_task(&info, cancel_rx);
             
             if !self.send_task_to_worker(worker_id, task, cancel_tx).await {
@@ -545,7 +546,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         info!("收到 Worker #{} 取消请求: {}", worker_id, reason);
         
         if let Some(cancel_tx) = self.cancel_senders.remove(&worker_id) {
-            let _ = cancel_tx.send(());
+            let _ = cancel_tx.notify(());
             self.active_workers.write().remove(&worker_id);
             info!("已取消 Worker #{} 的任务", worker_id);
         }

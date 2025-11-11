@@ -4,6 +4,7 @@ use log::{debug, info};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ranged_mmap::AllocatedRange;
+use lite_sync::oneshot::lite;
 
 use crate::utils::io_traits::{HttpClient, HttpResponse, IoError};
 use crate::task::FileTask;
@@ -438,7 +439,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     /// - `Cancelled { data, bytes_downloaded }`: 下载被取消，包含已下载的部分数据和已下载的字节数
     pub async fn fetch_with_cancel(
         self,
-        cancel_rx: tokio::sync::oneshot::Receiver<()>,
+        cancel_rx: lite::Receiver<()>,
     ) -> Result<FetchRangeResult> {
         let (http_start, http_end) = self.range.as_http_range();
         debug!(
@@ -479,7 +480,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     async fn download_stream_with_cancel<S>(
         &self,
         mut stream: S,
-        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+        mut cancel_rx: lite::Receiver<()>,
     ) -> Result<FetchRangeResult>
     where
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
@@ -892,7 +893,7 @@ mod tests {
         );
 
         // 创建一个永远不会发送的取消信号
-        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (_cancel_tx, cancel_rx) = lite::channel();
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
@@ -943,7 +944,7 @@ mod tests {
         );
 
         // 创建取消通道（虽然不会用到）
-        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (_cancel_tx, cancel_rx) = lite::channel();
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
@@ -1064,7 +1065,7 @@ mod tests {
         );
 
         // 创建取消通道（不发送取消信号）
-        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (_cancel_tx, cancel_rx) = lite::channel();
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
@@ -1120,12 +1121,12 @@ mod tests {
         );
 
         // 创建取消通道，在稍后发送取消信号
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = lite::channel();
         
         tokio::spawn(async move {
             // 给予一点时间让下载开始
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _ = cancel_tx.send(());
+            let _ = cancel_tx.notify(());
         });
 
         // 执行下载
@@ -1180,8 +1181,8 @@ mod tests {
         );
 
         // 立即发送取消信号
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let _ = cancel_tx.send(()); // 立即取消
+        let (cancel_tx, cancel_rx) = lite::channel();
+        let _ = cancel_tx.notify(()); // 立即取消
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
