@@ -556,4 +556,14 @@ impl SpeedCalculator {
         
         (acceleration, valid)
     }
+    
+    /// 获取下载开始时间
+    /// 
+    /// # Returns
+    /// 
+    /// `Option<Instant>` - 下载开始时间，如果尚未初始化则返回 None
+    #[inline]
+    pub(crate) fn get_start_time(&self) -> Option<Instant> {
+        self.start_time.get().copied()
+    }
 }

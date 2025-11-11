@@ -35,9 +35,7 @@ pub(crate) struct StatsAggregator {
     total_bytes: AtomicU64,
     /// 完成的 range 数量（原子操作，无锁）
     completed_ranges: AtomicUsize,
-    /// 下载开始时间（只初始化一次）
-    start_time: OnceLock<Instant>,
-    /// 速度计算器（管理瞬时速度和窗口平均速度的采样点）
+    /// 速度计算器（管理瞬时速度、窗口平均速度的采样点和开始时间）
     speed_calculator: SpeedCalculator,
 }
 
@@ -52,13 +50,10 @@ impl StatsAggregator {
     /// * `bytes` - 本次下载的字节数
     #[inline]
     pub(crate) fn record_chunk(&self, bytes: u64) {
-        // 第一个 chunk 到达时初始化开始时间
-        self.start_time.get_or_init(Instant::now);
-        
         // 原子增加字节数（使用 Relaxed 顺序，性能最佳）
         let current_total = self.total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         
-        // 自动采样逻辑由 SpeedCalculator 内部处理
+        // 自动采样逻辑由 SpeedCalculator 内部处理（包括初始化开始时间）
         self.speed_calculator.record_sample(current_total);
     }
 
@@ -551,7 +546,6 @@ impl TaskStats {
             aggregator: Arc::new(StatsAggregator {
                 total_bytes: AtomicU64::new(0),
                 completed_ranges: AtomicUsize::new(0),
-                start_time: OnceLock::new(),
                 speed_calculator: SpeedCalculator::from_config(config),
             }),
             speed_config: config.clone(),
@@ -605,8 +599,7 @@ impl TaskStats {
     pub(crate) fn get_summary(&self) -> (u64, f64, usize) {
         let bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
         let ranges = self.aggregator.completed_ranges.load(Ordering::Relaxed);
-        let elapsed_secs = self.aggregator.start_time
-            .get()
+        let elapsed_secs = self.aggregator.speed_calculator.get_start_time()
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0);
         (bytes, elapsed_secs, ranges)
@@ -624,7 +617,7 @@ impl TaskStats {
     /// ```
     #[inline]
     pub(crate) fn get_speed(&self) -> f64 {
-        if let Some(start_time) = self.aggregator.start_time.get() {
+        if let Some(start_time) = self.aggregator.speed_calculator.get_start_time() {
             let elapsed_secs = start_time.elapsed().as_secs_f64();
             if elapsed_secs > 0.0 {
                 let bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
@@ -699,8 +692,7 @@ impl TaskStats {
     pub(crate) fn get_full_summary(&self) -> StatsSummary {
         let total_bytes = self.aggregator.total_bytes.load(Ordering::Relaxed);
         let completed_ranges = self.aggregator.completed_ranges.load(Ordering::Relaxed);
-        let elapsed_secs = self.aggregator.start_time
-            .get()
+        let elapsed_secs = self.aggregator.speed_calculator.get_start_time()
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0);
         let avg_speed = self.get_speed();

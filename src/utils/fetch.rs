@@ -6,6 +6,7 @@ use thiserror::Error;
 use ranged_mmap::AllocatedRange;
 use lite_sync::oneshot::lite;
 
+use crate::constants::KB;
 use crate::utils::io_traits::{HttpClient, HttpResponse, IoError};
 use crate::task::FileTask;
 use crate::utils::stats::WorkerStats;
@@ -486,11 +487,18 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
     {
         let expected_size = self.range.len();
-        let mut chunks = Vec::new();
+        
+        // 性能优化 1: Vec 容量预分配
+        // 典型 HTTP chunk 大小为 8KB-64KB，这里使用 16KB 作为保守估计
+        // 预分配可以避免多次 realloc 和数据移动
+        let estimated_chunks = ((expected_size + 16 * KB - 1) / (16 * KB)).max(4) as usize;
+        let mut chunks = Vec::with_capacity(estimated_chunks);
         let mut downloaded_bytes = 0u64;
         
         loop {
+            // 性能优化 4: biased select - 优先检查数据流（热路径）
             tokio::select! {
+                biased;
                 chunk_result = stream.next() => {
                     match chunk_result {
                         Some(chunk) => {
@@ -530,27 +538,32 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     
     /// 合并多个 Bytes chunk 为单个 Bytes
     /// 
-    /// 避免逐个复制，直接分配合适大小的缓冲区后一次性复制
+    /// 性能优化：
+    /// - 零拷贝：单个 chunk 直接返回
+    /// - 预分配：精确分配总大小，避免重新分配
+    /// - 批量复制：一次性合并所有数据
     #[inline]
     fn merge_chunks(&self, chunks: Vec<Bytes>) -> Bytes {
-        if chunks.is_empty() {
-            return Bytes::new();
+        match chunks.len() {
+            0 => Bytes::new(),
+            1 => {
+                // 性能优化 2: 单 chunk 零拷贝快速路径
+                // SAFETY: 已确认 len == 1
+                unsafe { chunks.into_iter().next().unwrap_unchecked() }
+            }
+            _ => {
+                // 性能优化 2: 精确预分配并批量复制
+                let total_size: usize = chunks.iter().map(|c| c.len()).sum();
+                let mut buffer = BytesMut::with_capacity(total_size);
+                
+                // 编译器可能会向量化这个循环
+                for chunk in chunks {
+                    buffer.extend_from_slice(&chunk);
+                }
+                
+                buffer.freeze()
+            }
         }
-        
-        if chunks.len() == 1 {
-            return chunks.into_iter().next().unwrap();
-        }
-        
-        // 计算总大小
-        let total_size: usize = chunks.iter().map(|c| c.len()).sum();
-        
-        // 一次性分配缓冲区并复制
-        let mut buffer = BytesMut::with_capacity(total_size);
-        for chunk in chunks {
-            buffer.extend_from_slice(&chunk);
-        }
-        
-        buffer.freeze()
     }
 }
 
