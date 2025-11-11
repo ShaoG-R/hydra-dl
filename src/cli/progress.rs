@@ -85,6 +85,7 @@ impl ProgressManager {
                 total_size,
                 percentage: _,
                 instant_speed,
+                instant_acceleration,
                 worker_stats,
                 ..
             } => {
@@ -96,7 +97,43 @@ impl ProgressManager {
                     let speed_display = format_speed(instant);
                     let eta_display = if instant > 0.0 {
                         let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded) as f64;
-                        let eta_secs = remaining_bytes / instant;
+                        
+                        // 使用加速度改进 ETA 预测
+                        let eta_secs = if let Some(accel) = instant_acceleration {
+                            // 如果有加速度信息，使用二次运动方程预测
+                            // s = v*t + 0.5*a*t²
+                            // 0.5*a*t² + v*t - s = 0
+                            // 使用求根公式
+                            if accel.abs() > 0.1 {
+                                let a = 0.5 * accel;
+                                let b = instant;
+                                let c = -remaining_bytes;
+                                let discriminant = b * b - 4.0 * a * c;
+                                
+                                if discriminant >= 0.0 && a.abs() > 1e-9 {
+                                    let t1 = (-b + discriminant.sqrt()) / (2.0 * a);
+                                    let t2 = (-b - discriminant.sqrt()) / (2.0 * a);
+                                    // 取正的较小根
+                                    let t = if t1 > 0.0 && t2 > 0.0 {
+                                        t1.min(t2)
+                                    } else if t1 > 0.0 {
+                                        t1
+                                    } else if t2 > 0.0 {
+                                        t2
+                                    } else {
+                                        remaining_bytes / instant  // 降级为线性预测
+                                    };
+                                    t
+                                } else {
+                                    remaining_bytes / instant  // 降级为线性预测
+                                }
+                            } else {
+                                remaining_bytes / instant  // 加速度太小，使用线性预测
+                            }
+                        } else {
+                            remaining_bytes / instant  // 无加速度信息，使用线性预测
+                        };
+                        
                         format!(", ETA: {}", format_duration(eta_secs))
                     } else {
                         String::new()
@@ -153,12 +190,25 @@ impl ProgressManager {
                                 String::new()
                             };
                             
+                            let accel_str = if let Some(accel) = stats.instant_acceleration {
+                                if accel > 0.0 {
+                                    format!(" ↑{:.0}B/s²", accel)
+                                } else if accel < 0.0 {
+                                    format!(" ↓{:.0}B/s²", accel.abs())
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            };
+                            
                             worker_bar.set_message(format!(
-                                "{}, {} ranges, 分块: {}{}",
+                                "{}, {} ranges, 分块: {}{}{}",
                                 format_bytes(stats.bytes),
                                 stats.ranges,
                                 format_bytes(stats.current_chunk_size),
-                                instant_str
+                                instant_str,
+                                accel_str
                             ));
                         }
                     }

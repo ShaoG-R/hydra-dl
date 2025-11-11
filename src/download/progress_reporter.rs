@@ -24,6 +24,8 @@ pub struct WorkerStatSnapshot {
     pub instant_speed: Option<f64>,
     /// 该 worker 当前的分块大小 (bytes)
     pub current_chunk_size: u64,
+    /// 该 worker 实时加速度 (bytes/s²)，如果无效则为 None
+    pub instant_acceleration: Option<f64>,
 }
 
 /// 下载进度更新信息
@@ -52,6 +54,8 @@ pub enum DownloadProgress {
         instant_speed: Option<f64>,
         /// 窗口平均速度 (bytes/s)，如果无效则为 None
         window_avg_speed: Option<f64>,
+        /// 实时加速度 (bytes/s²)，如果无效则为 None
+        instant_acceleration: Option<f64>,
         /// 所有 worker 的统计信息（包含各自的分块大小）
         worker_stats: Vec<WorkerStatSnapshot>,
     },
@@ -192,6 +196,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
             let stats = handle.stats();
             let summary = stats.get_full_summary();
             let current_chunk_size = stats.get_current_chunk_size();
+            let (instant_acceleration, accel_valid) = stats.get_instant_acceleration();
             
             WorkerStatSnapshot {
                 worker_id: *worker_id,
@@ -200,6 +205,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
                 avg_speed: summary.avg_speed,
                 instant_speed: summary.instant_speed,
                 current_chunk_size,
+                instant_acceleration: if accel_valid { Some(instant_acceleration) } else { None },
             }
         }).collect()
     }
@@ -227,6 +233,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
                 avg_speed: summary.avg_speed,
                 instant_speed: summary.instant_speed,
                 window_avg_speed: summary.window_avg_speed,
+                instant_acceleration: summary.instant_acceleration,
                 worker_stats: workers_snapshots,
             }).await;
         }

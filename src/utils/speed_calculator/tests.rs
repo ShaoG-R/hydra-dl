@@ -125,97 +125,6 @@ fn test_speed_calculator_read_recent_samples_sorted() {
 }
 
 // ============================================================================
-// 线性回归测试
-// ============================================================================
-
-#[test]
-fn test_linear_regression_insufficient_samples() {
-    let config = SpeedConfigBuilder::new().build();
-    let calculator = SpeedCalculator::from_config(&config);
-    
-    // 没有采样点
-    let samples = vec![];
-    let speed = calculator.linear_regression(&samples);
-    assert_eq!(speed, 0.0);
-    
-    // 只有 1 个采样点
-    let samples = vec![(1.0, 1024.0)];
-    let speed = calculator.linear_regression(&samples);
-    assert_eq!(speed, 0.0);
-}
-
-#[test]
-fn test_linear_regression_two_samples() {
-    let config = SpeedConfig::default();
-    let calculator = SpeedCalculator::from_config(&config);
-    
-    // 2 个采样点（降级为平均速度）
-    // t=0s, bytes=0; t=1s, bytes=1024
-    // 速度 = (1024 - 0) / (1.0 - 0.0) = 1024 bytes/s
-    let samples = vec![
-        (0.0, 0.0),
-        (1.0, 1024.0),
-    ];
-    let speed = calculator.linear_regression(&samples);
-    assert_eq!(speed, 1024.0);
-}
-
-#[test]
-fn test_linear_regression_perfect_linear() {
-    let config = SpeedConfig::default();
-    let calculator = SpeedCalculator::from_config(&config);
-    
-    // 完美线性关系：速度恒定为 1024 bytes/s
-    let samples = vec![
-        (0.0, 0.0),
-        (1.0, 1024.0),
-        (2.0, 2048.0),
-        (3.0, 3072.0),
-        (4.0, 4096.0),
-    ];
-    let speed = calculator.linear_regression(&samples);
-    
-    // 速度应该接近 1024.0
-    assert!((speed - 1024.0).abs() < 0.1);
-}
-
-#[test]
-fn test_linear_regression_with_noise() {
-    let config = SpeedConfig::default();
-    let calculator = SpeedCalculator::from_config(&config);
-    
-    // 带噪声的线性关系（平均速度约 1024 bytes/s）
-    let samples = vec![
-        (0.0, 0.0),
-        (1.0, 1000.0),
-        (2.0, 2100.0),
-        (3.0, 2950.0),
-        (4.0, 4200.0),
-    ];
-    let speed = calculator.linear_regression(&samples);
-    
-    // 速度应该接近 1024.0（允许一定误差）
-    assert!((speed - 1024.0).abs() < 100.0);
-}
-
-#[test]
-fn test_linear_regression_zero_variance() {
-    let config = SpeedConfig::default();
-    let calculator = SpeedCalculator::from_config(&config);
-    
-    // 所有采样点时间戳相同（方差为 0）
-    let samples = vec![
-        (1.0, 0.0),
-        (1.0, 1024.0),
-        (1.0, 2048.0),
-    ];
-    let speed = calculator.linear_regression(&samples);
-    
-    // 方差为 0 时应该返回 0
-    assert_eq!(speed, 0.0);
-}
-
-// ============================================================================
 // 速度计算测试
 // ============================================================================
 
@@ -569,6 +478,154 @@ fn test_sample_interval_enforcement() {
     let samples = calculator.read_recent_samples();
     assert_eq!(samples.len(), 2);
 }
+
+// 鲁棒回归测试（Theil-Sen 估计器）
+// ============================================================================
+
+#[test]
+fn test_theil_sen_perfect_linear() {
+    let config = SpeedConfig::default();
+    let calculator = SpeedCalculator::from_config(&config);
+    
+    // 完美线性关系：速度恒定为 1024 bytes/s
+    // 时间戳以纳秒为单位
+    let samples = vec![
+        (0i128, 0u64),
+        (1_000_000_000i128, 1024u64),
+        (2_000_000_000i128, 2048u64),
+        (3_000_000_000i128, 3072u64),
+        (4_000_000_000i128, 4096u64),
+    ];
+    let speed = calculator.theil_sen_regression(&samples);
+    
+    // 速度应该接近 1024.0
+    assert!((speed - 1024.0).abs() < 0.1);
+}
+
+
+// ============================================================================
+// 加速度计算测试
+// ============================================================================
+
+#[test]
+fn test_calculate_acceleration_constant_speed() {
+    let config = SpeedConfig::default();
+    let calculator = SpeedCalculator::from_config(&config);
+    
+    // 恒定速度：加速度应该为 0
+    let samples = vec![
+        (0i128, 0u64),
+        (1_000_000_000i128, 1024u64),
+        (2_000_000_000i128, 2048u64),
+        (3_000_000_000i128, 3072u64),
+        (4_000_000_000i128, 4096u64),
+    ];
+    
+    let acceleration = calculator.calculate_acceleration(&samples);
+    
+    // 加速度应该接近 0（恒定速度）
+    assert!(acceleration.abs() < 10.0);
+}
+
+#[test]
+fn test_calculate_acceleration_accelerating() {
+    let config = SpeedConfig::default();
+    let calculator = SpeedCalculator::from_config(&config);
+    
+    // 加速：速度从 512 bytes/s 增加到 1536 bytes/s
+    let samples = vec![
+        (0i128, 0u64),
+        (1_000_000_000i128, 512u64),
+        (2_000_000_000i128, 1024u64),
+        (3_000_000_000i128, 1536u64),
+        (4_000_000_000i128, 2048u64),
+    ];
+    
+    let acceleration = calculator.calculate_acceleration(&samples);
+    
+    // 加速度应该为正
+    assert!(acceleration > 0.0);
+}
+
+#[test]
+fn test_calculate_acceleration_decelerating() {
+    let config = SpeedConfig::default();
+    let calculator = SpeedCalculator::from_config(&config);
+    
+    // 减速：速度从 1536 bytes/s 减少到 512 bytes/s
+    let samples = vec![
+        (0i128, 0u64),
+        (1_000_000_000i128, 1536u64),
+        (2_000_000_000i128, 2048u64),
+        (3_000_000_000i128, 2560u64),
+        (4_000_000_000i128, 3072u64),
+    ];
+    
+    let acceleration = calculator.calculate_acceleration(&samples);
+    
+    // 加速度应该为负
+    assert!(acceleration < 0.0);
+}
+
+#[test]
+fn test_calculate_acceleration_insufficient_samples() {
+    let config = SpeedConfig::default();
+    let calculator = SpeedCalculator::from_config(&config);
+    
+    // 只有 3 个采样点（需要至少 4 个）
+    let samples = vec![
+        (0i128, 0u64),
+        (1_000_000_000i128, 1024u64),
+        (2_000_000_000i128, 2048u64),
+    ];
+    
+    let acceleration = calculator.calculate_acceleration(&samples);
+    
+    // 应该返回 0
+    assert_eq!(acceleration, 0.0);
+}
+
+#[test]
+fn test_theil_sen_multiple_outliers() {
+    let config = SpeedConfig::default();
+    let calculator = SpeedCalculator::from_config(&config);
+    
+    // 包含多个异常值的数据（最多 50% 异常值）
+    let samples = vec![
+        (0i128, 0u64),
+        (1_000_000_000i128, 1024u64),
+        (2_000_000_000i128, 2048u64),
+        (3_000_000_000i128, 3072u64),
+        (4_000_000_000i128, 4096u64),
+        (5_000_000_000i128, 15000u64),  // 异常值
+        (6_000_000_000i128, 6144u64),
+        (7_000_000_000i128, 7168u64),
+        (8_000_000_000i128, 20000u64),  // 异常值
+        (9_000_000_000i128, 9216u64),
+    ];
+    
+    let theil_sen_speed = calculator.theil_sen_regression(&samples);
+    
+    // 速度应该接近 1024（即使有 20% 的异常值）
+    assert!((theil_sen_speed - 1024.0).abs() < 200.0);
+}
+
+#[test]
+fn test_theil_sen_insufficient_samples() {
+    let config = SpeedConfig::default();
+    let calculator = SpeedCalculator::from_config(&config);
+    
+    // 只有 2 个采样点
+    let samples = vec![
+        (0i128, 0u64),
+        (1_000_000_000i128, 1024u64),
+    ];
+    let speed = calculator.theil_sen_regression(&samples);
+    
+    // 应该降级为平均速度
+    assert_eq!(speed, 1024.0);
+}
+
 
 // ============================================================================
 // 配置测试
