@@ -29,7 +29,7 @@ portable-atomic = "1.11.1"
 kestrel-timer = "0.3.3"
 ranged-mmap = "0.1.2"
 deferred-map = "0.1.2"
-smallring = "0.1.4"
+smallring = "0.1.6"
 
 [dev-dependencies]
 tempfile = "3.23.0"

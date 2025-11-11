@@ -1384,9 +1384,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "smallring"
-version = "0.1.4"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af9ca9ce61f7f2bf0f112009014f2e61c3b79e284026fe8a656b81b8d7f1f6ac"
+checksum = "a40108ac1c3c26e8b41c333dee7167876c76ea06816f31164dc86337cb26db71"
 
 [[package]]
 name = "smallvec"

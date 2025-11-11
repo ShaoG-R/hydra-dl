@@ -1,11 +1,64 @@
 #[cfg(test)]
 mod tests;
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use portable_atomic::AtomicU128;
 use smallring::atomic::{AtomicRingBuf, AtomicElement};
+
+#[derive(Clone, Copy)]
+pub struct Sample {
+    timestamp_ns: NonZeroU64,
+    bytes: u64,
+}
+
+impl Sample {
+    /// 创建采样点
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_ns` - 时间戳（纳秒）
+    /// * `bytes` - 字节数
+    ///
+    /// # Returns
+    ///
+    /// `Sample` - 创建的采样点
+    #[inline]
+    pub fn new(timestamp_ns: u64, bytes: u64) -> Self {
+        let timestamp_ns = unsafe {
+            NonZeroU64::new(timestamp_ns).unwrap_or(NonZeroU64::new_unchecked(1))
+        };
+        Self { timestamp_ns, bytes }
+    }
+
+    /// 从打包的 u128 数据创建采样点
+    ///
+    /// # Arguments
+    ///
+    /// * `packed` - 打包的 u128 数据
+    ///
+    /// # Returns
+    ///
+    /// `Sample` - 解包后的采样点
+    #[inline]
+    pub fn from_u128(packed: u128) -> Self {
+        Self::new((packed >> 64) as u64, packed as u64)
+    }
+
+    /// 将采样点转换为打包的 u128 数据
+    ///
+    /// # Returns
+    ///
+    /// `u128` - 打包后的 u128 数据
+    #[inline]
+    pub fn into_u128(self) -> u128 {
+        ((self.timestamp_ns.get() as u128) << 64) | (self.bytes as u128)
+    }
+
+}
+
 
 /// 采样点数据
 ///
@@ -16,116 +69,34 @@ use smallring::atomic::{AtomicRingBuf, AtomicElement};
 /// - 高 64 位：时间戳（纳秒）
 /// - 低 64 位：字节数
 #[derive(Debug)]
-pub(crate) struct Sample {
+pub(crate) struct SampleRaw {
     /// 打包的数据：高 64 位为时间戳，低 64 位为字节数
     data: AtomicU128,
 }
 
-impl Default for Sample {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Sample {
-    /// 创建新的采样点（初始值为 0）
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            data: AtomicU128::new(0),
-        }
-    }
-
-    /// 读取采样点数据（原子化读取）
-    ///
-    /// # Returns
-    ///
-    /// `Option<(时间戳纳秒, 字节数)>`，如果时间戳为 0 则返回 None
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn read(&self) -> Option<(u64, u64)> {
-        let packed = self.data.load(Ordering::Acquire);
-
-        // 解包：高 64 位是时间戳，低 64 位是字节数
-        let timestamp_ns = (packed >> 64) as u64;
-        let bytes = packed as u64;
-
-        if timestamp_ns == 0 {
-            return None;
-        }
-
-        Some((timestamp_ns, bytes))
-    }
-
-    /// 写入采样点数据（原子化写入）
-    #[inline]
-    pub(crate) fn write(&self, timestamp_ns: u64, bytes: u64) {
-        // 打包：高 64 位是时间戳，低 64 位是字节数
-        let packed = ((timestamp_ns as u128) << 64) | (bytes as u128);
-        self.data.store(packed, Ordering::Release);
-    }
-}
-
-/// 为 Sample 实现 AtomicElement trait
+/// 为 SampleRaw 实现 AtomicElement trait
 /// 
-/// 这允许 Sample 直接用于 AtomicRingBuf，而不需要额外的包装
-impl AtomicElement for Sample {
-    type Primitive = (u64, u64);
-    
-    #[inline]
-    fn new(val: Self::Primitive) -> Self {
-        let sample = Self::default();
-        sample.write(val.0, val.1);
-        sample
-    }
+/// 这允许 SampleRaw 直接用于 AtomicRingBuf，而不需要额外的包装
+impl AtomicElement for SampleRaw {
+    type Primitive = Sample;
     
     #[inline]
     fn load(&self, order: Ordering) -> Self::Primitive {
         let packed = self.data.load(order);
-        let timestamp_ns = (packed >> 64) as u64;
-        let bytes = packed as u64;
-        (timestamp_ns, bytes)
+        Sample::from_u128(packed)
     }
     
     #[inline]
     fn store(&self, val: Self::Primitive, order: Ordering) {
-        let packed = ((val.0 as u128) << 64) | (val.1 as u128);
+        let packed = val.into_u128();
         self.data.store(packed, order);
     }
     
     #[inline]
     fn swap(&self, val: Self::Primitive, order: Ordering) -> Self::Primitive {
-        let new_packed = ((val.0 as u128) << 64) | (val.1 as u128);
+        let new_packed = val.into_u128();
         let old_packed = self.data.swap(new_packed, order);
-        let timestamp_ns = (old_packed >> 64) as u64;
-        let bytes = old_packed as u64;
-        (timestamp_ns, bytes)
-    }
-    
-    #[inline]
-    fn compare_exchange(
-        &self,
-        current: Self::Primitive,
-        new: Self::Primitive,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<Self::Primitive, Self::Primitive> {
-        let current_packed = ((current.0 as u128) << 64) | (current.1 as u128);
-        let new_packed = ((new.0 as u128) << 64) | (new.1 as u128);
-        
-        match self.data.compare_exchange(current_packed, new_packed, success, failure) {
-            Ok(old_packed) => {
-                let timestamp_ns = (old_packed >> 64) as u64;
-                let bytes = old_packed as u64;
-                Ok((timestamp_ns, bytes))
-            }
-            Err(old_packed) => {
-                let timestamp_ns = (old_packed >> 64) as u64;
-                let bytes = old_packed as u64;
-                Err((timestamp_ns, bytes))
-            }
-        }
+        Sample::from_u128(old_packed)
     }
 }
 
@@ -165,7 +136,7 @@ const MIN_SAMPLES_FOR_REGRESSION: usize = 3;
 #[derive(Debug)]
 pub(crate) struct SpeedCalculator {
     /// 环形缓冲区，存储最近的采样点
-    ring_buffer: AtomicRingBuf<Sample, 64, true>,
+    ring_buffer: AtomicRingBuf<SampleRaw, 64, true>,
     /// 线性回归所需的最小采样点数
     min_samples_for_regression: usize,
     /// 瞬时速度的时间窗口
@@ -257,23 +228,21 @@ impl SpeedCalculator {
         // 自动采样逻辑：根据配置的采样间隔记录采样点
         let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
         let last_sample_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
-        
+
         // 检查是否需要采样（距离上次采样超过配置的采样间隔，或者是首次采样）
         if last_sample_ns == 0 || current_elapsed_ns.saturating_sub(last_sample_ns) >= self.sample_interval_ns {
-            // 确保时间戳不为 0（避免被 Sample::read() 过滤掉）
-            // 如果 elapsed 为 0，使用 1 纳秒作为最小值
-            let timestamp_ns = current_elapsed_ns.max(1);
-            
+            let sample = Sample::new(current_elapsed_ns, current_bytes);
+
             // 尝试更新采样时间戳（使用 compare_exchange 避免重复采样）
             // 允许多个线程竞争，只有一个会成功，这样可以避免过度采样
             if self.last_sample_timestamp_ns.compare_exchange(
                 last_sample_ns,
-                timestamp_ns,
+                sample.timestamp_ns.get(),
                 Ordering::Relaxed,
                 Ordering::Relaxed
             ).is_ok() {
                 // 成功获取采样权限，记录采样点
-                let _ = self.ring_buffer.push((timestamp_ns, current_bytes), Ordering::Relaxed);
+                let _ = self.ring_buffer.push(sample, Ordering::Relaxed);
             }
         }
     }
@@ -293,11 +262,10 @@ impl SpeedCalculator {
         // 转换为 (时间戳秒, 字节数) 格式，并过滤掉时间戳为 0 的采样点
         let mut samples: Vec<(f64, f64)> = all_samples
             .into_iter()
-            .map(|(timestamp_ns, bytes)| {
-                let timestamp_secs = timestamp_ns as f64 / 1_000_000_000.0;
-                (timestamp_secs, bytes as f64)
+            .map(|sample| {
+                let timestamp_secs = sample.timestamp_ns.get() as f64 / 1_000_000_000.0;
+                (timestamp_secs, sample.bytes as f64)
             })
-            .filter(|(timestamp_secs, _)| *timestamp_secs > 0.0)
             .collect();
         
         // 按时间戳排序（从旧到新）
