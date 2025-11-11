@@ -35,6 +35,10 @@ pub enum FetchError {
     /// 无法解析文件总大小
     #[error("无法解析文件总大小为 u64: {0}")]
     InvalidContentRangeSize(String),
+    
+    /// 下载数据大小与预期不符
+    #[error("下载数据大小不匹配: 预期 {expected} bytes，实际 {actual} bytes")]
+    SizeMismatch { expected: u64, actual: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, FetchError>;
@@ -480,7 +484,8 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     where
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
     {
-        let mut buffer = BytesMut::with_capacity(self.range.len() as usize);
+        let expected_size = self.range.len();
+        let mut chunks = Vec::new();
         let mut downloaded_bytes = 0u64;
         
         loop {
@@ -494,24 +499,57 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
                             // 实时记录 chunk
                             self.stats.record_chunk(chunk_size);
                             
-                            buffer.extend_from_slice(&chunk);
+                            chunks.push(chunk);
                             downloaded_bytes += chunk_size;
                         }
                         None => {
-                            // 流结束，下载完成
-                            return Ok(FetchRangeResult::Complete(buffer.freeze()));
+                            // 流结束，下载完成，验证大小并合并
+                            if downloaded_bytes != expected_size {
+                                return Err(FetchError::SizeMismatch {
+                                    expected: expected_size,
+                                    actual: downloaded_bytes,
+                                });
+                            }
+                            let data = self.merge_chunks(chunks);
+                            return Ok(FetchRangeResult::Complete(data));
                         }
                     }
                 }
                 _ = &mut cancel_rx => {
-                    // 收到取消信号，返回已下载的字节数
+                    // 收到取消信号，返回已下载的字节数和数据
+                    let data = self.merge_chunks(chunks);
                     return Ok(FetchRangeResult::Cancelled {
-                        data: buffer.freeze(),
+                        data,
                         bytes_downloaded: downloaded_bytes,
                     });
                 }
             }
         }
+    }
+    
+    /// 合并多个 Bytes chunk 为单个 Bytes
+    /// 
+    /// 避免逐个复制，直接分配合适大小的缓冲区后一次性复制
+    #[inline]
+    fn merge_chunks(&self, chunks: Vec<Bytes>) -> Bytes {
+        if chunks.is_empty() {
+            return Bytes::new();
+        }
+        
+        if chunks.len() == 1 {
+            return chunks.into_iter().next().unwrap();
+        }
+        
+        // 计算总大小
+        let total_size: usize = chunks.iter().map(|c| c.len()).sum();
+        
+        // 一次性分配缓冲区并复制
+        let mut buffer = BytesMut::with_capacity(total_size);
+        for chunk in chunks {
+            buffer.extend_from_slice(&chunk);
+        }
+        
+        buffer.freeze()
     }
 }
 
