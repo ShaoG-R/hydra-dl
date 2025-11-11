@@ -166,6 +166,12 @@ impl FetchRange {
     pub fn as_file_range(&self) -> (u64, u64) {
         (self.start, self.end)
     }
+
+    /// 获取范围长度
+    #[inline]
+    pub fn len(&self) -> u64 {
+        self.end - self.start
+    }
 }
 
 
@@ -474,7 +480,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     where
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
     {
-        let mut buffer = BytesMut::new();
+        let mut buffer = BytesMut::with_capacity(self.range.len() as usize);
         let mut downloaded_bytes = 0u64;
         
         loop {

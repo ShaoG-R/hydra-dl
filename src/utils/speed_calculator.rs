@@ -278,7 +278,7 @@ impl SpeedCalculator {
         // 使用 read_all 方法从环形缓冲区读取所有采样点
         let all_samples = self.ring_buffer.read_all(Ordering::Acquire);
         
-        // 转换为 (时间戳纳秒, 字节数) 格式，并过滤掉时间戳为 0 的采样点
+        // 转换为 (时间戳纳秒, 字节数) 格式
         let mut samples: Vec<(i128, u64)> = all_samples
             .into_iter()
             .map(|sample| {
