@@ -383,8 +383,10 @@ fn test_very_large_buffer() {
         .build();
     let calculator = SpeedCalculator::from_config(&config);
     
-    // 缓冲区大小 = 10s / 10ms * 2.0 = 2000
-    assert!(calculator.ring_buffer.capacity() >= 1000);
+    // 缓冲区大小被限制在 MAX_BUFFER_SIZE (512)
+    // 实际计算：10s / 10ms * 2.0 = 2000，但被限制为 512
+    assert!(calculator.ring_buffer.capacity() >= 256);
+    assert!(calculator.ring_buffer.capacity() <= 512);
 }
 
 #[test]
@@ -532,12 +534,12 @@ fn test_calculate_acceleration_accelerating() {
     let config = SpeedConfig::default();
     let calculator = SpeedCalculator::from_config(&config);
     
-    // 加速：速度从 512 bytes/s 增加到 1536 bytes/s
+    // 加速：前半段速度 256 bytes/s，后半段速度 768 bytes/s
     let samples = vec![
         (0i128, 0u64),
-        (1_000_000_000i128, 512u64),
-        (2_000_000_000i128, 1024u64),
-        (3_000_000_000i128, 1536u64),
+        (1_000_000_000i128, 256u64),
+        (2_000_000_000i128, 512u64),
+        (3_000_000_000i128, 1280u64),
         (4_000_000_000i128, 2048u64),
     ];
     
