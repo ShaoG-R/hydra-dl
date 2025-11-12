@@ -1,8 +1,12 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use net_bytes::{
+    FileSizeFormat, SizeStandard,
+    rust_decimal::{Decimal, prelude::ToPrimitive},
+};
 use std::time::Duration;
 
+use super::utils::{format_bytes, format_duration};
 use crate::download::DownloadProgress;
-use super::utils::{format_bytes, format_speed, format_duration};
 
 /// 进度条管理器
 pub struct ProgressManager {
@@ -14,6 +18,8 @@ pub struct ProgressManager {
     worker_bars: Vec<ProgressBar>,
     /// 是否为详细模式
     verbose: bool,
+    /// 文件大小标准
+    size_standard: SizeStandard,
 }
 
 impl ProgressManager {
@@ -21,7 +27,8 @@ impl ProgressManager {
     ///
     /// # Arguments
     /// * `verbose` - 是否启用详细模式（显示每个 worker 的进度）
-    pub fn new(verbose: bool) -> Self {
+    /// * `size_standard` - 文件大小标准
+    pub fn new(verbose: bool, size_standard: SizeStandard) -> Self {
         let (main_bar, multi) = if verbose {
             // 详细模式：使用 MultiProgress
             let multi = MultiProgress::new();
@@ -40,12 +47,13 @@ impl ProgressManager {
                 .expect("无效的进度条模板")
                 .progress_chars("#>-"),
         );
-        
+
         Self {
             main_bar,
             multi,
             worker_bars: Vec::new(),
             verbose,
+            size_standard,
         }
     }
 
@@ -66,18 +74,19 @@ impl ProgressManager {
 
                 // 详细模式：创建 worker 进度条
                 if self.verbose
-                    && let Some(ref multi) = self.multi {
-                        for i in 0..worker_count {
-                            let worker_bar = multi.add(ProgressBar::new(0));
-                            worker_bar.set_style(
-                                ProgressStyle::default_bar()
-                                    .template(&format!("  Worker #{}: {{msg}}", i))
-                                    .expect("无效的进度条模板"),
-                            );
-                            worker_bar.set_message("等待任务...");
-                            self.worker_bars.push(worker_bar);
-                        }
+                    && let Some(ref multi) = self.multi
+                {
+                    for i in 0..worker_count {
+                        let worker_bar = multi.add(ProgressBar::new(0));
+                        worker_bar.set_style(
+                            ProgressStyle::default_bar()
+                                .template(&format!("  Worker #{}: {{msg}}", i))
+                                .expect("无效的进度条模板"),
+                        );
+                        worker_bar.set_message("等待任务...");
+                        self.worker_bars.push(worker_bar);
                     }
+                }
             }
 
             DownloadProgress::Progress {
@@ -91,52 +100,22 @@ impl ProgressManager {
             } => {
                 // 更新主进度条
                 self.main_bar.set_position(bytes_downloaded);
-                
+
                 // 只在有实时速度时显示速度和 ETA
                 let (speed_str, eta) = if let Some(instant) = instant_speed {
-                    let speed_display = format_speed(instant);
-                    let eta_display = if instant > 0.0 {
-                        let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded) as f64;
-                        
+                    let speed_display = instant.to_formatted(self.size_standard).to_string();
+                    let eta_display = {
+                        let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded);
+
                         // 使用加速度改进 ETA 预测
-                        let eta_secs = if let Some(accel) = instant_acceleration {
-                            // 如果有加速度信息，使用二次运动方程预测
-                            // s = v*t + 0.5*a*t²
-                            // 0.5*a*t² + v*t - s = 0
-                            // 使用求根公式
-                            if accel.abs() > 0.1 {
-                                let a = 0.5 * accel;
-                                let b = instant;
-                                let c = -remaining_bytes;
-                                let discriminant = b * b - 4.0 * a * c;
-                                
-                                if discriminant >= 0.0 && a.abs() > 1e-9 {
-                                    let t1 = (-b + discriminant.sqrt()) / (2.0 * a);
-                                    let t2 = (-b - discriminant.sqrt()) / (2.0 * a);
-                                    // 取正的较小根
-                                    let t = if t1 > 0.0 && t2 > 0.0 {
-                                        t1.min(t2)
-                                    } else if t1 > 0.0 {
-                                        t1
-                                    } else if t2 > 0.0 {
-                                        t2
-                                    } else {
-                                        remaining_bytes / instant  // 降级为线性预测
-                                    };
-                                    t
-                                } else {
-                                    remaining_bytes / instant  // 降级为线性预测
-                                }
-                            } else {
-                                remaining_bytes / instant  // 加速度太小，使用线性预测
-                            }
-                        } else {
-                            remaining_bytes / instant  // 无加速度信息，使用线性预测
-                        };
-                        
-                        format!(", ETA: {}", format_duration(eta_secs))
-                    } else {
-                        String::new()
+                        let eta_secs = instant_acceleration
+                            .and_then(|accel| {
+                                accel.predict_eta(instant.as_decimal(), remaining_bytes)
+                            })
+                            .and_then(|d| Decimal::to_u64(&d))
+                            .unwrap_or_else(|| remaining_bytes / instant.as_u64());
+
+                        format!(", ETA: {}", format_duration(eta_secs as f64))
                     };
                     (speed_display, eta_display)
                 } else {
@@ -145,12 +124,24 @@ impl ProgressManager {
 
                 // 计算分块大小范围（显示最小和最大值）
                 let chunk_info = if !worker_stats.is_empty() {
-                    let min_chunk = worker_stats.iter().map(|s| s.current_chunk_size).min().unwrap_or(0);
-                    let max_chunk = worker_stats.iter().map(|s| s.current_chunk_size).max().unwrap_or(0);
+                    let min_chunk = worker_stats
+                        .iter()
+                        .map(|s| s.current_chunk_size)
+                        .min()
+                        .unwrap_or(0);
+                    let max_chunk = worker_stats
+                        .iter()
+                        .map(|s| s.current_chunk_size)
+                        .max()
+                        .unwrap_or(0);
                     if min_chunk == max_chunk {
                         format!(", 分块: {}", format_bytes(min_chunk))
                     } else {
-                        format!(", 分块: {}~{}", format_bytes(min_chunk), format_bytes(max_chunk))
+                        format!(
+                            ", 分块: {}~{}",
+                            format_bytes(min_chunk),
+                            format_bytes(max_chunk)
+                        )
                     }
                 } else {
                     String::new()
@@ -180,30 +171,31 @@ impl ProgressManager {
                             self.worker_bars.push(worker_bar);
                         }
                     }
-                    
+
                     // 更新所有 worker 的进度条
                     for (idx, stats) in worker_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
                             let instant_str = if let Some(instant) = stats.instant_speed {
-                                format!(" ({})", format_speed(instant))
+                                instant.to_formatted(self.size_standard).to_string()
                             } else {
                                 String::new()
                             };
-                            
+
                             let accel_str = if let Some(accel) = stats.instant_acceleration {
-                                if accel > 0.0 {
-                                    format!(" ↑{:.0}B/s²", accel)
-                                } else if accel < 0.0 {
-                                    format!(" ↓{:.0}B/s²", accel.abs())
+                                let accel_i64 = accel.as_i64();
+                                if accel_i64 > 0 {
+                                    format!(" ↑{}", accel.to_formatted(self.size_standard))
+                                } else if accel_i64 < 0 {
+                                    format!(" ↓{}", accel.to_formatted(self.size_standard))
                                 } else {
                                     String::new()
                                 }
                             } else {
                                 String::new()
                             };
-                            
+
                             worker_bar.set_message(format!(
-                                "{}, {} ranges, 分块: {}{}{}",
+                                "{}, {} ranges, 分块: {} {} {}",
                                 format_bytes(stats.bytes),
                                 stats.ranges,
                                 format_bytes(stats.current_chunk_size),
@@ -226,7 +218,9 @@ impl ProgressManager {
                     "完成！{} in {}, 平均速度: {}",
                     format_bytes(total_bytes),
                     format_duration(total_time),
-                    format_speed(avg_speed)
+                    avg_speed
+                        .map(|s| s.to_formatted(self.size_standard).to_string())
+                        .unwrap_or("N/A".to_string())
                 ));
 
                 // 详细模式：显示每个 worker 的最终统计
@@ -244,7 +238,7 @@ impl ProgressManager {
                             self.worker_bars.push(worker_bar);
                         }
                     }
-                    
+
                     // 显示所有 worker 的最终统计
                     for (idx, stats) in worker_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
@@ -252,7 +246,10 @@ impl ProgressManager {
                                 "完成：{}, {} ranges, 平均: {}",
                                 format_bytes(stats.bytes),
                                 stats.ranges,
-                                format_speed(stats.avg_speed)
+                                stats
+                                    .avg_speed
+                                    .map(|s| s.to_formatted(self.size_standard).to_string())
+                                    .unwrap_or("N/A".to_string())
                             ));
                         }
                     }
@@ -260,8 +257,9 @@ impl ProgressManager {
             }
 
             DownloadProgress::Error { message } => {
-                self.main_bar.abandon_with_message(format!("错误: {}", message));
-                
+                self.main_bar
+                    .abandon_with_message(format!("错误: {}", message));
+
                 // 详细模式：清理 worker 进度条
                 if self.verbose {
                     for worker_bar in &self.worker_bars {
@@ -297,4 +295,3 @@ pub fn create_spinner() -> ProgressBar {
     spinner.enable_steady_tick(Duration::from_millis(100));
     spinner
 }
-

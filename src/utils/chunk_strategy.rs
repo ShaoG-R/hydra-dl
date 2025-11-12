@@ -3,6 +3,7 @@
 //! 提供根据下载速度动态调整分块大小的策略接口和实现
 
 use crate::config::DownloadConfig;
+use net_bytes::DownloadSpeed;
 
 /// 分块策略 trait
 ///
@@ -19,7 +20,12 @@ pub(crate) trait ChunkStrategy: Send + Sync + 'static {
     /// # Returns
     ///
     /// 计算得到的新分块大小 (bytes)
-    fn calculate_chunk_size(&self, current_chunk_size: u64, instant_speed: f64, avg_speed: f64) -> u64;
+    fn calculate_chunk_size(
+        &self,
+        current_chunk_size: u64,
+        instant_speed: DownloadSpeed,
+        avg_speed: DownloadSpeed,
+    ) -> u64;
 }
 
 /// 基于速度的自适应分块策略
@@ -91,25 +97,42 @@ impl SpeedBasedChunkStrategy {
 }
 
 impl ChunkStrategy for SpeedBasedChunkStrategy {
-    fn calculate_chunk_size(&self, current_chunk_size: u64, instant_speed: f64, avg_speed: f64) -> u64 {
-        // 1. 计算加权速度 = (瞬时速度 * 瞬时速度权重 + 平均速度 * 平均速度权重)
-        let weighted_speed = instant_speed * self.instant_speed_weight + avg_speed * self.avg_speed_weight;
-        
-        // 2. 计算理想分块大小 = 加权速度 * 预期时间
-        let ideal_chunk_size = (weighted_speed * self.expected_duration) as u64;
-        
-        // 3. 应用平滑算法：新大小 = 旧大小 + (理想大小 - 旧大小) * 平滑系数
-        let smoothed_size = current_chunk_size as f64 
-            + (ideal_chunk_size as f64 - current_chunk_size as f64) * self.smoothing_factor;
-        
-        // 4. 限制在配置范围内
-        (smoothed_size as u64).clamp(self.min_chunk_size, self.max_chunk_size)
+    fn calculate_chunk_size(
+        &self,
+        current_chunk_size: u64,
+        instant_speed: DownloadSpeed,
+        avg_speed: DownloadSpeed,
+    ) -> u64 {
+        // 获取速度的字节/秒值
+        let instant_speed_bps = instant_speed.as_u64() as f64;
+        let avg_speed_bps = avg_speed.as_u64() as f64;
+
+        // 计算加权速度
+        let weighted_speed = (instant_speed_bps * self.instant_speed_weight)
+            + (avg_speed_bps * self.avg_speed_weight);
+
+        // 计算理想分块大小 (bytes/s * s = bytes)
+        let ideal_chunk_size = (weighted_speed * self.expected_duration) as f64;
+
+        // 应用平滑算法: 新大小 = 当前大小 + (理想大小 - 当前大小) * 平滑系数
+        let current_as_f64 = current_chunk_size as f64;
+        let smoothed_size =
+            current_as_f64 + (ideal_chunk_size - current_as_f64) * self.smoothing_factor;
+        let new_chunk_size = smoothed_size.max(0.0) as u64;
+
+        // 确保分块大小在允许的范围内
+        new_chunk_size.clamp(self.min_chunk_size, self.max_chunk_size)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use net_bytes::DownloadSpeed;
+    // Helper function to create a DownloadSpeed from bytes per second
+    fn speed(bps: u64) -> DownloadSpeed {
+        DownloadSpeed::from_raw(bps)
+    }
 
     #[test]
     fn test_speed_based_chunk_strategy_creation() {
@@ -129,17 +152,19 @@ mod tests {
     #[test]
     fn test_speed_based_chunk_strategy_from_config() {
         use std::time::Duration;
-        
+
         let config = DownloadConfig::builder()
-            .chunk(|c| c
-                .initial_size(10 * 1024 * 1024)
-                .min_size(5 * 1024 * 1024)
-                .max_size(100 * 1024 * 1024))
-            .speed(|s| s
-                .expected_chunk_duration(Duration::from_secs(3))
-                .smoothing_factor(0.5)
-                .instant_weight(0.6)
-                .avg_weight(0.4))
+            .chunk(|c| {
+                c.initial_size(10 * 1024 * 1024)
+                    .min_size(5 * 1024 * 1024)
+                    .max_size(100 * 1024 * 1024)
+            })
+            .speed(|s| {
+                s.expected_chunk_duration(Duration::from_secs(3))
+                    .smoothing_factor(0.5)
+                    .instant_weight(0.6)
+                    .avg_weight(0.4)
+            })
             .build();
 
         let strategy = SpeedBasedChunkStrategy::from_config(&config);
@@ -168,12 +193,20 @@ mod tests {
         // 理想分块: 10 * 2 = 20 MB
         // 当前: 5 MB, 新大小: 5 + (20 - 5) * 0.5 = 12.5 MB
         let current_size = 5 * 1024 * 1024;
-        let chunk_size = strategy.calculate_chunk_size(current_size, 10.0 * 1024.0 * 1024.0, 8.0 * 1024.0 * 1024.0);
+        let chunk_size = strategy.calculate_chunk_size(
+            current_size,
+            speed(10 * 1024 * 1024),
+            speed(8 * 1024 * 1024),
+        );
         assert_eq!(chunk_size, 12 * 1024 * 1024 + 512 * 1024); // 12.5 MB
 
         // 再次计算，应该继续平滑调整
         // 当前: 12.5 MB, 新大小: 12.5 + (20 - 12.5) * 0.5 = 16.25 MB
-        let chunk_size = strategy.calculate_chunk_size(chunk_size, 10.0 * 1024.0 * 1024.0, 8.0 * 1024.0 * 1024.0);
+        let chunk_size = strategy.calculate_chunk_size(
+            chunk_size,
+            speed(10 * 1024 * 1024),
+            speed(8 * 1024 * 1024),
+        );
         assert_eq!(chunk_size, 16 * 1024 * 1024 + 256 * 1024); // 16.25 MB
     }
 
@@ -191,7 +224,8 @@ mod tests {
         // 非常慢的速度: 100 KB/s, 理想分块: 100 * 1024 * 2 = 200 KB
         // 应该立即调整到理想值并被限制在最小值 2 MB
         let current_size = 5 * 1024 * 1024;
-        let chunk_size = strategy.calculate_chunk_size(current_size, 100.0 * 1024.0, 100.0 * 1024.0);
+        let chunk_size =
+            strategy.calculate_chunk_size(current_size, speed(100 * 1024), speed(100 * 1024));
         assert_eq!(chunk_size, 2 * 1024 * 1024);
     }
 
@@ -209,7 +243,11 @@ mod tests {
         // 非常快的速度: 100 MB/s, 理想分块: 100 * 2 = 200 MB
         // 应该被限制在最大值 50 MB
         let current_size = 5 * 1024 * 1024;
-        let chunk_size = strategy.calculate_chunk_size(current_size, 100.0 * 1024.0 * 1024.0, 100.0 * 1024.0 * 1024.0);
+        let chunk_size = strategy.calculate_chunk_size(
+            current_size,
+            speed(100 * 1024 * 1024),
+            speed(100 * 1024 * 1024),
+        );
         assert_eq!(chunk_size, 50 * 1024 * 1024);
     }
 
@@ -226,7 +264,11 @@ mod tests {
 
         // 即使速度很快，分块大小也不应该变化
         let current_size = 5 * 1024 * 1024;
-        let chunk_size = strategy.calculate_chunk_size(current_size, 100.0 * 1024.0 * 1024.0, 100.0 * 1024.0 * 1024.0);
+        let chunk_size = strategy.calculate_chunk_size(
+            current_size,
+            speed(100 * 1024 * 1024),
+            speed(100 * 1024 * 1024),
+        );
         assert_eq!(chunk_size, 5 * 1024 * 1024); // 保持当前值
     }
 
@@ -244,7 +286,11 @@ mod tests {
         // 速度: 10 MB/s, 理想分块: 10 * 2 = 20 MB
         // 应该立即调整到理想值
         let current_size = 5 * 1024 * 1024;
-        let chunk_size = strategy.calculate_chunk_size(current_size, 10.0 * 1024.0 * 1024.0, 10.0 * 1024.0 * 1024.0);
+        let chunk_size = strategy.calculate_chunk_size(
+            current_size,
+            speed(10 * 1024 * 1024),
+            speed(10 * 1024 * 1024),
+        );
         assert_eq!(chunk_size, 20 * 1024 * 1024);
     }
 
@@ -262,14 +308,22 @@ mod tests {
 
         // 第一次计算：从 5 MB 开始
         let current_size = 5 * 1024 * 1024;
-        let new_size = strategy.calculate_chunk_size(current_size, 10.0 * 1024.0 * 1024.0, 8.0 * 1024.0 * 1024.0);
+        let new_size = strategy.calculate_chunk_size(
+            current_size,
+            speed(10 * 1024 * 1024),
+            speed(8 * 1024 * 1024),
+        );
         assert_eq!(new_size, 12 * 1024 * 1024 + 512 * 1024); // 12.5 MB
-        
+
         // 第二次计算：使用上次的结果作为当前大小
-        let new_size = strategy.calculate_chunk_size(new_size, 10.0 * 1024.0 * 1024.0, 8.0 * 1024.0 * 1024.0);
+        let new_size = strategy.calculate_chunk_size(
+            new_size,
+            speed(10 * 1024 * 1024),
+            speed(8 * 1024 * 1024),
+        );
         assert_eq!(new_size, 16 * 1024 * 1024 + 256 * 1024); // 16.25 MB
     }
-    
+
     #[test]
     fn test_weighted_speed_calculation() {
         let strategy = SpeedBasedChunkStrategy::new(
@@ -285,11 +339,14 @@ mod tests {
         // 加权速度: 10 * 0.7 + 6 * 0.3 = 7 + 1.8 = 8.8 MB/s
         // 理想分块: 8.8 * 2 = 17.6 MB
         let current_size = 5 * 1024 * 1024;
-        let chunk_size = strategy.calculate_chunk_size(current_size, 10.0 * 1024.0 * 1024.0, 6.0 * 1024.0 * 1024.0);
-        
+        let chunk_size = strategy.calculate_chunk_size(
+            current_size,
+            speed(10 * 1024 * 1024),
+            speed(6 * 1024 * 1024),
+        );
+
         // 由于 smoothing_factor = 1.0，应该立即调整到理想值
         let expected = (8.8 * 2.0 * 1024.0 * 1024.0) as u64;
         assert_eq!(chunk_size, expected);
     }
 }
-

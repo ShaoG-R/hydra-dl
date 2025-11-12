@@ -2,10 +2,10 @@
 //!
 //! 为HTTP客户端和文件系统操作提供trait抽象，便于测试
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
-use reqwest::{header::HeaderMap, StatusCode};
-use async_trait::async_trait;
+use reqwest::{StatusCode, header::HeaderMap};
 use std::pin::Pin;
 use thiserror::Error;
 
@@ -15,31 +15,31 @@ pub enum IoError {
     /// HTTP GET 请求失败
     #[error("HTTP GET请求失败: {0}")]
     HttpGet(#[source] reqwest::Error),
-    
+
     /// HTTP HEAD 请求失败
     #[error("HTTP HEAD请求失败: {0}")]
     HttpHead(#[source] reqwest::Error),
-    
+
     /// HTTP Range 请求失败
     #[error("HTTP Range请求失败: {0}")]
     HttpRange(#[source] reqwest::Error),
-    
+
     /// 创建文件失败
     #[error("创建文件失败: {0}")]
     FileCreate(#[source] std::io::Error),
-    
+
     /// 写入文件失败
     #[error("写入文件失败: {0}")]
     FileWrite(#[source] std::io::Error),
-    
+
     /// 刷新文件缓冲区失败
     #[error("刷新文件缓冲区失败: {0}")]
     FileFlush(#[source] std::io::Error),
-    
+
     /// 流式读取数据块失败
     #[error("读取数据块失败: {0}")]
     StreamRead(String),
-    
+
     /// Mock 测试错误
     #[error("{0}")]
     Mock(String),
@@ -80,7 +80,7 @@ pub trait HttpResponse: Send {
 
     /// 获取字节流
     fn bytes_stream(self) -> Self::BytesStream;
-    
+
     /// 获取响应的最终 URL（重定向后的 URL）
     fn url(&self) -> &str;
 }
@@ -91,7 +91,7 @@ pub trait HttpResponse: Send {
 
 /// reqwest::Response的字节流包装器
 pub struct ReqwestBytesStream {
-    inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>,   
+    inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>,
 }
 
 impl Stream for ReqwestBytesStream {
@@ -114,18 +114,12 @@ impl HttpClient for reqwest::Client {
 
     async fn get(&self, url: &str) -> Result<Self::Response> {
         let url = url.to_string();
-        self.get(&url)
-            .send()
-            .await
-            .map_err(IoError::HttpGet)
+        self.get(&url).send().await.map_err(IoError::HttpGet)
     }
 
     async fn head(&self, url: &str) -> Result<Self::Response> {
         let url = url.to_string();
-        self.head(&url)
-            .send()
-            .await
-            .map_err(IoError::HttpHead)
+        self.head(&url).send().await.map_err(IoError::HttpHead)
     }
 
     async fn get_with_range(&self, url: &str, start: u64, end: u64) -> Result<Self::Response> {
@@ -156,12 +150,11 @@ impl HttpResponse for reqwest::Response {
             inner: Box::pin(stream),
         }
     }
-    
+
     fn url(&self) -> &str {
         self.url().as_str()
     }
 }
-
 
 // ============================================================================
 // 测试用的 Mock 实现
@@ -170,11 +163,11 @@ impl HttpResponse for reqwest::Response {
 #[cfg(test)]
 pub mod mock {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::Arc;
     use futures::stream;
-    
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     /// Mock HTTP 响应
     pub struct MockHttpResponse {
         pub status: StatusCode,
@@ -182,42 +175,42 @@ pub mod mock {
         pub body: Bytes,
         pub url: String,
     }
-    
+
     impl HttpResponse for MockHttpResponse {
         type BytesStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>>;
-        
+
         fn status(&self) -> StatusCode {
             self.status
         }
-        
+
         fn headers(&self) -> &HeaderMap {
             &self.headers
         }
-        
+
         fn bytes_stream(self) -> Self::BytesStream {
             // 将 body 按块分割，模拟真实的流式传输
             let chunk_size = 8192;
             let mut chunks = Vec::new();
             let bytes = self.body;
-            
+
             for i in (0..bytes.len()).step_by(chunk_size) {
                 let end = (i + chunk_size).min(bytes.len());
                 chunks.push(Ok(bytes.slice(i..end)));
             }
-            
+
             Box::pin(stream::iter(chunks))
         }
-        
+
         fn url(&self) -> &str {
             &self.url
         }
     }
-    
+
     /// Mock HTTP 客户端
-    /// 
+    ///
     /// 支持预设响应和请求记录
     #[derive(Clone)]
-    pub struct MockHttpClient { 
+    pub struct MockHttpClient {
         /// GET 请求的响应：URL -> Response
         get_responses: Arc<Mutex<HashMap<String, MockHttpResponse>>>,
         /// HEAD 请求的响应：URL -> Response
@@ -227,7 +220,7 @@ pub mod mock {
         /// 记录所有请求
         request_log: Arc<Mutex<Vec<String>>>,
     }
-    
+
     impl MockHttpClient {
         pub fn new() -> Self {
             Self {
@@ -237,9 +230,15 @@ pub mod mock {
                 request_log: Arc::new(Mutex::new(Vec::new())),
             }
         }
-        
+
         /// 设置 GET 请求的响应
-        pub fn set_response(&self, url: impl Into<String>, status: StatusCode, headers: HeaderMap, body: Bytes) {
+        pub fn set_response(
+            &self,
+            url: impl Into<String>,
+            status: StatusCode,
+            headers: HeaderMap,
+            body: Bytes,
+        ) {
             let url_string = url.into();
             let response = MockHttpResponse {
                 status,
@@ -247,11 +246,19 @@ pub mod mock {
                 body,
                 url: url_string.clone(),
             };
-            self.get_responses.lock().unwrap().insert(url_string, response);
+            self.get_responses
+                .lock()
+                .unwrap()
+                .insert(url_string, response);
         }
-        
+
         /// 设置 HEAD 请求的响应
-        pub fn set_head_response(&self, url: impl Into<String>, status: StatusCode, headers: HeaderMap) {
+        pub fn set_head_response(
+            &self,
+            url: impl Into<String>,
+            status: StatusCode,
+            headers: HeaderMap,
+        ) {
             let url_string = url.into();
             let response = MockHttpResponse {
                 status,
@@ -259,11 +266,22 @@ pub mod mock {
                 body: Bytes::new(),
                 url: url_string.clone(),
             };
-            self.head_responses.lock().unwrap().insert(url_string, response);
+            self.head_responses
+                .lock()
+                .unwrap()
+                .insert(url_string, response);
         }
-        
+
         /// 设置 Range 请求的响应
-        pub fn set_range_response(&self, url: impl Into<String>, start: u64, end: u64, status: StatusCode, headers: HeaderMap, body: Bytes) {
+        pub fn set_range_response(
+            &self,
+            url: impl Into<String>,
+            start: u64,
+            end: u64,
+            status: StatusCode,
+            headers: HeaderMap,
+            body: Bytes,
+        ) {
             let url_string = url.into();
             let response = MockHttpResponse {
                 status,
@@ -271,54 +289,75 @@ pub mod mock {
                 body,
                 url: url_string.clone(),
             };
-            self.range_responses.lock().unwrap().insert((url_string, start, end), response);
+            self.range_responses
+                .lock()
+                .unwrap()
+                .insert((url_string, start, end), response);
         }
-        
+
         /// 获取请求日志
         pub fn get_request_log(&self) -> Vec<String> {
             self.request_log.lock().unwrap().clone()
         }
-        
+
         /// 清空请求日志
         pub fn clear_request_log(&self) {
             self.request_log.lock().unwrap().clear();
         }
     }
-    
+
     impl Default for MockHttpClient {
         fn default() -> Self {
             Self::new()
         }
     }
-    
+
     #[async_trait]
     impl HttpClient for MockHttpClient {
         type Response = MockHttpResponse;
-        
+
         async fn get(&self, url: &str) -> Result<Self::Response> {
-            self.request_log.lock().unwrap().push(format!("GET {}", url));
-            
-            self.get_responses.lock().unwrap()
+            self.request_log
+                .lock()
+                .unwrap()
+                .push(format!("GET {}", url));
+
+            self.get_responses
+                .lock()
+                .unwrap()
                 .remove(url)
                 .ok_or_else(|| IoError::Mock(format!("未找到预设 GET 响应: {}", url)))
         }
-        
+
         async fn head(&self, url: &str) -> Result<Self::Response> {
-            self.request_log.lock().unwrap().push(format!("HEAD {}", url));
-            
-            self.head_responses.lock().unwrap()
+            self.request_log
+                .lock()
+                .unwrap()
+                .push(format!("HEAD {}", url));
+
+            self.head_responses
+                .lock()
+                .unwrap()
                 .remove(url)
                 .ok_or_else(|| IoError::Mock(format!("未找到预设 HEAD 响应: {}", url)))
         }
-        
+
         async fn get_with_range(&self, url: &str, start: u64, end: u64) -> Result<Self::Response> {
-            self.request_log.lock().unwrap().push(format!("GET {} Range: {}-{}", url, start, end));
-            
-            self.range_responses.lock().unwrap()
+            self.request_log
+                .lock()
+                .unwrap()
+                .push(format!("GET {} Range: {}-{}", url, start, end));
+
+            self.range_responses
+                .lock()
+                .unwrap()
                 .remove(&(url.to_string(), start, end))
-                .ok_or_else(|| IoError::Mock(format!("未找到预设 Range 响应: {} ({}-{})", url, start, end)))
+                .ok_or_else(|| {
+                    IoError::Mock(format!(
+                        "未找到预设 Range 响应: {} ({}-{})",
+                        url, start, end
+                    ))
+                })
         }
     }
-    
 }
-

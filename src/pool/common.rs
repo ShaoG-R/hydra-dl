@@ -73,11 +73,11 @@
 //! ```
 
 use async_trait::async_trait;
+use deferred_map::DeferredMap;
 use log::{debug, error, info};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use deferred_map::DeferredMap;
 
 use crate::{DownloadError, Result};
 
@@ -120,7 +120,6 @@ pub trait WorkerStats: Send + Sync + 'static {}
 /// - `Send`: 上下文可以在线程间传递（worker 独占所有权）
 pub trait WorkerContext: Send + 'static {}
 
-
 /// Worker 执行器 trait
 ///
 /// 定义了如何处理任务的具体逻辑
@@ -145,7 +144,7 @@ pub trait WorkerExecutor: Send + Sync + Clone + 'static {
     type Context: WorkerContext;
     /// 统计类型
     type Stats: WorkerStats;
-    
+
     /// 执行任务
     ///
     /// # Arguments
@@ -158,7 +157,13 @@ pub trait WorkerExecutor: Send + Sync + Clone + 'static {
     /// # Returns
     ///
     /// 任务执行结果
-    async fn execute(&self, worker_id: u64, task: Self::Task, context: &mut Self::Context, stats: &Self::Stats) -> Self::Result;
+    async fn execute(
+        &self,
+        worker_id: u64,
+        task: Self::Task,
+        context: &mut Self::Context,
+        stats: &Self::Stats,
+    ) -> Self::Result;
 }
 
 /// Worker 配置
@@ -214,7 +219,7 @@ pub(crate) async fn run_worker<E: WorkerExecutor>(config: WorkerConfig<E>) {
                     error!("Worker #{} 发送结果失败: {:?}", id, e);
                 }
             }
-            
+
             else => {
                 // task channel 关闭，正常退出
                 debug!("Worker #{} 任务通道关闭，退出", id);
@@ -327,8 +332,6 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
     }
 }
 
-
-
 /// 通用 Worker 协程池
 ///
 /// 管理多个 worker 协程的生命周期，支持任务分发、结果收集和动态扩展
@@ -355,11 +358,11 @@ pub struct WorkerPool<E: WorkerExecutor> {
 
 impl<E: WorkerExecutor> WorkerPool<E> {
     /// 启动单个 worker（内部辅助方法）
-    /// 
+    ///
     /// 封装创建和启动 worker 的通用逻辑，避免在 new 和 add_workers 中重复
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// 返回新创建的 worker slot 和句柄
     fn spawn_worker(
         &mut self,
@@ -370,12 +373,12 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         // 创建任务和关闭通道
         let (task_sender, task_receiver) = mpsc::channel::<E::Task>(100);
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
-        
+
         // 克隆 worker 需要的资源
         let result_sender_clone = self.result_sender.clone();
         let stats_for_worker = Arc::clone(&stats_arc);
         let executor_clone = self.executor.clone();
-        
+
         // 启动 worker 协程（不再包含自动清理逻辑）
         // 直接使用完整的 key 作为 worker_id
         let join_handle = tokio::spawn(async move {
@@ -390,12 +393,12 @@ impl<E: WorkerExecutor> WorkerPool<E> {
                 shutdown_receiver,
             })
             .await;
-            
+
             debug!("Worker #{} 退出", key);
         });
-        
+
         let task_sender = Arc::new(task_sender);
-        
+
         // 创建 WorkerSlot
         let slot = WorkerSlot {
             shutdown_sender,
@@ -404,7 +407,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
 
         // 创建 worker 句柄
         let handle = WorkerHandle::new(key, task_sender, stats_arc);
-        
+
         (slot, handle)
     }
 
@@ -426,36 +429,40 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// let contexts_with_stats = vec![(MyContext::new(), Arc::new(MyStats::new())); 4];
     /// let (pool, handles, result_receiver) = WorkerPool::new(executor, contexts_with_stats)?;
     /// ```
-    pub fn new(executor: E, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<(Self, Vec<WorkerHandle<E>>, Receiver<E::Result>)> {
+    pub fn new(
+        executor: E,
+        contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>,
+    ) -> Result<(Self, Vec<WorkerHandle<E>>, Receiver<E::Result>)> {
         let worker_count = contexts_with_stats.len();
-        
+
         // 创建 DeferredMap
         let slots = DeferredMap::with_capacity(worker_count);
-        
+
         // 创建统一的 result channel（所有 worker 共享同一个 sender）
         let (result_sender, result_receiver) = mpsc::channel::<E::Result>(100);
-        
+
         // 创建 pool 实例（先不启动 workers）
         let mut pool = Self {
             slots,
             result_sender: result_sender.clone(),
             executor,
         };
-        
+
         // 为每个 worker 创建独立的 task channel、上下文和统计，并启动协程
         let mut handles = Vec::with_capacity(worker_count);
         for (context, stats_arc) in contexts_with_stats.into_iter() {
             // 先分配 handle
             let deferred_handle = pool.slots.allocate_handle();
             let key = deferred_handle.key();
-            
+
             // spawn_worker 返回 slot 和 handle
             let (slot, worker_handle) = pool.spawn_worker(key, context, stats_arc);
-            
+
             // 将 slot 插入 DeferredMap
-            pool.slots.insert(deferred_handle, slot)
+            pool.slots
+                .insert(deferred_handle, slot)
                 .map_err(|e| DownloadError::Other(format!("插入 slot 失败: {:?}", e)))?;
-            
+
             handles.push(worker_handle);
         }
 
@@ -478,29 +485,32 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// let new_contexts = vec![(MyContext::new(), Arc::new(MyStats::new())); 2];
     /// let handles = pool.add_workers(new_contexts).await?;
     /// ```
-    pub async fn add_workers(&mut self, contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>) -> Result<Vec<WorkerHandle<E>>> {
+    pub async fn add_workers(
+        &mut self,
+        contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>,
+    ) -> Result<Vec<WorkerHandle<E>>> {
         let mut handles = Vec::with_capacity(contexts_with_stats.len());
         for (context, stats_arc) in contexts_with_stats.into_iter() {
             // 分配新的 handle
             let deferred_handle = self.slots.allocate_handle();
             let key = deferred_handle.key();
-            
+
             // 启动 worker（spawn_worker 返回 slot 和 handle）
             let (slot, worker_handle) = self.spawn_worker(key, context, stats_arc);
-            
+
             // 将 slot 插入 DeferredMap
-            self.slots.insert(deferred_handle, slot)
+            self.slots
+                .insert(deferred_handle, slot)
                 .map_err(|e| DownloadError::Other(format!("插入 slot 失败: {:?}", e)))?;
-            
+
             handles.push(worker_handle);
-            
+
             debug!("新 worker 添加到位置 #{}", key);
         }
-        
+
         Ok(handles)
     }
-    
-    
+
     /// 获取当前活跃 worker 总数
     pub fn worker_count(&self) -> u64 {
         self.slots.len() as u64
@@ -516,28 +526,28 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// 此方法会阻塞直到所有 workers 完全退出
     pub async fn shutdown(&mut self) {
         info!("发送关闭信号到所有活跃 workers");
-        
+
         // 收集所有需要关闭的 workers 的 key
         let keys: Vec<u64> = self.slots.iter().map(|(key, _)| key).collect();
         let closed_count = keys.len();
-        
+
         // 收集所有的 JoinHandle
         let mut join_handles = Vec::with_capacity(closed_count);
-        
+
         // 从 map 中移除每个 slot，获取所有权，并发送关闭信号
         for key in keys {
             if let Some(slot) = self.slots.remove(key) {
                 // 发送关闭信号（忽略发送错误，worker 可能已经退出）
                 let _ = slot.shutdown_sender.send(());
                 debug!("Worker #{} 关闭信号已发送", key);
-                
+
                 // 收集 JoinHandle
                 join_handles.push((key, slot.join_handle));
             }
         }
-        
+
         info!("已向 {} 个 workers 发送关闭信号，等待退出...", closed_count);
-        
+
         // 等待所有 workers 退出
         for (key, handle) in join_handles {
             match handle.await {
@@ -549,20 +559,20 @@ impl<E: WorkerExecutor> WorkerPool<E> {
                 }
             }
         }
-        
+
         info!("所有 {} 个 workers 已完全退出", closed_count);
     }
 }
 
 pub mod test_utils {
     //! 公共测试套件
-    //! 
+    //!
     //! 提供可复用的测试类型、执行器和辅助函数，供 common.rs 的单元测试
     //! 和 tests/ 目录下的集成测试使用
-    
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     /// 测试用的任务类型
     #[derive(Debug, Clone)]
@@ -585,31 +595,35 @@ pub mod test_utils {
         pub processed_count: AtomicUsize,
     }
     impl WorkerContext for TestContext {}
-    
+
     impl Default for TestContext {
         fn default() -> Self {
-            Self { processed_count: AtomicUsize::new(0) }
+            Self {
+                processed_count: AtomicUsize::new(0),
+            }
         }
     }
-    
+
     impl TestContext {
         pub fn new() -> Self {
             Self::default()
         }
     }
-    
+
     /// 测试用的统计
     pub struct TestStats {
         pub task_count: AtomicUsize,
     }
     impl WorkerStats for TestStats {}
-    
+
     impl Default for TestStats {
         fn default() -> Self {
-            Self { task_count: AtomicUsize::new(0) }
+            Self {
+                task_count: AtomicUsize::new(0),
+            }
         }
     }
-    
+
     impl TestStats {
         pub fn new() -> Self {
             Self::default()
@@ -619,15 +633,21 @@ pub mod test_utils {
     /// 测试用的成功执行器
     #[derive(Clone)]
     pub struct TestExecutor;
-    
+
     #[async_trait]
     impl WorkerExecutor for TestExecutor {
         type Task = TestTask;
         type Result = TestResult;
         type Context = TestContext;
         type Stats = TestStats;
-        
-        async fn execute(&self, worker_id: u64, task: Self::Task, context: &mut Self::Context, stats: &Self::Stats) -> Self::Result {
+
+        async fn execute(
+            &self,
+            worker_id: u64,
+            task: Self::Task,
+            context: &mut Self::Context,
+            stats: &Self::Stats,
+        ) -> Self::Result {
             // 模拟处理任务
             sleep(Duration::from_millis(10)).await;
             context.processed_count.fetch_add(1, Ordering::SeqCst);
@@ -642,27 +662,33 @@ pub mod test_utils {
     /// 测试用的失败执行器
     #[derive(Clone)]
     pub struct FailingExecutor;
-    
+
     #[async_trait]
     impl WorkerExecutor for FailingExecutor {
         type Task = TestTask;
         type Result = TestResult;
         type Context = TestContext;
         type Stats = TestStats;
-        
-        async fn execute(&self, worker_id: u64, _task: Self::Task, _context: &mut Self::Context, _stats: &Self::Stats) -> Self::Result {
+
+        async fn execute(
+            &self,
+            worker_id: u64,
+            _task: Self::Task,
+            _context: &mut Self::Context,
+            _stats: &Self::Stats,
+        ) -> Self::Result {
             TestResult::Failed {
                 worker_id,
                 error: "intentional failure".to_string(),
             }
         }
     }
-    
+
     /// 创建测试用的上下文和统计数据
     pub fn create_context_with_stats() -> (TestContext, Arc<TestStats>) {
         (TestContext::new(), Arc::new(TestStats::new()))
     }
-    
+
     /// 创建指定数量的测试用上下文和统计数据
     pub fn create_contexts_with_stats(count: usize) -> Vec<(TestContext, Arc<TestStats>)> {
         (0..count).map(|_| create_context_with_stats()).collect()
@@ -671,63 +697,66 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_utils::*;
+    use super::*;
     use std::sync::atomic::Ordering;
-    use tokio::time::{sleep, Duration};
-    
+    use tokio::time::{Duration, sleep};
+
     /// 测试创建协程池
     #[tokio::test]
     async fn test_create_worker_pool() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(4);
-        
+
         let result = WorkerPool::new(executor, contexts);
         assert!(result.is_ok());
-        
+
         let (mut pool, handles, _result_receiver) = result.unwrap();
         assert_eq!(pool.worker_count(), 4);
         assert_eq!(handles.len(), 4);
-        
+
         // 清理
         pool.shutdown().await;
     }
-    
+
     /// 测试空协程池创建
     #[tokio::test]
     async fn test_create_empty_pool() {
         let executor = TestExecutor;
         let contexts = vec![];
-        
+
         let result = WorkerPool::new(executor, contexts);
         assert!(result.is_ok());
-        
+
         let (mut pool, handles, _result_receiver) = result.unwrap();
         assert_eq!(pool.worker_count(), 0);
         assert_eq!(handles.len(), 0);
-        
+
         pool.shutdown().await;
     }
-    
+
     /// 测试发送任务并接收结果
     #[tokio::test]
     async fn test_send_and_receive() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(2);
         let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
-        
+
         // 向第一个 worker 发送任务
         let task = TestTask {
             id: 1,
             data: "test".to_string(),
         };
-        
+
         handles[0].send_task(task).await.unwrap();
-        
+
         // 接收结果
         if let Some(result) = result_receiver.recv().await {
             match result {
-                TestResult::Success { worker_id: _, task_id } => {
+                TestResult::Success {
+                    worker_id: _,
+                    task_id,
+                } => {
                     assert_eq!(task_id, 1);
                 }
                 _ => panic!("Expected success result"),
@@ -735,10 +764,10 @@ mod tests {
         } else {
             panic!("No result received");
         }
-        
+
         pool.shutdown().await;
     }
-    
+
     /// 测试 worker 统计数据
     #[tokio::test]
     async fn test_worker_stats() {
@@ -746,7 +775,7 @@ mod tests {
         let contexts = create_contexts_with_stats(1);
         let stats_ref = contexts[0].1.clone();
         let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
-        
+
         // 发送多个任务
         for i in 0..5 {
             let task = TestTask {
@@ -755,66 +784,66 @@ mod tests {
             };
             handles[0].send_task(task).await.unwrap();
         }
-        
+
         // 接收所有结果
         for _ in 0..5 {
             result_receiver.recv().await;
         }
-        
+
         // 验证统计数据
         let count = stats_ref.task_count.load(Ordering::SeqCst);
         assert_eq!(count, 5);
-        
+
         pool.shutdown().await;
     }
-    
+
     /// 测试动态添加 worker
     #[tokio::test]
     async fn test_add_workers() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(2);
         let (mut pool, _, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
-        
+
         assert_eq!(pool.worker_count(), 2);
-        
+
         // 动态添加 3 个新 workers
         let new_contexts = create_contexts_with_stats(3);
         let new_handles = pool.add_workers(new_contexts).await.unwrap();
-        
+
         assert_eq!(pool.worker_count(), 5);
         assert_eq!(new_handles.len(), 3);
-        
+
         pool.shutdown().await;
     }
-    
+
     /// 测试 worker 句柄的 worker_id
     #[tokio::test]
     async fn test_worker_handle_id() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(3);
         let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
-        
+
         // 验证每个 handle 的 worker_id 是唯一的
         let ids: Vec<u64> = handles.iter().map(|h| h.worker_id()).collect();
         assert_eq!(ids.len(), 3);
-        
+
         // 验证 ID 是唯一的
         for i in 0..ids.len() {
-            for j in (i+1)..ids.len() {
+            for j in (i + 1)..ids.len() {
                 assert_ne!(ids[i], ids[j]);
             }
         }
-        
+
         pool.shutdown().await;
     }
-    
+
     /// 测试优雅关闭
     #[tokio::test]
     async fn test_graceful_shutdown() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(4);
         let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
-        
+
         // 发送一些任务
         for i in 0..10 {
             let task = TestTask {
@@ -824,35 +853,38 @@ mod tests {
             // 轮流发送到不同 worker
             handles[i % 4].send_task(task).await.unwrap();
         }
-        
+
         // 给 workers 一些时间处理任务
         sleep(Duration::from_millis(50)).await;
-        
+
         // 关闭协程池
         pool.shutdown().await;
-        
+
         // 验证所有 workers 已退出
         assert_eq!(pool.worker_count(), 0);
     }
-    
+
     /// 测试失败执行器
     #[tokio::test]
     async fn test_failing_executor() {
         let executor = FailingExecutor;
         let contexts = create_contexts_with_stats(2);
         let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
-        
+
         // 发送任务
         let task = TestTask {
             id: 1,
             data: "test".to_string(),
         };
         handles[0].send_task(task).await.unwrap();
-        
+
         // 接收结果
         if let Some(result) = result_receiver.recv().await {
             match result {
-                TestResult::Failed { worker_id: _, error } => {
+                TestResult::Failed {
+                    worker_id: _,
+                    error,
+                } => {
                     assert_eq!(error, "intentional failure");
                 }
                 _ => panic!("Expected failed result"),
@@ -860,32 +892,44 @@ mod tests {
         } else {
             panic!("No result received");
         }
-        
+
         pool.shutdown().await;
     }
-    
+
     /// 测试 WorkerHandle 克隆
     #[tokio::test]
     async fn test_worker_handle_clone() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(1);
         let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
-        
+
         // 克隆句柄
         let handle1 = handles[0].clone();
         let handle2 = handle1.clone();
-        
+
         // 两个句柄都应该有相同的 worker_id
         assert_eq!(handle1.worker_id(), handle2.worker_id());
-        
+
         // 两个句柄都能发送任务
-        handle1.send_task(TestTask { id: 1, data: "test1".to_string() }).await.unwrap();
-        handle2.send_task(TestTask { id: 2, data: "test2".to_string() }).await.unwrap();
-        
+        handle1
+            .send_task(TestTask {
+                id: 1,
+                data: "test1".to_string(),
+            })
+            .await
+            .unwrap();
+        handle2
+            .send_task(TestTask {
+                id: 2,
+                data: "test2".to_string(),
+            })
+            .await
+            .unwrap();
+
         // 接收结果
         result_receiver.recv().await;
         result_receiver.recv().await;
-        
+
         pool.shutdown().await;
     }
 }

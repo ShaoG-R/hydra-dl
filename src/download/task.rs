@@ -1,21 +1,24 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use log::{error, info};
-use arc_swap::ArcSwap;
-use tokio::sync::mpsc;
-use parking_lot::RwLock;
-use rustc_hash::FxHashSet;
-use crate::{download::{
-    progress_reporter::ProgressReporter,
-    progressive::{ProgressiveLauncher, WorkerLaunchRequest},
-    task_allocator::{CompletionResult, FailedRange, TaskAllocatorActor, TaskAllocatorHandle},
-    worker_health_checker::WorkerHealthChecker,
-}, pool::download::DownloadWorkerHandle};
-use crate::utils::writer::MmapWriter;
 use crate::DownloadError;
+use crate::download::DownloadTaskParams;
 use crate::pool::download::DownloadWorkerPool;
 use crate::utils::io_traits::HttpClient;
-use crate::download::DownloadTaskParams;
+use crate::utils::writer::MmapWriter;
+use crate::{
+    download::{
+        progress_reporter::ProgressReporter,
+        progressive::{ProgressiveLauncher, WorkerLaunchRequest},
+        task_allocator::{CompletionResult, FailedRange, TaskAllocatorActor, TaskAllocatorHandle},
+        worker_health_checker::WorkerHealthChecker,
+    },
+    pool::download::DownloadWorkerHandle,
+};
+use arc_swap::ArcSwap;
+use log::{error, info};
+use parking_lot::RwLock;
+use rustc_hash::FxHashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// 下载任务执行器
 ///
@@ -61,13 +64,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 获取 global_stats
         let global_stats = Arc::new(crate::utils::stats::TaskStats::from_config(config.speed()));
-        
+
         // worker_handles 占位，稍后填充
         let worker_handles = Arc::new(ArcSwap::from_pointee(im::HashMap::new()));
-        
+
         // 基准时间间隔：50ms
         let base_offset = std::time::Duration::from_millis(50);
-        
+
         // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
         let mut progressive_launcher = ProgressiveLauncher::new(
             Arc::clone(&config),
@@ -78,14 +81,15 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             config.speed().instant_speed_window(),
             std::time::Duration::ZERO,
         );
-        
+
         // 取出启动请求接收器
-        let launch_request_rx = progressive_launcher.take_launch_request_rx()
+        let launch_request_rx = progressive_launcher
+            .take_launch_request_rx()
             .expect("launch_request_rx should be available");
-        
+
         // 创建 active_workers 共享状态（使用 RwLock 确保 TaskAllocator 和 HealthChecker 同步）
         let active_workers = Arc::new(RwLock::new(FxHashSet::default()));
-        
+
         // 创建健康检查器（actor 模式） - 偏移 50ms
         let mut health_checker = WorkerHealthChecker::new(
             Arc::clone(&config),
@@ -94,9 +98,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             Arc::clone(&active_workers),
             base_offset,
         );
-        
+
         // 取出取消请求接收器
-        let cancel_request_rx = health_checker.take_cancel_request_rx()
+        let cancel_request_rx = health_checker
+            .take_cancel_request_rx()
             .expect("cancel_request_rx should be available");
 
         // 第一批 worker 数量
@@ -114,11 +119,12 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         )?;
 
         // 使用实际的 worker_id（从 handle 获取）填充 worker_handles
-        let initial_worker_handles: im::HashMap<u64, _> = initial_handles.into_iter()
+        let initial_worker_handles: im::HashMap<u64, _> = initial_handles
+            .into_iter()
             .map(|handle| (handle.worker_id(), handle))
             .collect();
         worker_handles.store(Arc::new(initial_worker_handles));
-        
+
         // 创建并启动任务分配器 Actor
         let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(
             allocator,
@@ -130,7 +136,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             Arc::clone(&worker_handles),
             Arc::clone(&active_workers),
         );
-        
+
         // 创建进度报告器（使用配置的统计窗口作为更新间隔） - 偏移 100ms
         let progress_reporter = ProgressReporter::new(
             progress_sender,
@@ -142,7 +148,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         );
 
         // 注册第一批 workers（会自动触发任务分配）
-        task_allocator_handle.register_new_workers(worker_handles.load().keys().cloned().collect()).await;
+        task_allocator_handle
+            .register_new_workers(worker_handles.load().keys().cloned().collect())
+            .await;
 
         Ok(Self {
             pool,
@@ -158,14 +166,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         })
     }
 
-
     /// 等待所有 range 完成
     ///
     /// 动态分配任务，支持失败重试
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
     pub(super) async fn wait_for_completion(&mut self) -> crate::Result<Vec<FailedRange>> {
         // 注意：任务分配已在注册 workers 时自动触发，这里直接进入事件循环
-        
+
         // 事件循环：分发各种事件到对应的处理器
         let completion_result = loop {
             tokio::select! {
@@ -210,18 +217,20 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         }
     }
 
-    
     /// 处理 worker 启动请求（由 progressive_launcher actor 发送）
     async fn handle_launch_request(&mut self, request: WorkerLaunchRequest) {
         let WorkerLaunchRequest { count, stage } = request;
-        
+
         if let Err(e) = self.execute_worker_launch(count, stage).await {
             error!("渐进式启动失败: {:?}", e);
         }
     }
 
     /// 关闭并清理资源
-    pub(super) async fn shutdown_and_cleanup(mut self, error_msg: Option<String>) -> crate::Result<()> {
+    pub(super) async fn shutdown_and_cleanup(
+        mut self,
+        error_msg: Option<String>,
+    ) -> crate::Result<()> {
         // 发送错误事件
         if let Some(ref msg) = error_msg {
             self.progress_reporter.send_error(msg).await;
@@ -229,16 +238,16 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 关闭 workers（发送关闭信号）
         self.pool.shutdown().await;
-        
+
         // 关闭 progress reporter actor
         self.progress_reporter.shutdown().await;
-        
+
         // 关闭 progressive launcher actor 并等待其完全停止
         self.progressive_launcher.shutdown_and_wait().await;
-        
+
         // 关闭 health checker actor 并等待其完全停止
         self.health_checker.shutdown_and_wait().await;
-        
+
         // 关闭 TaskAllocator Actor 并等待其完全停止
         self.task_allocator.shutdown_and_wait().await;
 
@@ -260,18 +269,18 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 释放 pool（它持有 writer 的共享）
         drop(pool);
-        
+
         // 关闭 progress reporter actor
         self.progress_reporter.shutdown().await;
-        
+
         // 关闭 progressive launcher actor 并等待其完全停止
         // 这很重要，因为 actor 持有 written_bytes 的 Arc 引用
         // 必须等待它释放后才能 finalize writer
         self.progressive_launcher.shutdown_and_wait().await;
-        
+
         // 关闭 health checker actor 并等待其完全停止
         self.health_checker.shutdown_and_wait().await;
-        
+
         // 关闭 TaskAllocator Actor 并等待其完全停止
         self.task_allocator.shutdown_and_wait().await;
 
@@ -299,7 +308,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     ///
     /// Worker 句柄的克隆，如果 worker 不存在则返回 `None`
     #[inline]
-    fn get_worker_handle(&self, worker_id: u64) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
+    fn get_worker_handle(
+        &self,
+        worker_id: u64,
+    ) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
         self.worker_handles.load().get(&worker_id).cloned()
     }
 
@@ -324,11 +336,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     }
 
     /// 执行 worker 启动（内部方法）
-    async fn execute_worker_launch(
-        &mut self,
-        count: u64,
-        stage: usize,
-    ) -> crate::Result<()> {
+    async fn execute_worker_launch(&mut self, count: u64, stage: usize) -> crate::Result<()> {
         let current_worker_count = self.pool.worker_count();
         let next_target = current_worker_count + count;
 
@@ -352,7 +360,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 }
                 self.worker_handles.store(Arc::new(new_handles));
                 ids
-            },
+            }
             Err(e) => {
                 error!("添加新 workers 失败: {:?}", e);
                 return Err(e);
@@ -360,7 +368,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         };
 
         // 为新启动的worker加入队列（使用实际的 worker_id）
-        self.task_allocator.register_new_workers(new_worker_ids).await;
+        self.task_allocator
+            .register_new_workers(new_worker_ids)
+            .await;
 
         Ok(())
     }

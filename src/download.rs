@@ -1,27 +1,27 @@
+use crate::utils::io_traits::HttpClient;
 use crate::utils::writer::MmapWriter;
 use crate::{DownloadError, Result};
+use kestrel_timer::TimerService;
 use log::{info, warn};
+use ranged_mmap::RangeAllocator;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use kestrel_timer::TimerService;
-use crate::utils::io_traits::HttpClient;
-use ranged_mmap::RangeAllocator;
 
-mod progressive;
-mod task_allocator;
 mod progress_reporter;
-mod worker_health_checker;
+mod progressive;
 pub mod task;
+mod task_allocator;
+mod worker_health_checker;
 
 pub use progress_reporter::{DownloadProgress, WorkerStatSnapshot};
-pub use worker_health_checker::WorkerSpeed;
 use task::DownloadTask;
+pub use worker_health_checker::WorkerSpeed;
 
 /// 下载任务句柄
-/// 
+///
 /// 封装了正在进行的下载任务，提供进度监听和等待完成的接口
 pub struct DownloadHandle {
     /// 接收进度更新的 channel
@@ -32,24 +32,24 @@ pub struct DownloadHandle {
 
 impl DownloadHandle {
     /// 等待下载完成
-    /// 
+    ///
     /// 此方法会消费 handle 并等待下载任务完成
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// 成功时返回 `Ok(())`，失败时返回错误信息
     pub async fn wait(self) -> Result<()> {
         self.completion_handle
             .await
             .map_err(|e| DownloadError::TaskPanic(e.to_string()))?
     }
-    
+
     /// 获取进度接收器的可变引用
-    /// 
+    ///
     /// 使用此方法可以循环接收进度更新
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```no_run
     /// # use hydra_dl::{download_ranged, DownloadProgress, DownloadConfig};
     /// # use kestrel_timer::{TimerWheel, config::ServiceConfig};
@@ -60,12 +60,12 @@ impl DownloadHandle {
     /// let timer = TimerWheel::with_defaults();
     /// let timer_service = timer.create_service(ServiceConfig::default());
     /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config, timer_service).await.unwrap();
-    /// 
+    ///
     /// while let Some(progress) = handle.progress_receiver().recv().await {
     ///     match progress {
     ///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
     ///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
-    ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers", 
+    ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers",
     ///                 percentage, avg_speed / 1024.0 / 1024.0, worker_stats.len());
     ///         }
     ///         DownloadProgress::Completed { .. } => {
@@ -74,24 +74,24 @@ impl DownloadHandle {
     ///         _ => {}
     ///     }
     /// }
-    /// 
+    ///
     /// handle.wait().await.unwrap();
     /// # }
     /// ```
     pub fn progress_receiver(&mut self) -> &mut Receiver<DownloadProgress> {
         &mut self.progress_rx
     }
-    
+
     /// 同时接收进度并等待完成
-    /// 
+    ///
     /// 这是一个便捷方法，会持续接收进度更新直到下载完成
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `callback` - 每次收到进度更新时调用的回调函数
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// 成功时返回 `Ok(())`，失败时返回错误信息
     pub async fn wait_with_progress<F>(mut self, mut callback: F) -> Result<()>
     where
@@ -114,9 +114,11 @@ impl DownloadHandle {
                 }
             }
         }
-        
+
         // channel 关闭后等待任务完成
-        self.completion_handle.await.map_err(|e| DownloadError::TaskPanic(e.to_string()))?
+        self.completion_handle
+            .await
+            .map_err(|e| DownloadError::TaskPanic(e.to_string()))?
     }
 }
 
@@ -142,15 +144,14 @@ pub struct DownloadTaskParams<C: HttpClient> {
     config: Arc<crate::config::DownloadConfig>,
 }
 
-
 /// 使用 Range 请求下载单个文件（内部泛型实现）
-/// 
+///
 /// 为此下载任务创建独立的协程池，下载完成后销毁
 /// Workers 直接写入共享的 RangeWriter，减少内存拷贝
 /// 使用动态分块机制，根据实时速度自动调整分块大小
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `config` - 下载配置，包含动态分块策略和并发控制参数
 /// * `progress_sender` - 可选的进度更新发送器，通过 channel 发送进度信息
 async fn download_ranged_generic<C>(
@@ -165,8 +166,11 @@ where
     C: HttpClient + Clone + Send + 'static,
 {
     let worker_count = config.concurrency().worker_count();
-    
-    info!("准备 Range 下载: {} ({} 个 workers, 动态分块)", url, worker_count);
+
+    info!(
+        "准备 Range 下载: {} ({} 个 workers, 动态分块)",
+        url, worker_count
+    );
 
     // 获取文件元数据
     let metadata = crate::utils::fetch::fetch_file_metadata(&client, url).await?;
@@ -180,14 +184,20 @@ where
         return Ok(crate::utils::fetch::fetch_file(&client, task).await?);
     }
 
-    let content_length = metadata.content_length.ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
+    let content_length = metadata
+        .content_length
+        .ok_or_else(|| DownloadError::Other("无法获取文件大小".to_string()))?;
 
     let content_length = match std::num::NonZeroU64::new(content_length) {
         Some(length) => length,
         None => return Err(DownloadError::Other("文件大小无效".to_string())),
     };
 
-    info!("文件大小: {} bytes ({:.2} MB)", content_length.get(), content_length.get() as f64 / 1024.0 / 1024.0);
+    info!(
+        "文件大小: {} bytes ({:.2} MB)",
+        content_length.get(),
+        content_length.get() as f64 / 1024.0 / 1024.0
+    );
     info!(
         "动态分块配置: 初始 {} bytes, 范围 {} ~ {} bytes",
         config.chunk().initial_size(),
@@ -211,12 +221,15 @@ where
         total_size: content_length,
         timer_service,
         config: Arc::clone(&config),
-    }).await?;
-    
+    })
+    .await?;
+
     // 发送开始事件（使用第一个 worker 的初始分块大小）
     let current_worker_count = task.worker_count();
     let initial_chunk_size = task.get_worker_chunk_size(0);
-    task.progress_reporter().send_started_event(current_worker_count, initial_chunk_size).await;
+    task.progress_reporter()
+        .send_started_event(current_worker_count, initial_chunk_size)
+        .await;
 
     // 等待所有任务完成（内部会动态分配任务）
     let failed_ranges = task.wait_for_completion().await?;
@@ -238,33 +251,33 @@ where
 }
 
 /// 使用 Range 请求下载单个文件（公共API）
-/// 
+///
 /// 为此下载任务创建独立的协程池，下载完成后销毁
 /// Workers 直接写入共享的 RangeWriter，减少内存拷贝
 /// 使用动态分块机制，根据实时下载速度自动调整分块大小
-/// 
+///
 /// **破坏性变更**：此函数现在接受目录路径而非文件路径，并自动从服务器或 URL 提取文件名
-/// 
+///
 /// # Arguments
 /// * `url` - 下载 URL
 /// * `save_dir` - 保存目录路径
 /// * `config` - 下载配置（包含动态分块参数、worker数等）
-/// 
+///
 /// # Returns
-/// 
+///
 /// 返回 `(DownloadHandle, PathBuf)`，其中：
 /// - `DownloadHandle` - 可以通过它监听下载进度并等待完成
 /// - `PathBuf` - 实际保存的文件路径（目录 + 自动检测的文件名）
-/// 
+///
 /// # 文件名检测优先级
-/// 
+///
 /// 1. Content-Disposition header（服务器建议的文件名）
 /// 2. 重定向后 URL 中的文件名
 /// 3. 原始 URL 中的文件名
 /// 4. 时间戳文件名 `file_{unix_timestamp}`
-/// 
+///
 /// # Example
-/// 
+///
 /// ```no_run
 /// # use hydra_dl::{download_ranged, DownloadConfig, DownloadProgress};
 /// # use hydra_dl::timer::{TimerWheel, TimerService, ServiceConfig};
@@ -281,27 +294,27 @@ where
 ///     config,
 ///     service,
 /// ).await?;
-/// 
+///
 /// println!("文件将保存到: {:?}", save_path);
-/// 
+///
 /// // 监听进度
 /// while let Some(progress) = handle.progress_receiver().recv().await {
 ///     match progress {
 ///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
 ///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
-///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers", 
-///                 percentage, 
+///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers",
+///                 percentage,
 ///                 avg_speed / 1024.0 / 1024.0,
 ///                 worker_stats.len());
 ///         }
 ///         DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {
-///             println!("下载完成！{:.2} MB in {:.2}s, {} workers", 
+///             println!("下载完成！{:.2} MB in {:.2}s, {} workers",
 ///                 total_bytes as f64 / 1024.0 / 1024.0, total_time, worker_stats.len());
 ///         }
 ///         _ => {}
 ///     }
 /// }
-/// 
+///
 /// // 等待下载完成
 /// handle.wait().await?;
 /// # Ok(())
@@ -314,46 +327,48 @@ pub async fn download_ranged(
     timer_service: TimerService,
 ) -> Result<(DownloadHandle, std::path::PathBuf)> {
     use reqwest::Client;
-    
+
     // 创建带超时设置的 HTTP 客户端
     let client = Client::builder()
         .timeout(config.network().timeout())
         .connect_timeout(config.network().connect_timeout())
         .build()?;
-    
+
     // 获取文件元数据以确定文件名
     info!("正在获取文件元数据: {}", url);
     let metadata = crate::utils::fetch::fetch_file_metadata(&client, url).await?;
-    
+
     // 确定文件名
-    let filename = metadata.suggested_filename
+    let filename = metadata
+        .suggested_filename
         .ok_or_else(|| DownloadError::Other("无法确定文件名".to_string()))?;
-    
+
     // 组合完整路径
     let save_path = save_dir.as_ref().join(&filename);
-    
+
     info!("自动检测到文件名: {}", filename);
     info!("保存路径: {:?}", save_path);
-    
+
     // 创建进度 channel
     let (progress_tx, progress_rx) = mpsc::channel(100);
-    
+
     // 克隆必要的参数给后台任务
     let url = url.to_string();
     let save_path_clone = save_path.clone();
-    
+
     // 启动后台下载任务
     let completion_handle = tokio::spawn(async move {
         download_ranged_generic(
-            client, 
-            &url, 
-            save_path_clone, 
+            client,
+            &url,
+            save_path_clone,
             &config,
             Some(progress_tx),
             timer_service,
-        ).await
+        )
+        .await
     });
-    
+
     Ok((
         DownloadHandle {
             progress_rx,
@@ -367,9 +382,9 @@ pub async fn download_ranged(
 mod tests {
     use super::*;
     use crate::utils::io_traits::mock::MockHttpClient;
-    use reqwest::{header::HeaderMap, StatusCode};
     use bytes::Bytes;
-    use kestrel_timer::{config::ServiceConfig, TimerWheel};
+    use kestrel_timer::{TimerWheel, config::ServiceConfig};
+    use reqwest::{StatusCode, header::HeaderMap};
 
     fn create_timer_service() -> (TimerWheel, TimerService) {
         let timer = TimerWheel::with_defaults();
@@ -391,12 +406,11 @@ mod tests {
         // 设置 HEAD 请求响应（检查 Range 支持）
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
-        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
+        head_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
         );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置 Range 请求响应
         // 假设分成 3 个 range：0-11, 12-23, 24-35
@@ -434,12 +448,13 @@ mod tests {
         let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(1))
-            .chunk(|c| c
-                .initial_size(chunk_size)
-                .min_size(1)  // 设置为 1 以允许小文件测试
-                .max_size(chunk_size))  // 固定分块大小以便测试
+            .chunk(|c| {
+                c.initial_size(chunk_size)
+                    .min_size(1) // 设置为 1 以允许小文件测试
+                    .max_size(chunk_size)
+            }) // 固定分块大小以便测试
             .build();
-        
+
         let result = download_ranged_generic(
             client.clone(),
             test_url,
@@ -449,7 +464,6 @@ mod tests {
             timer_service,
         )
         .await;
-    
 
         assert!(result.is_ok(), "下载应该成功: {:?}", result);
 
@@ -472,16 +486,18 @@ mod tests {
         // 设置 HEAD 请求响应（不支持 Range）
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "none".parse().unwrap());
-        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
+        head_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
         );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置普通 GET 请求响应
         let mut get_headers = HeaderMap::new();
-        get_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
+        get_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
+        );
         client.set_response(
             test_url,
             StatusCode::OK,
@@ -492,12 +508,13 @@ mod tests {
         // 执行下载
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(2))
-            .chunk(|c| c
-                .initial_size(test_data.len() as u64)  // 单次分块完成
-                .min_size(1)
-                .max_size(test_data.len() as u64))
+            .chunk(|c| {
+                c.initial_size(test_data.len() as u64) // 单次分块完成
+                    .min_size(1)
+                    .max_size(test_data.len() as u64)
+            })
             .build();
-        
+
         let result = download_ranged_generic(
             client.clone(),
             test_url,
@@ -513,8 +530,15 @@ mod tests {
         // 验证使用了 HEAD 和 GET 请求
         let log = client.get_request_log();
         assert!(log.len() >= 2, "应该有 HEAD 和 GET 请求");
-        assert!(log.iter().any(|s| s.starts_with("HEAD")), "应该有 HEAD 请求");
-        assert!(log.iter().any(|s| s.starts_with("GET http://example.com/file.bin")), "应该有 GET 请求");
+        assert!(
+            log.iter().any(|s| s.starts_with("HEAD")),
+            "应该有 HEAD 请求"
+        );
+        assert!(
+            log.iter()
+                .any(|s| s.starts_with("GET http://example.com/file.bin")),
+            "应该有 GET 请求"
+        );
     }
 
     #[tokio::test]
@@ -530,12 +554,11 @@ mod tests {
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
-        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
+        head_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
         );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置 Range 请求响应（4 个 range）
         let range_count = 4;
@@ -572,12 +595,9 @@ mod tests {
         let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(2))
-            .chunk(|c| c
-                .initial_size(chunk_size)
-                .min_size(1)
-                .max_size(chunk_size))  // 固定分块大小以便测试
+            .chunk(|c| c.initial_size(chunk_size).min_size(1).max_size(chunk_size)) // 固定分块大小以便测试
             .build();
-        
+
         let result = download_ranged_generic(
             client.clone(),
             test_url,
@@ -605,12 +625,11 @@ mod tests {
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
-        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
+        head_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
         );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置单个 Range 请求（因为会被调整为 1 个分块）
         let mut headers = HeaderMap::new();
@@ -632,10 +651,11 @@ mod tests {
         // 使用 1 MB 的初始分块大小下载 1 MB 文件
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(4))
-            .chunk(|c| c
-                .initial_size(1 * 1024 * 1024)  // 1 MB
-                .min_size(512 * 1024)  // 512 KB
-                .max_size(2 * 1024 * 1024))  // 2 MB
+            .chunk(|c| {
+                c.initial_size(1 * 1024 * 1024) // 1 MB
+                    .min_size(512 * 1024) // 512 KB
+                    .max_size(2 * 1024 * 1024)
+            }) // 2 MB
             .build();
 
         let result = download_ranged_generic(
@@ -667,11 +687,7 @@ mod tests {
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
         head_headers.insert("content-length", file_size.to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
-        );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 使用 2MB 的分块大小
         let chunk_size = 2 * 1024 * 1024;
@@ -706,10 +722,11 @@ mod tests {
 
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(3))
-            .chunk(|c| c
-                .initial_size(chunk_size as u64)
-                .min_size(chunk_size as u64)
-                .max_size(chunk_size as u64))  // 固定 2 MB 分块
+            .chunk(|c| {
+                c.initial_size(chunk_size as u64)
+                    .min_size(chunk_size as u64)
+                    .max_size(chunk_size as u64)
+            }) // 固定 2 MB 分块
             .build();
 
         let result = download_ranged_generic(
@@ -740,11 +757,7 @@ mod tests {
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
         head_headers.insert("content-length", file_size.to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
-        );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 使用 10MB 的分块大小
         let chunk_size = 10 * 1024 * 1024;
@@ -779,10 +792,11 @@ mod tests {
 
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(4))
-            .chunk(|c| c
-                .initial_size(chunk_size as u64)
-                .min_size(chunk_size as u64)
-                .max_size(chunk_size as u64))  // 固定 10 MB 分块
+            .chunk(|c| {
+                c.initial_size(chunk_size as u64)
+                    .min_size(chunk_size as u64)
+                    .max_size(chunk_size as u64)
+            }) // 固定 10 MB 分块
             .build();
 
         let result = download_ranged_generic(
@@ -812,12 +826,11 @@ mod tests {
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
-        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
+        head_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
         );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置足够多的 Range 请求响应
         let chunk_size = 10;
@@ -853,13 +866,12 @@ mod tests {
         // 配置渐进式启动：[0.5, 1.0] 表示先启动2个worker，再启动剩余2个
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(4))
-            .chunk(|c| c
-                .initial_size(chunk_size as u64)
-                .min_size(chunk_size as u64)
-                .max_size(chunk_size as u64))
-            .progressive(|p| p
-                .worker_ratios(vec![0.5, 1.0])
-                .min_speed_threshold(0))  // 设置为0以便立即启动下一批
+            .chunk(|c| {
+                c.initial_size(chunk_size as u64)
+                    .min_size(chunk_size as u64)
+                    .max_size(chunk_size as u64)
+            })
+            .progressive(|p| p.worker_ratios(vec![0.5, 1.0]).min_speed_threshold(None)) // 设置为0以便立即启动下一批
             .build();
 
         let result = download_ranged_generic(
@@ -880,61 +892,85 @@ mod tests {
         // 测试渐进式启动配置的正确性
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(12))
-            .progressive(|p| p
-                .worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
-                .min_speed_threshold(5 * 1024 * 1024))  // 5 MB/s
+            .progressive(|p| {
+                p.worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
+                    .min_speed_threshold(Some(NonZeroU64::new(5 * 1024 * 1024).unwrap()))
+            }) // 5 MB/s
             .build();
 
         assert_eq!(config.concurrency().worker_count(), 12);
-        assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
-        assert_eq!(config.progressive().min_speed_threshold(), 5 * 1024 * 1024);
+        assert_eq!(
+            config.progressive().worker_ratios(),
+            &[0.25, 0.5, 0.75, 1.0]
+        );
+        assert_eq!(
+            config.progressive().min_speed_threshold(),
+            Some(NonZeroU64::new(5 * 1024 * 1024).unwrap())
+        );
     }
 
     #[test]
     fn test_retry_config() {
         // 测试重试配置的正确性
         let config = crate::config::DownloadConfig::builder()
-            .retry(|r| r
-                .max_retry_count(5)
-                .retry_delays(vec![
+            .retry(|r| {
+                r.max_retry_count(5).retry_delays(vec![
                     std::time::Duration::from_secs(1),
                     std::time::Duration::from_secs(2),
                     std::time::Duration::from_secs(5),
                 ])
-            )
+            })
             .build();
 
         assert_eq!(config.retry().max_retry_count(), 5);
         assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(config.retry().retry_delays()[0], std::time::Duration::from_secs(1));
-        assert_eq!(config.retry().retry_delays()[1], std::time::Duration::from_secs(2));
-        assert_eq!(config.retry().retry_delays()[2], std::time::Duration::from_secs(5));
+        assert_eq!(
+            config.retry().retry_delays()[0],
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            config.retry().retry_delays()[1],
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            config.retry().retry_delays()[2],
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]
     fn test_retry_config_default() {
         // 测试默认重试配置
         let config = crate::config::DownloadConfig::default();
-        
+
         assert_eq!(config.retry().max_retry_count(), 3);
         assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(config.retry().retry_delays()[0], std::time::Duration::from_secs(1));
-        assert_eq!(config.retry().retry_delays()[1], std::time::Duration::from_secs(2));
-        assert_eq!(config.retry().retry_delays()[2], std::time::Duration::from_secs(3));
+        assert_eq!(
+            config.retry().retry_delays()[0],
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            config.retry().retry_delays()[1],
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            config.retry().retry_delays()[2],
+            std::time::Duration::from_secs(3)
+        );
     }
 
     #[test]
     fn test_retry_delays_empty_uses_default() {
         // 测试空延迟序列使用默认值
         let config = crate::config::DownloadConfig::builder()
-            .retry(|r| { r
-                .retry_delays(vec![])
-            })
+            .retry(|r| r.retry_delays(vec![]))
             .build();
-            
 
         assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(config.retry().retry_delays()[0], std::time::Duration::from_secs(1));
+        assert_eq!(
+            config.retry().retry_delays()[0],
+            std::time::Duration::from_secs(1)
+        );
     }
 
     #[tokio::test]
@@ -951,12 +987,11 @@ mod tests {
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
-        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
+        head_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
         );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置 Range 请求响应
         let chunk_size = 12;
@@ -1014,14 +1049,18 @@ mod tests {
         // 配置：1 个 worker，最大重试 3 次，快速重试（100ms）
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(1))
-            .chunk(|c| c.initial_size(chunk_size as u64).min_size(1).max_size(chunk_size as u64))
-            .retry(|r| r
-                .max_retry_count(3)
-                .retry_delays(vec![
+            .chunk(|c| {
+                c.initial_size(chunk_size as u64)
+                    .min_size(1)
+                    .max_size(chunk_size as u64)
+            })
+            .retry(|r| {
+                r.max_retry_count(3).retry_delays(vec![
                     std::time::Duration::from_millis(100),
                     std::time::Duration::from_millis(200),
                     std::time::Duration::from_millis(300),
-                ]))
+                ])
+            })
             .build();
 
         let result = download_ranged_generic(
@@ -1051,12 +1090,11 @@ mod tests {
         // 设置 HEAD 请求响应
         let mut head_headers = HeaderMap::new();
         head_headers.insert("accept-ranges", "bytes".parse().unwrap());
-        head_headers.insert("content-length", test_data.len().to_string().parse().unwrap());
-        client.set_head_response(
-            test_url,
-            StatusCode::OK,
-            head_headers,
+        head_headers.insert(
+            "content-length",
+            test_data.len().to_string().parse().unwrap(),
         );
+        client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置 Range 请求响应：第一个 range 始终失败
         let chunk_size = 12;
@@ -1105,13 +1143,17 @@ mod tests {
         // 配置：1 个 worker，最大重试 2 次，快速重试（50ms）
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(1))
-            .chunk(|c| c.initial_size(chunk_size as u64).min_size(1).max_size(chunk_size as u64))
-            .retry(|r| r
-                .max_retry_count(2)
-                .retry_delays(vec![
+            .chunk(|c| {
+                c.initial_size(chunk_size as u64)
+                    .min_size(1)
+                    .max_size(chunk_size as u64)
+            })
+            .retry(|r| {
+                r.max_retry_count(2).retry_delays(vec![
                     std::time::Duration::from_millis(50),
                     std::time::Duration::from_millis(50),
-                ]))
+                ])
+            })
             .build();
 
         let result = download_ranged_generic(
@@ -1126,34 +1168,48 @@ mod tests {
 
         // 应该失败，因为达到最大重试次数
         assert!(result.is_err(), "下载应该失败（达到最大重试次数）");
-        
+
         let error_msg = format!("{:?}", result.unwrap_err());
-        assert!(error_msg.contains("达到最大重试次数"), "错误消息应该包含重试信息");
+        assert!(
+            error_msg.contains("达到最大重试次数"),
+            "错误消息应该包含重试信息"
+        );
     }
 
     #[tokio::test]
     async fn test_retry_delay_sequence() {
         // 测试重试延迟序列正确使用
         let config = crate::config::DownloadConfig::builder()
-            .retry(|r| r
-                .max_retry_count(5)
-                .retry_delays(vec![
+            .retry(|r| {
+                r.max_retry_count(5).retry_delays(vec![
                     std::time::Duration::from_secs(1),
                     std::time::Duration::from_secs(2),
-                ]))
+                ])
+            })
             .build();
 
         let delays = config.retry().retry_delays();
-        
+
         // 第 0 次重试使用第一个延迟
-        assert_eq!(delays[0.min(delays.len() - 1)], std::time::Duration::from_secs(1));
-        
+        assert_eq!(
+            delays[0.min(delays.len() - 1)],
+            std::time::Duration::from_secs(1)
+        );
+
         // 第 1 次重试使用第二个延迟
-        assert_eq!(delays[1.min(delays.len() - 1)], std::time::Duration::from_secs(2));
-        
+        assert_eq!(
+            delays[1.min(delays.len() - 1)],
+            std::time::Duration::from_secs(2)
+        );
+
         // 第 2 次及以后重试使用最后一个延迟
-        assert_eq!(delays[2.min(delays.len() - 1)], std::time::Duration::from_secs(2));
-        assert_eq!(delays[10.min(delays.len() - 1)], std::time::Duration::from_secs(2));
+        assert_eq!(
+            delays[2.min(delays.len() - 1)],
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            delays[10.min(delays.len() - 1)],
+            std::time::Duration::from_secs(2)
+        );
     }
 }
-

@@ -14,14 +14,15 @@ use crate::pool::common::WorkerHandle;
 use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::{
     chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy},
-    fetch::{RangeFetcher, FetchRangeResult},
+    fetch::{FetchRangeResult, RangeFetcher},
     io_traits::HttpClient,
     stats::{TaskStats, WorkerStats},
     writer::MmapWriter,
 };
 use async_trait::async_trait;
-use log::{debug, error, info};
 use lite_sync::oneshot::lite;
+use log::{debug, error, info};
+use net_bytes::{DownloadSpeed, FormattedValue, SizeStandard};
 
 use std::sync::Arc;
 
@@ -60,6 +61,8 @@ pub(crate) struct DownloadWorkerExecutor<C> {
     client: C,
     /// 共享的文件写入器
     writer: MmapWriter,
+    /// 文件大小标准
+    size_standard: SizeStandard,
 }
 
 impl<C> DownloadWorkerExecutor<C> {
@@ -69,8 +72,13 @@ impl<C> DownloadWorkerExecutor<C> {
     ///
     /// - `client`: HTTP 客户端
     /// - `writer`: 共享的文件写入器
-    pub(crate) fn new(client: C, writer: MmapWriter) -> Self {
-        Self { client, writer }
+    /// - `size_standard`: 文件大小标准
+    pub(crate) fn new(client: C, writer: MmapWriter, size_standard: SizeStandard) -> Self {
+        Self {
+            client,
+            writer,
+            size_standard,
+        }
     }
 }
 
@@ -83,7 +91,7 @@ where
     type Result = RangeResult;
     type Context = DownloadWorkerContext;
     type Stats = WorkerStats;
-    
+
     async fn execute(
         &self,
         worker_id: u64,
@@ -91,8 +99,13 @@ where
         context: &mut Self::Context,
         stats: &Self::Stats,
     ) -> Self::Result {
-        let RangeTask::Range { url, range, retry_count, cancel_rx } = task;
-        
+        let RangeTask::Range {
+            url,
+            range,
+            retry_count,
+            cancel_rx,
+        } = task;
+
         let (start, end) = range.as_range_tuple();
         debug!(
             "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
@@ -106,12 +119,17 @@ where
             Ok(FetchRangeResult::Complete(data)) => {
                 self.handle_download_complete(worker_id, range, data, context, stats)
             }
-            Ok(FetchRangeResult::Cancelled { data, bytes_downloaded }) => {
-                self.handle_download_cancelled(worker_id, range, data, bytes_downloaded, retry_count)
-            }
-            Err(e) => {
-                self.handle_download_failed(worker_id, range, retry_count, e)
-            }
+            Ok(FetchRangeResult::Cancelled {
+                data,
+                bytes_downloaded,
+            }) => self.handle_download_cancelled(
+                worker_id,
+                range,
+                data,
+                bytes_downloaded,
+                retry_count,
+            ),
+            Err(e) => self.handle_download_failed(worker_id, range, retry_count, e),
         }
     }
 }
@@ -128,8 +146,8 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         cancel_rx: lite::Receiver<()>,
     ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
         use crate::utils::fetch::FetchRange;
-        let fetch_range = FetchRange::from_allocated_range(range)
-            .expect("AllocatedRange 应该总是有效的");
+        let fetch_range =
+            FetchRange::from_allocated_range(range).expect("AllocatedRange 应该总是有效的");
         RangeFetcher::new(&self.client, url, fetch_range, stats)
             .fetch_with_cancel(cancel_rx)
             .await
@@ -157,7 +175,7 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
 
         // 记录 range 完成
         stats.record_range_complete();
-        
+
         // 根据当前速度更新分块大小
         self.update_chunk_size(context, stats);
 
@@ -190,16 +208,19 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         // 有部分数据下载，尝试保存并返回剩余部分
         use std::num::NonZeroU64;
         let bytes_downloaded = NonZeroU64::new(bytes_downloaded).unwrap();
-        
+
         match range.split_at(bytes_downloaded) {
             Ok((downloaded_range, remaining_range)) => {
                 // 尝试写入已下载的部分（忽略写入错误，继续重试剩余部分）
                 if let Err(e) = self.writer.write_range(downloaded_range, data.as_ref()) {
                     error!("Worker #{} 写入已下载的部分数据失败: {:?}", worker_id, e);
                 } else {
-                    debug!("Worker #{} 成功写入已下载的 {} bytes", worker_id, bytes_downloaded);
+                    debug!(
+                        "Worker #{} 成功写入已下载的 {} bytes",
+                        worker_id, bytes_downloaded
+                    );
                 }
-                
+
                 // 返回剩余的 range 用于重试
                 let error_msg = format!(
                     "下载被取消，剩余 range: {}..{}",
@@ -239,8 +260,11 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
     ) -> RangeResult {
         let (start, end) = range.as_range_tuple();
         let error_msg = format!("下载失败: {:?}", error);
-        error!("Worker #{} Range {}..{} {}", worker_id, start, end, error_msg);
-        
+        error!(
+            "Worker #{} Range {}..{} {}",
+            worker_id, start, end, error_msg
+        );
+
         RangeResult::DownloadFailed {
             worker_id,
             range,
@@ -250,24 +274,30 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
     }
 
     /// 根据当前速度更新分块大小
-    fn update_chunk_size(
-        &self,
-        context: &mut DownloadWorkerContext,
-        stats: &WorkerStats,
-    ) {
-        let (instant_speed, valid) = stats.get_instant_speed();
-        if !valid || instant_speed <= 0.0 {
-            return;
-        }
+    fn update_chunk_size(&self, context: &mut DownloadWorkerContext, stats: &WorkerStats) {
+        let instant_speed = stats.get_instant_speed();
+        let window_avg_speed = stats.get_window_avg_speed();
 
-        let avg_speed = stats.get_speed();
-        let current_chunk_size = stats.get_current_chunk_size();
-        let new_chunk_size = context.chunk_strategy.calculate_chunk_size(
-            current_chunk_size,
-            instant_speed,
-            avg_speed,
-        );
-        stats.set_current_chunk_size(new_chunk_size);
+        if let (Some(instant_speed), Some(window_avg_speed)) = (instant_speed, window_avg_speed) {
+            // 只有当两个速度都有效时才更新分块大小
+            let current_chunk_size = stats.get_current_chunk_size();
+            let new_chunk_size = context.chunk_strategy.calculate_chunk_size(
+                current_chunk_size,
+                instant_speed,
+                window_avg_speed,
+            );
+
+            // 更新分块大小
+            stats.set_current_chunk_size(new_chunk_size);
+
+            debug!(
+                "Updated chunk size: {} -> {} (speed: {}, avg: {})",
+                current_chunk_size,
+                new_chunk_size,
+                FormattedValue::new(instant_speed, self.size_standard),
+                FormattedValue::new(window_avg_speed, self.size_standard)
+            );
+        }
     }
 }
 
@@ -344,20 +374,18 @@ impl<C: HttpClient> DownloadWorkerHandle<C> {
     ///
     /// # Returns
     ///
-    /// (实时速度 bytes/s, 是否有效)
-    pub fn instant_speed(&self) -> (f64, bool) {
-        let stats = self.handle.stats();
-        stats.get_instant_speed()
+    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
+    pub fn instant_speed(&self) -> Option<DownloadSpeed> {
+        self.handle.stats().get_instant_speed()
     }
 
     /// 获取该 worker 的窗口平均速度
     ///
     /// # Returns
     ///
-    /// (窗口平均速度 bytes/s, 是否有效)
-    pub fn window_avg_speed(&self) -> (f64, bool) {
-        let stats = self.handle.stats();
-        stats.get_window_avg_speed()
+    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
+    pub fn window_avg_speed(&self) -> Option<DownloadSpeed> {
+        self.handle.stats().get_window_avg_speed()
     }
 
     /// 获取该 worker 的当前分块大小
@@ -407,30 +435,36 @@ where
         writer: MmapWriter,
         config: Arc<crate::config::DownloadConfig>,
         global_stats: Arc<TaskStats>,
-    ) -> Result<(Self, Vec<DownloadWorkerHandle<C>>, tokio::sync::mpsc::Receiver<RangeResult>)> {
+    ) -> Result<(
+        Self,
+        Vec<DownloadWorkerHandle<C>>,
+        tokio::sync::mpsc::Receiver<RangeResult>,
+    )> {
         // 创建执行器（直接 move writer，避免 Arc 克隆）
-        let executor = DownloadWorkerExecutor::new(client, writer);
+        let executor = DownloadWorkerExecutor::new(client, writer, config.speed().size_standard());
 
         // 为每个 worker 创建独立的上下文和统计
-        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..initial_worker_count)
+        let contexts_with_stats: Vec<(
+            DownloadWorkerContext,
+            Arc<crate::utils::stats::WorkerStats>,
+        )> = (0..initial_worker_count)
             .map(|_| {
                 // 通过 parent 创建 child stats
                 let worker_stats = Arc::new(global_stats.create_child());
                 // 设置初始分块大小
                 worker_stats.set_current_chunk_size(config.chunk().initial_size());
                 // 创建独立的分块策略（每个 worker 独立一份，策略是无状态的）
-                let chunk_strategy = 
-                    Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
+                let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
+                    as Box<dyn ChunkStrategy + Send + Sync>;
 
-                let context = DownloadWorkerContext {
-                    chunk_strategy,
-                };
+                let context = DownloadWorkerContext { chunk_strategy };
                 (context, worker_stats)
             })
             .collect();
 
         // 创建通用协程池并获取 worker 句柄和 result_receiver
-        let (pool, worker_handles, result_receiver) = WorkerPool::new(executor, contexts_with_stats)?;
+        let (pool, worker_handles, result_receiver) =
+            WorkerPool::new(executor, contexts_with_stats)?;
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
@@ -440,11 +474,15 @@ where
             .map(DownloadWorkerHandle::new)
             .collect();
 
-        Ok((Self {
-            pool,
-            global_stats,
-            config,
-        }, download_handles, result_receiver))
+        Ok((
+            Self {
+                pool,
+                global_stats,
+                config,
+            },
+            download_handles,
+            result_receiver,
+        ))
     }
 
     /// 动态添加新的 worker
@@ -458,31 +496,32 @@ where
     /// 成功时返回新添加的所有 worker 的句柄，失败时返回错误信息
     pub(crate) async fn add_workers(&mut self, count: u64) -> Result<Vec<DownloadWorkerHandle<C>>> {
         // 创建新的 worker 上下文和统计
-        let contexts_with_stats: Vec<(DownloadWorkerContext, Arc<crate::utils::stats::WorkerStats>)> = (0..count)
+        let contexts_with_stats: Vec<(
+            DownloadWorkerContext,
+            Arc<crate::utils::stats::WorkerStats>,
+        )> = (0..count)
             .map(|_| {
                 let worker_stats = Arc::new(self.global_stats.create_child());
                 // 设置初始分块大小
                 worker_stats.set_current_chunk_size(self.config.chunk().initial_size());
                 // 创建独立的分块策略（策略内部使用原子操作，无需外部锁）
-                let chunk_strategy = 
-                    Box::new(SpeedBasedChunkStrategy::from_config(&self.config)) as Box<dyn ChunkStrategy + Send + Sync>;
+                let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&self.config))
+                    as Box<dyn ChunkStrategy + Send + Sync>;
 
-                let context = DownloadWorkerContext {
-                    chunk_strategy,
-                };
+                let context = DownloadWorkerContext { chunk_strategy };
                 (context, worker_stats)
             })
             .collect();
 
         // 添加新 workers（使用现有的执行器）并获取句柄
         let worker_handles = self.pool.add_workers(contexts_with_stats).await?;
-        
+
         // 将通用句柄转换为下载特定句柄
         let download_handles = worker_handles
             .into_iter()
             .map(DownloadWorkerHandle::new)
             .collect();
-        
+
         Ok(download_handles)
     }
 
@@ -495,16 +534,16 @@ where
     ///
     /// # Returns
     ///
-    /// `(窗口平均速度 bytes/s, 是否有效)`
+    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
     #[allow(dead_code)]
-    pub(crate) fn get_total_window_avg_speed(&self) -> (f64, bool) {
+    pub(crate) fn get_total_window_avg_speed(&self) -> Option<DownloadSpeed> {
         self.global_stats.get_window_avg_speed()
     }
 
     /// 优雅关闭所有 workers
     ///
     /// 发送关闭信号到所有活跃的 worker，让它们停止接收新任务并自动退出清理
-    /// 
+    ///
     /// # Note
     ///
     /// 此方法会等待 workers 退出
@@ -518,12 +557,12 @@ mod tests {
     use super::*;
     use crate::utils::io_traits::mock::MockHttpClient;
     use bytes::Bytes;
-    use reqwest::{header::HeaderMap, StatusCode};
+    use reqwest::{StatusCode, header::HeaderMap};
 
     #[tokio::test]
     async fn test_download_worker_pool_creation() {
         use std::num::NonZeroU64;
-        
+
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
@@ -533,7 +572,8 @@ mod tests {
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
         let global_stats = Arc::new(TaskStats::from_config(config.speed()));
-        let (pool, _handles, _result_receiver) = DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
+        let (pool, _handles, _result_receiver) =
+            DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
 
         assert_eq!(pool.worker_count(), 4);
     }
@@ -541,7 +581,7 @@ mod tests {
     #[tokio::test]
     async fn test_download_worker_pool_stats() {
         use std::num::NonZeroU64;
-        
+
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
@@ -551,7 +591,8 @@ mod tests {
         let worker_count = 3;
         let config = Arc::new(crate::config::DownloadConfig::default());
         let global_stats = Arc::new(TaskStats::from_config(config.speed()));
-        let (pool, _handles, _result_receiver) = DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
+        let (pool, _handles, _result_receiver) =
+            DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
 
         // 初始统计应该都是 0
         let (total_bytes, total_secs, ranges) = pool.global_stats.get_summary();
@@ -560,13 +601,13 @@ mod tests {
         assert_eq!(ranges, 0);
 
         let speed = pool.global_stats.get_speed();
-        assert_eq!(speed, 0.0);
+        assert_eq!(speed, None);
     }
 
     #[tokio::test]
     async fn test_download_worker_pool_shutdown() {
         use std::num::NonZeroU64;
-        
+
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
@@ -575,7 +616,8 @@ mod tests {
 
         let config = Arc::new(crate::config::DownloadConfig::default());
         let global_stats = Arc::new(TaskStats::from_config(config.speed()));
-        let (mut pool, _handles, _result_receiver) = DownloadWorkerPool::new(client.clone(), 2, writer, config, global_stats).unwrap();
+        let (mut pool, _handles, _result_receiver) =
+            DownloadWorkerPool::new(client.clone(), 2, writer, config, global_stats).unwrap();
 
         // 关闭 workers
         pool.shutdown().await;
@@ -588,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn test_download_worker_executor_success() {
         use std::num::NonZeroU64;
-        
+
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJ"; // 20 bytes
 
@@ -596,16 +638,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = MmapWriter::new(save_path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+        let (writer, mut allocator) =
+            MmapWriter::new(save_path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
 
-        let range = allocator.allocate(NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+        let range = allocator
+            .allocate(NonZeroU64::new(test_data.len() as u64).unwrap())
+            .unwrap();
 
         // 设置 Range 响应
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-range",
-            format!("bytes 0-19/20").parse().unwrap(),
-        );
+        headers.insert("content-range", format!("bytes 0-19/20").parse().unwrap());
         client.set_range_response(
             test_url,
             0,
@@ -616,16 +658,14 @@ mod tests {
         );
 
         // 创建执行器（直接 move writer）
-        let executor = DownloadWorkerExecutor::new(client, writer);
+        let executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
 
         // 创建上下文和统计
         let stats = crate::utils::stats::WorkerStats::default();
         let config = crate::config::DownloadConfig::default();
-        let chunk_strategy = 
-            Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
-        let mut context = DownloadWorkerContext {
-            chunk_strategy,
-        };
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
+            as Box<dyn ChunkStrategy + Send + Sync>;
+        let mut context = DownloadWorkerContext { chunk_strategy };
 
         // 执行任务
         let (_cancel_tx, cancel_rx) = lite::channel();
@@ -657,14 +697,15 @@ mod tests {
     #[tokio::test]
     async fn test_download_worker_executor_failure() {
         use std::num::NonZeroU64;
-        
+
         let test_url = "http://example.com/file.bin";
 
         let client = MockHttpClient::new();
         let dir = tempfile::tempdir().unwrap();
         let save_path = dir.path().join("test.bin");
 
-        let (writer, mut allocator) = MmapWriter::new(save_path, NonZeroU64::new(100).unwrap()).unwrap();
+        let (writer, mut allocator) =
+            MmapWriter::new(save_path, NonZeroU64::new(100).unwrap()).unwrap();
 
         let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
 
@@ -679,15 +720,13 @@ mod tests {
         );
 
         // 创建执行器（直接 move writer）
-        let executor = DownloadWorkerExecutor::new(client, writer);
+        let executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
 
         let stats = crate::utils::stats::WorkerStats::default();
         let config = crate::config::DownloadConfig::default();
-        let chunk_strategy = 
-            Box::new(SpeedBasedChunkStrategy::from_config(&config)) as Box<dyn ChunkStrategy + Send + Sync>;
-        let mut context = DownloadWorkerContext {
-            chunk_strategy,
-        };
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
+            as Box<dyn ChunkStrategy + Send + Sync>;
+        let mut context = DownloadWorkerContext { chunk_strategy };
 
         let (_cancel_tx, cancel_rx) = lite::channel();
         let task = RangeTask::Range {
@@ -701,7 +740,9 @@ mod tests {
 
         // 验证结果
         match result {
-            RangeResult::DownloadFailed { worker_id, error, .. } => {
+            RangeResult::DownloadFailed {
+                worker_id, error, ..
+            } => {
                 assert_eq!(worker_id, 0);
                 assert!(error.contains("下载失败"));
             }
@@ -713,6 +754,4 @@ mod tests {
             }
         }
     }
-
 }
-

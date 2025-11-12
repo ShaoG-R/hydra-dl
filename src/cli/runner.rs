@@ -1,9 +1,9 @@
 use log::info;
 
-use crate::{download_ranged, DownloadConfig};
-use super::{Cli, Result};
 use super::progress::ProgressManager;
 use super::utils::format_bytes;
+use super::{Cli, Result};
+use crate::{DownloadConfig, download_ranged};
 use kestrel_timer::{TimerWheel, config::ServiceConfig};
 
 /// 执行下载任务
@@ -13,16 +13,19 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     // 构建下载配置
     let config = DownloadConfig::builder()
         .concurrency(|c| c.worker_count(cli.workers))
-        .chunk(|c| c.initial_size(cli.chunk_size * 1024 * 1024).min_size(cli.min_chunk * 1024 * 1024).max_size(cli.max_chunk * 1024 * 1024))
+        .chunk(|c| {
+            c.initial_size(cli.chunk_size * 1024 * 1024)
+                .min_size(cli.min_chunk * 1024 * 1024)
+                .max_size(cli.max_chunk * 1024 * 1024)
+        })
         .build();
+
+    let size_standard = config.speed().size_standard();
 
     let timer = TimerWheel::with_defaults();
     let timer_service = timer.create_service(ServiceConfig::default());
 
-    info!(
-        "开始下载: {}",
-        cli.url
-    );
+    info!("开始下载: {}", cli.url);
     info!(
         "配置: {} workers, 分块大小: {} ~ {} (初始: {})",
         config.concurrency().worker_count(),
@@ -32,7 +35,8 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
     );
 
     // 启动下载任务（会自动检测文件名）
-    let (mut handle, save_path) = download_ranged(&cli.url, save_dir, config, timer_service).await?;
+    let (mut handle, save_path) =
+        download_ranged(&cli.url, save_dir, config, timer_service).await?;
 
     if cli.quiet {
         // 静默模式：只等待完成
@@ -40,7 +44,7 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
         println!("下载完成: {:?}", save_path);
     } else {
         // 进度条模式
-        let mut progress_manager = ProgressManager::new(cli.verbose);
+        let mut progress_manager = ProgressManager::new(cli.verbose, size_standard);
 
         // 将进度条引用传给 logger，使日志输出不破坏进度条
         super::set_progress_bar(progress_manager.main_bar());
@@ -55,14 +59,12 @@ pub async fn execute_download(cli: &Cli, save_dir: &str) -> Result<()> {
 
         // 确保进度条完成
         progress_manager.finish();
-        
+
         // 清除进度条引用
         super::clear_progress_bar();
-        
+
         println!("文件已保存到: {:?}", save_path);
     }
 
     Ok(())
 }
-
-

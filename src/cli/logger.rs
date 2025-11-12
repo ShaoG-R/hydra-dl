@@ -3,7 +3,7 @@ use log::{Level, LevelFilter, Metadata, Record};
 use parking_lot::RwLock;
 
 /// Logger 状态管理器
-/// 
+///
 /// 封装进度条引用的存储和访问逻辑，提供简洁的 API
 struct LoggerState {
     progress_bar: RwLock<Option<ProgressBar>>,
@@ -117,4 +117,3 @@ pub fn set_progress_bar(progress_bar: ProgressBar) {
 pub fn clear_progress_bar() {
     LOGGER_STATE.clear();
 }
-

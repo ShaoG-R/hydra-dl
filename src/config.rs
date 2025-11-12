@@ -2,8 +2,12 @@
 //!
 //! 提供下载任务的配置选项，按功能域分类组织
 
-use std::{num::NonZeroU32, time::Duration};
 use crate::constants::{KB, MB};
+use net_bytes::SizeStandard;
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 // ==================== 常量结构体 ====================
 
@@ -68,7 +72,7 @@ impl ProgressiveDefaults {
     /// 渐进式启动比例序列：[0.25, 0.5, 0.75, 1.0]
     pub const WORKER_RATIOS: &'static [f64] = &[0.25, 0.5, 0.75, 1.0];
     /// 最小速度阈值：1 MB/s
-    pub const MIN_SPEED_THRESHOLD: u64 = MB;
+    pub const MIN_SPEED_THRESHOLD: Option<NonZeroU64> = Some(NonZeroU64::new(MB).unwrap());
     /// 预期下载结束前最小时间（秒）：20 秒
     pub const MIN_TIME_BEFORE_FINISH_SECS: u64 = 20;
 }
@@ -88,7 +92,7 @@ pub struct HealthCheckDefaults;
 
 impl HealthCheckDefaults {
     /// 绝对速度阈值：100 KB/s
-    pub const ABSOLUTE_SPEED_THRESHOLD: u64 = 100 * KB;
+    pub const ABSOLUTE_SPEED_THRESHOLD: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100 * KB) };
     /// 是否启用健康检查
     pub const ENABLED: bool = true;
     /// 最小worker数量阈值（低于此数量不执行健康检查）
@@ -216,20 +220,28 @@ pub struct SpeedConfig {
     pub sample_interval: Duration,
     /// 环形缓冲区大小安全余量（在理论值基础上增加的比例）
     pub buffer_size_margin: f64,
+    /// 文件大小单位标准
+    pub size_standard: SizeStandard,
 }
 
 impl Default for SpeedConfig {
     fn default() -> Self {
         Self {
             base_interval: Duration::from_millis(SpeedDefaults::BASE_INTERVAL_MILLIS),
-            instant_speed_window_multiplier: NonZeroU32::new(SpeedDefaults::INSTANT_WINDOW_MULTIPLIER).unwrap(),
+            instant_speed_window_multiplier: NonZeroU32::new(
+                SpeedDefaults::INSTANT_WINDOW_MULTIPLIER,
+            )
+            .unwrap(),
             window_avg_multiplier: NonZeroU32::new(SpeedDefaults::WINDOW_AVG_MULTIPLIER).unwrap(),
-            expected_chunk_duration: Duration::from_secs(SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS),
+            expected_chunk_duration: Duration::from_secs(
+                SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS,
+            ),
             smoothing_factor: SpeedDefaults::SMOOTHING_FACTOR,
             instant_speed_weight: SpeedDefaults::INSTANT_WEIGHT,
             avg_speed_weight: SpeedDefaults::AVG_WEIGHT,
             sample_interval: Duration::from_millis(SpeedDefaults::SAMPLE_INTERVAL_MILLIS),
             buffer_size_margin: SpeedDefaults::BUFFER_SIZE_MARGIN,
+            size_standard: SizeStandard::IEC,
         }
     }
 }
@@ -289,6 +301,11 @@ impl SpeedConfig {
     pub fn buffer_size_margin(&self) -> f64 {
         self.buffer_size_margin
     }
+
+    #[inline]
+    pub fn size_standard(&self) -> SizeStandard {
+        self.size_standard
+    }
 }
 
 /// 渐进式启动配置
@@ -299,7 +316,7 @@ pub struct ProgressiveConfig {
     /// 渐进式启动比例序列
     pub worker_ratios: Vec<f64>,
     /// 最小速度阈值（bytes/s）
-    pub min_speed_threshold: u64,
+    pub min_speed_threshold: Option<NonZeroU64>,
     /// 预期下载结束前最小时间（在此时间内不启动新 worker）
     pub min_time_before_finish: Duration,
 }
@@ -309,7 +326,9 @@ impl Default for ProgressiveConfig {
         Self {
             worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: ProgressiveDefaults::MIN_SPEED_THRESHOLD,
-            min_time_before_finish: Duration::from_secs(ProgressiveDefaults::MIN_TIME_BEFORE_FINISH_SECS),
+            min_time_before_finish: Duration::from_secs(
+                ProgressiveDefaults::MIN_TIME_BEFORE_FINISH_SECS,
+            ),
         }
     }
 }
@@ -321,7 +340,7 @@ impl ProgressiveConfig {
     }
 
     #[inline]
-    pub fn min_speed_threshold(&self) -> u64 {
+    pub fn min_speed_threshold(&self) -> Option<NonZeroU64> {
         self.min_speed_threshold
     }
 
@@ -374,7 +393,7 @@ pub struct HealthCheckConfig {
     /// 是否启用健康检查
     pub enabled: bool,
     /// 绝对速度阈值（bytes/s）
-    pub absolute_speed_threshold: u64,
+    pub absolute_speed_threshold: Option<NonZeroU64>,
     /// 最小worker数量阈值（低于此数量不执行健康检查）
     pub min_workers_for_check: u64,
 }
@@ -383,7 +402,7 @@ impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
             enabled: HealthCheckDefaults::ENABLED,
-            absolute_speed_threshold: HealthCheckDefaults::ABSOLUTE_SPEED_THRESHOLD,
+            absolute_speed_threshold: Some(HealthCheckDefaults::ABSOLUTE_SPEED_THRESHOLD),
             min_workers_for_check: HealthCheckDefaults::MIN_WORKERS_FOR_CHECK,
         }
     }
@@ -396,7 +415,7 @@ impl HealthCheckConfig {
     }
 
     #[inline]
-    pub fn absolute_speed_threshold(&self) -> u64 {
+    pub fn absolute_speed_threshold(&self) -> Option<NonZeroU64> {
         self.absolute_speed_threshold
     }
 
@@ -444,7 +463,7 @@ impl DownloadConfig {
     pub fn builder() -> DownloadConfigBuilder {
         DownloadConfigBuilder::new()
     }
-    
+
     #[inline]
     pub fn chunk(&self) -> &ChunkConfig {
         &self.chunk
@@ -459,7 +478,7 @@ impl DownloadConfig {
     pub fn network(&self) -> &NetworkConfig {
         &self.network
     }
-    
+
     #[inline]
     pub fn speed(&self) -> &SpeedConfig {
         &self.speed
@@ -624,6 +643,7 @@ pub struct SpeedConfigBuilder {
     avg_speed_weight: f64,
     sample_interval: Duration,
     buffer_size_margin: f64,
+    size_standard: SizeStandard,
 }
 
 impl SpeedConfigBuilder {
@@ -631,14 +651,20 @@ impl SpeedConfigBuilder {
     pub fn new() -> Self {
         Self {
             base_interval: Duration::from_millis(SpeedDefaults::BASE_INTERVAL_MILLIS),
-            instant_speed_window_multiplier: NonZeroU32::new(SpeedDefaults::INSTANT_WINDOW_MULTIPLIER).unwrap(),
+            instant_speed_window_multiplier: NonZeroU32::new(
+                SpeedDefaults::INSTANT_WINDOW_MULTIPLIER,
+            )
+            .unwrap(),
             window_avg_multiplier: NonZeroU32::new(SpeedDefaults::WINDOW_AVG_MULTIPLIER).unwrap(),
-            expected_chunk_duration: Duration::from_secs(SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS),
+            expected_chunk_duration: Duration::from_secs(
+                SpeedDefaults::EXPECTED_CHUNK_DURATION_SECS,
+            ),
             smoothing_factor: SpeedDefaults::SMOOTHING_FACTOR,
             instant_speed_weight: SpeedDefaults::INSTANT_WEIGHT,
             avg_speed_weight: SpeedDefaults::AVG_WEIGHT,
             sample_interval: Duration::from_millis(SpeedDefaults::SAMPLE_INTERVAL_MILLIS),
             buffer_size_margin: SpeedDefaults::BUFFER_SIZE_MARGIN,
+            size_standard: SizeStandard::SI,
         }
     }
 
@@ -690,9 +716,15 @@ impl SpeedConfigBuilder {
         self
     }
 
-    /// 设置缓冲区大小安全余量
+    /// 缓冲区大小安全余量
     pub fn buffer_size_margin(mut self, margin: f64) -> Self {
         self.buffer_size_margin = margin.max(1.0); // 至少为 1.0，不能缩小缓冲区
+        self
+    }
+
+    /// 设置文件大小单位标准
+    pub fn size_standard(mut self, standard: SizeStandard) -> Self {
+        self.size_standard = standard;
         self
     }
 
@@ -708,6 +740,7 @@ impl SpeedConfigBuilder {
             avg_speed_weight: self.avg_speed_weight,
             sample_interval: self.sample_interval,
             buffer_size_margin: self.buffer_size_margin,
+            size_standard: self.size_standard,
         }
     }
 }
@@ -722,7 +755,7 @@ impl Default for SpeedConfigBuilder {
 #[derive(Debug, Clone)]
 pub struct ProgressiveConfigBuilder {
     worker_ratios: Vec<f64>,
-    min_speed_threshold: u64,
+    min_speed_threshold: Option<NonZeroU64>,
     min_time_before_finish: Duration,
 }
 
@@ -732,7 +765,9 @@ impl ProgressiveConfigBuilder {
         Self {
             worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: ProgressiveDefaults::MIN_SPEED_THRESHOLD,
-            min_time_before_finish: Duration::from_secs(ProgressiveDefaults::MIN_TIME_BEFORE_FINISH_SECS),
+            min_time_before_finish: Duration::from_secs(
+                ProgressiveDefaults::MIN_TIME_BEFORE_FINISH_SECS,
+            ),
         }
     }
 
@@ -743,23 +778,23 @@ impl ProgressiveConfigBuilder {
             .into_iter()
             .filter(|&r| r > 0.0 && r <= 1.0)
             .collect();
-        
+
         // 排序并去重
         valid_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
         valid_ratios.dedup();
-        
+
         // 如果没有有效比例，使用默认值
         if valid_ratios.is_empty() {
             self.worker_ratios = ProgressiveDefaults::WORKER_RATIOS.to_vec();
         } else {
             self.worker_ratios = valid_ratios;
         }
-        
+
         self
     }
 
     /// 设置最小速度阈值（bytes/s）
-    pub fn min_speed_threshold(mut self, threshold: u64) -> Self {
+    pub fn min_speed_threshold(mut self, threshold: Option<NonZeroU64>) -> Self {
         self.min_speed_threshold = threshold;
         self
     }
@@ -844,7 +879,7 @@ impl Default for RetryConfigBuilder {
 #[derive(Debug, Clone)]
 pub struct HealthCheckConfigBuilder {
     enabled: bool,
-    absolute_speed_threshold: u64,
+    absolute_speed_threshold: Option<NonZeroU64>,
     min_workers_for_check: u64,
 }
 
@@ -853,7 +888,7 @@ impl HealthCheckConfigBuilder {
     pub fn new() -> Self {
         Self {
             enabled: HealthCheckDefaults::ENABLED,
-            absolute_speed_threshold: HealthCheckDefaults::ABSOLUTE_SPEED_THRESHOLD,
+            absolute_speed_threshold: Some(HealthCheckDefaults::ABSOLUTE_SPEED_THRESHOLD),
             min_workers_for_check: HealthCheckDefaults::MIN_WORKERS_FOR_CHECK,
         }
     }
@@ -865,7 +900,7 @@ impl HealthCheckConfigBuilder {
     }
 
     /// 设置绝对速度阈值（bytes/s）
-    pub fn absolute_speed_threshold(mut self, threshold: u64) -> Self {
+    pub fn absolute_speed_threshold(mut self, threshold: Option<NonZeroU64>) -> Self {
         self.absolute_speed_threshold = threshold;
         self
     }
@@ -931,9 +966,9 @@ impl DownloadConfigBuilder {
             health_check: HealthCheckConfig::default(),
         }
     }
-    
+
     // ==================== 闭包风格配置方法 ====================
-    
+
     /// 配置分块设置
     ///
     /// # Example
@@ -956,7 +991,7 @@ impl DownloadConfigBuilder {
         self.chunk = f(builder).build();
         self
     }
-    
+
     /// 配置并发设置
     ///
     /// # Example
@@ -977,7 +1012,7 @@ impl DownloadConfigBuilder {
         self.concurrency = f(builder).build();
         self
     }
-    
+
     /// 配置网络设置
     ///
     /// # Example
@@ -1000,7 +1035,7 @@ impl DownloadConfigBuilder {
         self.network = f(builder).build();
         self
     }
-    
+
     /// 配置速度计算设置
     ///
     /// # Example
@@ -1025,11 +1060,12 @@ impl DownloadConfigBuilder {
             avg_speed_weight: self.speed.avg_speed_weight,
             sample_interval: self.speed.sample_interval,
             buffer_size_margin: self.speed.buffer_size_margin,
+            size_standard: self.speed.size_standard,
         };
         self.speed = f(builder).build();
         self
     }
-    
+
     /// 配置渐进式启动设置
     ///
     /// # Example
@@ -1052,7 +1088,7 @@ impl DownloadConfigBuilder {
         self.progressive = f(builder).build();
         self
     }
-    
+
     /// 配置重试设置
     ///
     /// # Example
@@ -1074,7 +1110,7 @@ impl DownloadConfigBuilder {
         self.retry = f(builder).build();
         self
     }
-    
+
     /// 配置健康检查设置
     ///
     /// # Example
@@ -1097,16 +1133,16 @@ impl DownloadConfigBuilder {
         self.health_check = f(builder).build();
         self
     }
-    
+
     // ==================== 构建方法 ====================
-    
+
     /// 构建配置对象
     pub fn build(self) -> DownloadConfig {
         // 确保配置的合理性：min <= initial <= max
         let mut chunk = self.chunk;
         chunk.initial_size = chunk.initial_size.max(chunk.min_size);
         chunk.max_size = chunk.max_size.max(chunk.initial_size);
-        
+
         DownloadConfig {
             chunk,
             concurrency: self.concurrency,
@@ -1134,7 +1170,10 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = DownloadConfig::default();
-        assert_eq!(config.concurrency().worker_count(), ConcurrencyDefaults::WORKER_COUNT);
+        assert_eq!(
+            config.concurrency().worker_count(),
+            ConcurrencyDefaults::WORKER_COUNT
+        );
         assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
         assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
         assert_eq!(config.chunk().max_size(), ChunkDefaults::MAX_SIZE);
@@ -1143,7 +1182,10 @@ mod tests {
     #[test]
     fn test_builder_default() {
         let config = DownloadConfig::builder().build();
-        assert_eq!(config.concurrency().worker_count(), ConcurrencyDefaults::WORKER_COUNT);
+        assert_eq!(
+            config.concurrency().worker_count(),
+            ConcurrencyDefaults::WORKER_COUNT
+        );
         assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
         assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
         assert_eq!(config.chunk().max_size(), ChunkDefaults::MAX_SIZE);
@@ -1153,12 +1195,13 @@ mod tests {
     fn test_builder_custom() {
         let config = DownloadConfig::builder()
             .concurrency(|c| c.worker_count(8))
-            .chunk(|c| c
-                .min_size(1 * 1024 * 1024)
-                .initial_size(10 * 1024 * 1024)
-                .max_size(100 * 1024 * 1024))
+            .chunk(|c| {
+                c.min_size(1 * 1024 * 1024)
+                    .initial_size(10 * 1024 * 1024)
+                    .max_size(100 * 1024 * 1024)
+            })
             .build();
-        
+
         assert_eq!(config.concurrency().worker_count(), 8);
         assert_eq!(config.chunk().min_size(), 1 * 1024 * 1024);
         assert_eq!(config.chunk().initial_size(), 10 * 1024 * 1024);
@@ -1168,13 +1211,14 @@ mod tests {
     #[test]
     fn test_builder_min_values() {
         let config = DownloadConfig::builder()
-            .concurrency(|c| c.worker_count(0))  // 应该被限制为 1
-            .chunk(|c| c
-                .min_size(0)  // 应该被限制为 1
-                .initial_size(0)  // 应该被限制为 1
-                .max_size(0))  // 应该被限制为 1
+            .concurrency(|c| c.worker_count(0)) // 应该被限制为 1
+            .chunk(|c| {
+                c.min_size(0) // 应该被限制为 1
+                    .initial_size(0) // 应该被限制为 1
+                    .max_size(0)
+            }) // 应该被限制为 1
             .build();
-        
+
         assert_eq!(config.concurrency().worker_count(), 1);
         assert_eq!(config.chunk().min_size(), 1);
         assert_eq!(config.chunk().initial_size(), 1);
@@ -1185,22 +1229,29 @@ mod tests {
     fn test_builder_ensures_order() {
         // 测试 build() 确保 min <= initial <= max
         let config = DownloadConfig::builder()
-            .chunk(|c| c
-                .min_size(10 * 1024 * 1024)
-                .initial_size(5 * 1024 * 1024)  // 小于 min
-                .max_size(3 * 1024 * 1024))      // 小于 initial
+            .chunk(|c| {
+                c.min_size(10 * 1024 * 1024)
+                    .initial_size(5 * 1024 * 1024) // 小于 min
+                    .max_size(3 * 1024 * 1024)
+            }) // 小于 initial
             .build();
-        
+
         assert_eq!(config.chunk().min_size(), 10 * 1024 * 1024);
-        assert_eq!(config.chunk().initial_size(), 10 * 1024 * 1024);  // 调整为 min
-        assert_eq!(config.chunk().max_size(), 10 * 1024 * 1024);      // 调整为 initial
+        assert_eq!(config.chunk().initial_size(), 10 * 1024 * 1024); // 调整为 min
+        assert_eq!(config.chunk().max_size(), 10 * 1024 * 1024); // 调整为 initial
     }
 
     #[test]
     fn test_progressive_worker_ratios_default() {
         let config = DownloadConfig::default();
-        assert_eq!(config.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
-        assert_eq!(config.progressive().min_speed_threshold(), ProgressiveDefaults::MIN_SPEED_THRESHOLD);
+        assert_eq!(
+            config.progressive().worker_ratios(),
+            ProgressiveDefaults::WORKER_RATIOS
+        );
+        assert_eq!(
+            config.progressive().min_speed_threshold(),
+            ProgressiveDefaults::MIN_SPEED_THRESHOLD
+        );
     }
 
     #[test]
@@ -1208,7 +1259,7 @@ mod tests {
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.5, 1.0]))
             .build();
-        
+
         assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
     }
 
@@ -1218,8 +1269,11 @@ mod tests {
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![1.0, 0.25, 0.75, 0.5]))
             .build();
-        
-        assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
+
+        assert_eq!(
+            config.progressive().worker_ratios(),
+            &[0.25, 0.5, 0.75, 1.0]
+        );
     }
 
     #[test]
@@ -1228,7 +1282,7 @@ mod tests {
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.0, 0.5, 1.0, 1.5, -0.1]))
             .build();
-        
+
         // 0.0, 1.5, -0.1 应该被过滤掉
         assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
     }
@@ -1239,7 +1293,7 @@ mod tests {
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.5, 0.5, 1.0, 1.0, 0.25]))
             .build();
-        
+
         assert_eq!(config.progressive().worker_ratios(), &[0.25, 0.5, 1.0]);
     }
 
@@ -1249,35 +1303,44 @@ mod tests {
         let config = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![]))
             .build();
-        
-        assert_eq!(config.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
-        
+
+        assert_eq!(
+            config.progressive().worker_ratios(),
+            ProgressiveDefaults::WORKER_RATIOS
+        );
+
         let config2 = DownloadConfig::builder()
             .progressive(|p| p.worker_ratios(vec![0.0, -1.0, 2.0]))
             .build();
-        
-        assert_eq!(config2.progressive().worker_ratios(), ProgressiveDefaults::WORKER_RATIOS);
+
+        assert_eq!(
+            config2.progressive().worker_ratios(),
+            ProgressiveDefaults::WORKER_RATIOS
+        );
     }
 
     #[test]
     fn test_min_speed_threshold() {
         let config = DownloadConfig::builder()
-            .progressive(|p| p.min_speed_threshold(5 * 1024 * 1024))  // 5 MB/s
+            .progressive(|p| p.min_speed_threshold(Some(NonZeroU64::new(5 * 1024 * 1024).unwrap()))) // 5 MB/s
             .build();
-        
-        assert_eq!(config.progressive().min_speed_threshold(), 5 * 1024 * 1024);
+
+        assert_eq!(
+            config.progressive().min_speed_threshold(),
+            Some(NonZeroU64::new(5 * 1024 * 1024).unwrap())
+        );
     }
 
     #[test]
     fn test_retry_config() {
         let config = DownloadConfig::builder()
-            .retry(|r| r
-                .max_retry_count(5)
-                .retry_delays(vec![
+            .retry(|r| {
+                r.max_retry_count(5).retry_delays(vec![
                     Duration::from_secs(1),
                     Duration::from_secs(2),
                     Duration::from_secs(5),
-                ]))
+                ])
+            })
             .build();
 
         assert_eq!(config.retry().max_retry_count(), 5);
@@ -1290,8 +1353,11 @@ mod tests {
     #[test]
     fn test_retry_config_default() {
         let config = DownloadConfig::default();
-        
-        assert_eq!(config.retry().max_retry_count(), RetryDefaults::MAX_RETRY_COUNT);
+
+        assert_eq!(
+            config.retry().max_retry_count(),
+            RetryDefaults::MAX_RETRY_COUNT
+        );
         assert_eq!(config.retry().retry_delays().len(), 3);
         assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
         assert_eq!(config.retry().retry_delays()[1], Duration::from_secs(2));
@@ -1312,13 +1378,10 @@ mod tests {
     fn test_sub_configs() {
         // 测试多个配置组合
         let config = DownloadConfig::builder()
-            .chunk(|c| c
-                .min_size(1 * MB)
-                .initial_size(5 * MB)
-                .max_size(20 * MB))
+            .chunk(|c| c.min_size(1 * MB).initial_size(5 * MB).max_size(20 * MB))
             .concurrency(|c| c.worker_count(8))
             .build();
-        
+
         assert_eq!(config.chunk.min_size, 1 * MB);
         assert_eq!(config.chunk.initial_size, 5 * MB);
         assert_eq!(config.chunk.max_size, 20 * MB);

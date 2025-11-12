@@ -1,6 +1,6 @@
 use clap::Parser;
-use log::LevelFilter;
 use hydra_dl::cli;
+use log::LevelFilter;
 
 #[tokio::main]
 async fn main() {
@@ -9,9 +9,9 @@ async fn main() {
 
     // 根据 CLI 模式初始化日志系统
     let log_level = if cli.quiet {
-        LevelFilter::Warn  // quiet 模式：只显示 WARN 和 ERROR
+        LevelFilter::Warn // quiet 模式：只显示 WARN 和 ERROR
     } else {
-        LevelFilter::Info  // normal/verbose 模式：显示 INFO、WARN 和 ERROR
+        LevelFilter::Info // normal/verbose 模式：显示 INFO、WARN 和 ERROR
     };
 
     if let Err(e) = cli::init_logger(log_level) {
@@ -24,4 +24,3 @@ async fn main() {
         std::process::exit(1);
     }
 }
-

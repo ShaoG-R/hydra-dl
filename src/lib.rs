@@ -54,7 +54,7 @@
 //!     while let Some(progress) = handle.progress_receiver().recv().await {
 //!         match progress {
 //!             DownloadProgress::Started { total_size, initial_chunk_size, .. } => {
-//!                 println!("开始下载，总大小: {:.2} MB, 初始分块: {:.2} MB", 
+//!                 println!("开始下载，总大小: {:.2} MB, 初始分块: {:.2} MB",
 //!                     total_size.get() as f64 / 1024.0 / 1024.0,
 //!                     initial_chunk_size as f64 / 1024.0 / 1024.0);
 //!             }
@@ -125,10 +125,10 @@
 //! }
 //! ```
 
+pub mod cli;
 pub mod config;
 pub mod download;
 mod task;
-pub mod cli;
 
 pub mod pool {
     pub mod common;
@@ -137,22 +137,22 @@ pub mod pool {
 pub mod utils {
     pub(crate) mod chunk_strategy;
     pub mod fetch;
+    pub mod io_traits;
     pub(crate) mod speed_calculator;
     pub(crate) mod stats;
-    pub mod io_traits;
     pub mod writer;
 }
 
 /// 常用单位常量
-/// 
+///
 /// 提供方便的字节单位常量，用于配置下载参数
-/// 
+///
 /// # Example
-/// 
+///
 /// ```
 /// use hydra_dl::constants::*;
 /// use hydra_dl::DownloadConfig;
-/// 
+///
 /// let config = DownloadConfig::builder()
 ///     .chunk(|c| c.initial_size(10 * MB))  // 10 MB
 ///     .progressive(|p| p.min_speed_threshold(5 * MB))  // 5 MB/s
@@ -169,23 +169,17 @@ pub mod constants {
 
 // 重新导出核心类型和函数
 pub use config::{
-    DownloadConfig, DownloadConfigBuilder,
-    ChunkConfig, ChunkConfigBuilder,
-    ConcurrencyConfig, ConcurrencyConfigBuilder,
-    NetworkConfig, NetworkConfigBuilder,
-    SpeedConfig, SpeedConfigBuilder,
-    ProgressiveConfig, ProgressiveConfigBuilder,
-    RetryConfig, RetryConfigBuilder,
-    ChunkDefaults, ConcurrencyDefaults, NetworkDefaults, SpeedDefaults, ProgressiveDefaults, RetryDefaults,
+    ChunkConfig, ChunkConfigBuilder, ChunkDefaults, ConcurrencyConfig, ConcurrencyConfigBuilder,
+    ConcurrencyDefaults, DownloadConfig, DownloadConfigBuilder, NetworkConfig,
+    NetworkConfigBuilder, NetworkDefaults, ProgressiveConfig, ProgressiveConfigBuilder,
+    ProgressiveDefaults, RetryConfig, RetryConfigBuilder, RetryDefaults, SpeedConfig,
+    SpeedConfigBuilder, SpeedDefaults,
 };
-pub use download::{
-    download_ranged, DownloadHandle, WorkerStatSnapshot,
-    DownloadProgress
-};
+pub use download::{DownloadHandle, DownloadProgress, WorkerStatSnapshot, download_ranged};
 pub use task::FileTask;
-pub use utils::fetch::{fetch_file_metadata, FileMetadata};
+pub use utils::fetch::{FileMetadata, fetch_file_metadata};
 pub mod timer {
-    pub use kestrel_timer::{TimerWheel, TimerService, config::ServiceConfig};
+    pub use kestrel_timer::{TimerService, TimerWheel, config::ServiceConfig};
 }
 
 use std::path::Path;
@@ -196,7 +190,7 @@ pub enum DownloadError {
     /// Fetch 错误
     #[error(transparent)]
     Fetch(#[from] utils::fetch::FetchError),
-    
+
     /// HTTP 客户端构建错误
     #[error("创建 HTTP 客户端失败: {0}")]
     BuildClient(#[from] reqwest::Error),
@@ -204,19 +198,19 @@ pub enum DownloadError {
     /// Mmap 写入错误
     #[error(transparent)]
     MmapWrite(#[from] utils::writer::MmapWriterError),
-    
+
     /// 任务发送错误
     #[error("任务发送失败: {0}")]
     TaskSend(String),
-    
+
     /// 下载任务 panic
     #[error("下载任务 panic: {0}")]
     TaskPanic(String),
-    
+
     /// Worker 退出失败
     #[error("等待 Worker #{0} 退出失败")]
     WorkerExit(usize),
-    
+
     /// Worker 不存在或已被移除
     #[error("Worker #{0} 不存在或已被移除")]
     WorkerNotFound(usize),
@@ -228,11 +222,11 @@ pub enum DownloadError {
     /// Worker 池已满
     #[error("Worker 池已满，无法添加更多 worker（最大 {0} 个）")]
     WorkerPoolFull(usize),
-    
+
     /// Worker ID 无效（超出范围）
     #[error("Worker ID {0} 无效，必须在范围 [0, {1}) 内")]
     InvalidWorkerId(usize, usize),
-    
+
     /// 通用错误
     #[error("{0}")]
     Other(String),
@@ -282,14 +276,15 @@ pub async fn download_file(url: &str, save_dir: impl AsRef<Path>) -> Result<std:
         .timeout(default_config.network().timeout())
         .connect_timeout(default_config.network().connect_timeout())
         .build()?;
-    
+
     // 获取文件元数据以确定文件名
     let metadata = fetch::fetch_file_metadata(&client, url).await?;
-    
+
     // 确定文件名
-    let filename = metadata.suggested_filename
+    let filename = metadata
+        .suggested_filename
         .ok_or_else(|| DownloadError::Other("无法确定文件名".to_string()))?;
-    
+
     // 组合完整路径
     let save_path = save_dir.as_ref().join(&filename);
 

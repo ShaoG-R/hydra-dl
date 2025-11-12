@@ -5,7 +5,7 @@ mod progress;
 mod runner;
 pub mod utils;
 
-pub use logger::{init_logger, set_progress_bar, clear_progress_bar};
+pub use logger::{clear_progress_bar, init_logger, set_progress_bar};
 
 /// CLI 错误类型
 #[derive(thiserror::Error, Debug)]
@@ -13,23 +13,23 @@ pub enum CliError {
     /// 下载错误
     #[error(transparent)]
     Download(#[from] crate::DownloadError),
-    
+
     /// URL 解析错误
     #[error("URL 解析失败: {0}")]
     UrlParse(#[from] url::ParseError),
-    
+
     /// URL 解码错误
     #[error("URL 解码失败: {0}")]
     UrlDecode(String),
-    
+
     /// IO 错误
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
-    
+
     /// 路径错误
     #[error("{0}")]
     Path(String),
-    
+
     /// 通用错误
     #[error("{0}")]
     Other(String),
@@ -84,4 +84,3 @@ pub async fn run(cli: Cli) -> Result<()> {
     // 执行下载
     runner::execute_download(&cli, save_dir).await
 }
-
