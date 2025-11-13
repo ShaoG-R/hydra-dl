@@ -62,12 +62,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arc-swap"
-version = "1.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
-
-[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -535,7 +529,6 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 name = "hydra-dl"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "bytes",
  "clap",
@@ -554,6 +547,7 @@ dependencies = [
  "reqwest",
  "rustc-hash",
  "smallring",
+ "smr-swap",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1448,6 +1442,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "smr-swap"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51c9c3e998bdad2ab473a63d35e5e741448d90a25e932671fe09930e21a26c4f"
+dependencies = [
+ "swmr-epoch",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1474,6 +1477,15 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "swmr-epoch"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "643a337b8224611669547160388f7fe586c37308943ecc4e308a277762e4896c"
+dependencies = [
+ "crossbeam-queue",
+]
 
 [[package]]
 name = "syn"

@@ -12,13 +12,13 @@ use crate::{
     },
     pool::download::DownloadWorkerHandle,
 };
-use arc_swap::ArcSwap;
 use log::{error, info};
 use parking_lot::RwLock;
 use rustc_hash::FxHashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use smr_swap::Swapper;
 
 /// 下载任务执行器
 ///
@@ -41,8 +41,8 @@ pub struct DownloadTask<C: HttpClient> {
     /// 任务完成通知接收器（由 task_allocator 发送）
     completion_rx: tokio::sync::oneshot::Receiver<CompletionResult>,
     /// Worker 句柄缓存（worker_id -> handle）
-    /// 使用 ArcSwap + im::HashMap 实现无锁原子更新和共享
-    worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+    /// 使用 SMR-Swap + im::HashMap 实现无锁原子更新和共享
+    worker_handles: Swapper<im::HashMap<u64, DownloadWorkerHandle<C>>>,
     /// 健康检查器（actor 模式）
     health_checker: WorkerHealthChecker<C>,
 }
@@ -66,7 +66,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let global_stats = Arc::new(crate::utils::stats::TaskStats::from_config(config.speed()));
 
         // worker_handles 占位，稍后填充
-        let worker_handles = Arc::new(ArcSwap::from_pointee(im::HashMap::new()));
+        let (mut swapper, reader) = smr_swap::new(im::HashMap::new());
 
         // 基准时间间隔：50ms
         let base_offset = std::time::Duration::from_millis(50);
@@ -74,7 +74,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
         let mut progressive_launcher = ProgressiveLauncher::new(
             Arc::clone(&config),
-            Arc::clone(&worker_handles),
+            reader.clone(),
             writer.total_size(),
             writer.written_bytes_ref(),
             Arc::clone(&global_stats),
@@ -93,7 +93,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建健康检查器（actor 模式） - 偏移 50ms
         let mut health_checker = WorkerHealthChecker::new(
             Arc::clone(&config),
-            Arc::clone(&worker_handles),
+            reader.clone(),
             config.speed().instant_speed_window(),
             Arc::clone(&active_workers),
             base_offset,
@@ -123,7 +123,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             .into_iter()
             .map(|handle| (handle.worker_id(), handle))
             .collect();
-        worker_handles.store(Arc::new(initial_worker_handles));
+        swapper.update(initial_worker_handles);
 
         // 创建并启动任务分配器 Actor
         let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(
@@ -133,7 +133,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             result_receiver,
             cancel_request_rx,
             Arc::clone(&config),
-            Arc::clone(&worker_handles),
+            reader.clone(),
             Arc::clone(&active_workers),
         );
 
@@ -141,16 +141,22 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let progress_reporter = ProgressReporter::new(
             progress_sender,
             total_size,
-            Arc::clone(&worker_handles),
+            reader.clone(),
             Arc::clone(&global_stats),
             config.speed().instant_speed_window(),
             base_offset * 2,
         );
 
         // 注册第一批 workers（会自动触发任务分配）
-        task_allocator_handle
-            .register_new_workers(worker_handles.load().keys().cloned().collect())
-            .await;
+        {
+            let worker_ids = {
+                let guard = reader.read();
+                guard.keys().cloned().collect()
+            };
+            task_allocator_handle
+                .register_new_workers(worker_ids)
+                .await;
+        }
 
         Ok(Self {
             pool,
@@ -161,7 +167,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             progressive_launcher,
             launch_request_rx,
             completion_rx,
-            worker_handles,
+            worker_handles: swapper,
             health_checker,
         })
     }
@@ -312,7 +318,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         &self,
         worker_id: u64,
     ) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
-        self.worker_handles.load().get(&worker_id).cloned()
+        self.worker_handles.read().get(&worker_id).cloned()
     }
 
     /// 获取指定 worker 的当前分块大小
@@ -352,13 +358,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             Ok(handles) => {
                 let mut ids = Vec::new();
                 // load() 返回 Guard，解引用两次得到 im::HashMap，然后 clone (O(1) 操作)
-                let mut new_handles = (*self.worker_handles.load_full()).clone();
+                let mut new_handles = (*self.worker_handles.read()).clone();
                 for handle in handles {
                     let worker_id = handle.worker_id();
                     ids.push(worker_id);
                     new_handles = new_handles.update(worker_id, handle);
                 }
-                self.worker_handles.store(Arc::new(new_handles));
+                self.worker_handles.update(new_handles);
                 ids
             }
             Err(e) => {

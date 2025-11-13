@@ -5,10 +5,10 @@
 
 use crate::config::DownloadConfig;
 use crate::pool::download::DownloadWorkerHandle;
-use arc_swap::ArcSwap;
 use lite_sync::oneshot::lite;
 use log::{debug, error, info};
 use net_bytes::{DownloadSpeed, FileSizeFormat};
+use smr_swap::SwapReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -264,7 +264,7 @@ struct ProgressiveLauncherActor<C: crate::utils::io_traits::HttpClient> {
     /// 关闭接收器
     shutdown_rx: lite::Receiver<()>,
     /// 共享的 worker handles
-    worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+    worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
     /// 文件总大小
     total_size: u64,
     /// 已写入字节数（共享引用）
@@ -282,7 +282,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
     async fn new(
         config: Arc<DownloadConfig>,
         shutdown_rx: lite::Receiver<()>,
-        worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+        worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
         total_size: u64,
         written_bytes: Arc<AtomicU64>,
         global_stats: Arc<crate::utils::stats::TaskStats>,
@@ -352,21 +352,24 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
             return;
         }
 
-        // 检测并调整启动阶段（应对 worker 数量变化）
-        let current_worker_count = self.worker_handles.load().len() as u64;
-        self.logic
-            .adjust_stage_for_worker_count(current_worker_count);
+        let decision = {
+            let worker_handles = self.worker_handles.read();
 
-        // 从共享数据获取信息并决策
-        let handles = self.worker_handles.load();
-        let written = self.written_bytes.load(Ordering::SeqCst);
-        let decision = self.logic.decide_next_launch(
-            &*handles,
-            written,
-            self.total_size,
-            &*self.global_stats,
-            &self.config,
-        );
+            // 检测并调整启动阶段（应对 worker 数量变化）
+            let current_worker_count = worker_handles.len() as u64;
+            self.logic
+                .adjust_stage_for_worker_count(current_worker_count);
+
+            // 从共享数据获取信息并决策
+            let written = self.written_bytes.load(Ordering::SeqCst);
+            self.logic.decide_next_launch(
+                &*worker_handles,
+                written,
+                self.total_size,
+                &*self.global_stats,
+                &self.config,
+            )
+        };
 
         // 根据决策结果执行相应操作
         match decision {
@@ -461,7 +464,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
     /// 创建新的渐进式启动管理器（启动 actor）
     pub(super) fn new(
         config: Arc<DownloadConfig>,
-        worker_handles: Arc<ArcSwap<im::HashMap<u64, DownloadWorkerHandle<C>>>>,
+        worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
         total_size: u64,
         written_bytes: Arc<AtomicU64>,
         global_stats: Arc<crate::utils::stats::TaskStats>,

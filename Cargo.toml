@@ -21,7 +21,6 @@ indicatif = "0.18.2"
 url = "2.5"
 urlencoding = "2.1"
 rustc-hash = "2.1.1"
-arc-swap = "1.7.1"
 im = "15.1.0"
 portable-atomic = "1.11.1"
 
@@ -32,6 +31,7 @@ deferred-map = "0.1.2"
 smallring = "0.1.6"
 lite-sync = "0.1.7"
 net-bytes = "0.2.1"
+smr-swap = "0.2.0"
 
 [dev-dependencies]
 tempfile = "3.23.0"
