@@ -150,7 +150,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 注册第一批 workers（会自动触发任务分配）
         {
             let worker_ids = {
-                let guard = reader.read();
+                let local_epoch = reader.register_reader();
+                let guard = reader.read(&local_epoch);
                 guard.keys().cloned().collect()
             };
             task_allocator_handle
@@ -318,7 +319,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         &self,
         worker_id: u64,
     ) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
-        self.worker_handles.read().get(&worker_id).cloned()
+        let local_epoch = self.worker_handles.register_reader();
+        let guard = self.worker_handles.read(&local_epoch);
+        guard.get(&worker_id).cloned()
     }
 
     /// 获取指定 worker 的当前分块大小
@@ -357,8 +360,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let new_worker_ids: Vec<u64> = match self.pool.add_workers(count).await {
             Ok(handles) => {
                 let mut ids = Vec::new();
+                let local_epoch = self.worker_handles.register_reader();
+                let guard = self.worker_handles.read(&local_epoch);
                 // load() 返回 Guard，解引用两次得到 im::HashMap，然后 clone (O(1) 操作)
-                let mut new_handles = (*self.worker_handles.read()).clone();
+                let mut new_handles = (*guard).clone();
                 for handle in handles {
                     let worker_id = handle.worker_id();
                     ids.push(worker_id);

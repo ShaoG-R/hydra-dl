@@ -1443,9 +1443,9 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smr-swap"
-version = "0.2.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51c9c3e998bdad2ab473a63d35e5e741448d90a25e932671fe09930e21a26c4f"
+checksum = "97604fb69847c0885064605ddebebfb33ad80b250cbd616591fd4a407c9c6564"
 dependencies = [
  "swmr-epoch",
 ]
@@ -1480,12 +1480,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swmr-epoch"
-version = "0.2.2"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "643a337b8224611669547160388f7fe586c37308943ecc4e308a277762e4896c"
-dependencies = [
- "crossbeam-queue",
-]
+checksum = "a95d7912a3e06990ddc139c01fd92ca70b55ebb378b42fc6cc9c8a2e45666aa4"
 
 [[package]]
 name = "syn"

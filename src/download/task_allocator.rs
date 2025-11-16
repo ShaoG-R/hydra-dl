@@ -336,8 +336,9 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         cancel_tx: lite::Sender<()>,
     ) -> bool {
         let handle = {
-            let guard = self.worker_handles.read();
-            guard.get(&worker_id).cloned()
+            let local_epoch = self.worker_handles.register_reader();
+            let worker_handles = self.worker_handles.read(&local_epoch);
+            worker_handles.get(&worker_id).cloned()
         };
         if let Some(handle) = handle {
             if let Err(e) = handle.send_task(task).await {
@@ -568,12 +569,15 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         info!("开始为空闲 workers 分配任务");
 
         while let Some(&worker_id) = self.state.idle_workers.front() {
-            let chunk_size = self
-                .worker_handles
-                .read()
-                .get(&worker_id)
-                .map(|h| h.chunk_size())
-                .unwrap_or(self.config.chunk().initial_size());
+            let chunk_size = {
+                let local_epoch = self.worker_handles.register_reader();
+                self
+                    .worker_handles
+                    .read(&local_epoch)
+                    .get(&worker_id)
+                    .map(|h| h.chunk_size())
+                    .unwrap_or(self.config.chunk().initial_size())
+            };
 
             if let Some(allocated) = self.state.try_allocate_task_to_idle_worker(chunk_size) {
                 let (task, worker_id, cancel_tx) = allocated.into_parts();
@@ -592,12 +596,15 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
 
     /// 尝试为 worker 分配下一个任务
     async fn try_allocate_next_task(&mut self, worker_id: u64) {
-        let chunk_size = self
-            .worker_handles
-            .read()
-            .get(&worker_id)
-            .map(|h| h.chunk_size())
-            .unwrap_or(self.config.chunk().initial_size());
+        let chunk_size = {
+            let local_epoch = self.worker_handles.register_reader();
+            self
+                .worker_handles
+                .read(&local_epoch)
+                .get(&worker_id)
+                .map(|h| h.chunk_size())
+                .unwrap_or(self.config.chunk().initial_size())
+        };
 
         if let Some(allocated) = self.state.try_allocate_task_to_idle_worker(chunk_size) {
             let (task, target_worker, cancel_tx) = allocated.into_parts();

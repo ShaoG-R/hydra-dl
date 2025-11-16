@@ -31,7 +31,7 @@ deferred-map = "0.1.2"
 smallring = "0.1.6"
 lite-sync = "0.1.7"
 net-bytes = "0.2.1"
-smr-swap = "0.2.0"
+smr-swap = "0.3.2"
 
 [dev-dependencies]
 tempfile = "3.23.0"

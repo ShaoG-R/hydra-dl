@@ -353,7 +353,8 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
         }
 
         let decision = {
-            let worker_handles = self.worker_handles.read();
+            let local_epoch = self.worker_handles.register_reader();
+            let worker_handles = self.worker_handles.read(&local_epoch);
 
             // 检测并调整启动阶段（应对 worker 数量变化）
             let current_worker_count = worker_handles.len() as u64;

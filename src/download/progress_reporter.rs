@@ -191,7 +191,8 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
 
     /// 计算 worker 统计快照（直接从 worker_handles 中获取）
     fn compute_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
-        let handles = self.worker_handles.read();
+        let local_epoch = self.worker_handles.register_reader();
+        let handles = self.worker_handles.read(&local_epoch);
         handles
             .iter()
             .map(|(worker_id, handle)| {

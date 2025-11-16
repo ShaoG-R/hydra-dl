@@ -362,7 +362,8 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
 
         // 使用内部作用域确保锁在 await 之前释放
         {
-            let guard = self.worker_handles.read();
+            let local_epoch = self.worker_handles.register_reader();
+            let guard = self.worker_handles.read(&local_epoch);
             let current_worker_count = guard.len() as u64;
             let min_workers = self.config.health_check().min_workers_for_check();
 
