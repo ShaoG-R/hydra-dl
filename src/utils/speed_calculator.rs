@@ -1,15 +1,9 @@
-#[cfg(test)]
-mod tests;
-
 use net_bytes::{DownloadAcceleration, DownloadSpeed};
-use portable_atomic::AtomicU128;
-use smallring::atomic::{AtomicElement, AtomicRingBuf};
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
-use std::sync::OnceLock;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Sample {
     timestamp_ns: NonZeroU64,
     bytes: u64,
@@ -17,15 +11,6 @@ pub struct Sample {
 
 impl Sample {
     /// 创建采样点
-    ///
-    /// # Arguments
-    ///
-    /// * `timestamp_ns` - 时间戳（纳秒）
-    /// * `bytes` - 字节数
-    /// 
-    /// # Returns
-    ///
-    /// `Sample` - 创建的采样点
     #[inline]
     pub fn new(timestamp_ns: u64, bytes: u64) -> Self {
         let timestamp_ns =
@@ -34,70 +19,6 @@ impl Sample {
             timestamp_ns,
             bytes,
         }
-    }
-
-    /// 从打包的 u128 数据创建采样点
-    ///
-    /// # Arguments
-    ///
-    /// * `packed` - 打包的 u128 数据
-    ///
-    /// # Returns
-    ///
-    /// `Sample` - 解包后的采样点
-    #[inline]
-    pub fn from_u128(packed: u128) -> Self {
-        Self::new((packed >> 64) as u64, packed as u64)
-    }
-
-    /// 将采样点转换为打包的 u128 数据
-    ///
-    /// # Returns
-    ///
-    /// `u128` - 打包后的 u128 数据
-    #[inline]
-    pub fn into_u128(self) -> u128 {
-        ((self.timestamp_ns.get() as u128) << 64) | (self.bytes as u128)
-    }
-}
-
-/// 采样点数据
-///
-/// 使用 128 位原子类型存储时间戳和字节数，确保原子化读写。
-///
-/// # 数据布局
-///
-/// - 高 64 位：时间戳（纳秒）
-/// - 低 64 位：字节数
-#[derive(Debug)]
-pub(crate) struct SampleRaw {
-    /// 打包的数据：高 64 位为时间戳，低 64 位为字节数
-    data: AtomicU128,
-}
-
-/// 为 SampleRaw 实现 AtomicElement trait
-///
-/// 这允许 SampleRaw 直接用于 AtomicRingBuf，而不需要额外的包装
-impl AtomicElement for SampleRaw {
-    type Primitive = Sample;
-
-    #[inline]
-    fn load(&self, order: Ordering) -> Self::Primitive {
-        let packed = self.data.load(order);
-        Sample::from_u128(packed)
-    }
-
-    #[inline]
-    fn store(&self, val: Self::Primitive, order: Ordering) {
-        let packed = val.into_u128();
-        self.data.store(packed, order);
-    }
-
-    #[inline]
-    fn swap(&self, val: Self::Primitive, order: Ordering) -> Self::Primitive {
-        let new_packed = val.into_u128();
-        let old_packed = self.data.swap(new_packed, order);
-        Sample::from_u128(old_packed)
     }
 }
 
@@ -119,31 +40,13 @@ const MAX_BUFFER_SIZE: usize = 512;
 ///
 /// - **环形缓冲区**：动态大小（根据时间窗口和采样间隔计算），自动覆盖旧数据
 /// - **线性回归**：使用最小二乘法计算速度（斜率）
-/// - **完全无锁**：使用原子操作，支持高并发场景
-/// - **Send + Sync**：所有字段都是原子类型或不可变引用
-///
-/// # 采样策略
-///
-/// 调用方应定期调用 `record_sample()` 记录采样点（间隔由 `sample_interval` 配置）。
-/// 缓冲区满时会自动覆盖最旧的采样点。
-///
-/// # 速度计算
-///
-/// 使用最小二乘法线性回归：
-/// ```text
-/// 速度 = Σ[(t_i - t_avg)(b_i - b_avg)] / Σ[(t_i - t_avg)²]
-/// ```
-///
-/// 当有效采样点少于 3 个时，降级使用平均速度。
-///
-/// # 线程安全
-///
-/// 所有方法都是线程安全的，可以被多个线程并发调用。使用 `AtomicU128` 保证
-/// 每个采样点的时间戳和字节数原子化读写，不存在数据不一致的问题。
-#[derive(Debug)]
+/// - **Send + Sync**：所有字段都是 Send，record_sample 需要 &mut self
+#[derive(Debug, Clone)]
 pub(crate) struct SpeedCalculator {
-    /// 环形缓冲区，存储最近的采样点
-    ring_buffer: AtomicRingBuf<SampleRaw, 64, true>,
+    /// 采样点缓冲区
+    samples: VecDeque<Sample>,
+    /// 缓冲区最大容量
+    max_samples: usize,
     /// 线性回归所需的最小采样点数
     min_samples_for_regression: usize,
     /// 瞬时速度的时间窗口
@@ -151,39 +54,13 @@ pub(crate) struct SpeedCalculator {
     /// 窗口平均速度的时间窗口
     window_avg_duration: Duration,
     /// 下载开始时间（只初始化一次）
-    start_time: OnceLock<Instant>,
-    /// 上次采样点（打包的 timestamp + bytes）
-    last_sample_packed: AtomicU128,
+    start_time: Option<Instant>,
     /// 采样间隔（纳秒）
     sample_interval_ns: u64,
 }
 
 impl SpeedCalculator {
     /// 从速度配置创建速度计算器
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - 速度配置
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use hydra_dl::config::SpeedConfig;
-    ///
-    /// let config = SpeedConfig::default();
-    /// let calculator = SpeedCalculator::from_config(&config);
-    /// ```
-    ///
-    /// # 缓冲区大小计算
-    ///
-    /// 根据最大时间窗口和采样间隔计算所需的缓冲区大小：
-    /// ```text
-    /// buffer_size = max(instant_speed_window, window_avg_duration) / sample_interval * buffer_size_margin
-    /// ```
-    ///
-    /// 例如，对于 5 秒窗口、100ms 采样间隔、1.2 倍余量：
-    /// - 理论需要：5000ms / 100ms = 50 个采样点
-    /// - 实际分配：50 * 1.2 = 60 个采样点（增加 20% 余量）
     pub(crate) fn from_config(config: &crate::config::SpeedConfig) -> Self {
         let instant_speed_window = config.instant_speed_window();
         let window_avg_duration = config.window_avg_duration();
@@ -197,120 +74,66 @@ impl SpeedCalculator {
         let sample_interval_ns = sample_interval.as_nanos();
         let required_samples = (max_window_ns / sample_interval_ns) as usize;
 
-        // 优化的缓冲区大小计算：
-        // 1. 基础大小 = 所需采样点数 * 余量系数
-        // 2. 最小值 = MIN_BUFFER_SIZE（确保足够的采样点用于鲁棒回归）
-        // 3. 最大值 = MAX_BUFFER_SIZE（防止过度内存占用）
-        // 4. 使用 2 的幂次作为最终大小（提高缓冲区访问效率）
+        // 优化的缓冲区大小计算
         let base_size = (required_samples as f64 * buffer_size_margin) as usize;
-        let clamped_size = base_size.max(MIN_BUFFER_SIZE).min(MAX_BUFFER_SIZE);
-
-        // 向上舍入到最近的 2 的幂次（提高内存对齐和访问效率）
-        let buffer_size = if clamped_size.is_power_of_two() {
-            clamped_size
-        } else {
-            1 << (64 - clamped_size.leading_zeros())
-        };
-
-        // 创建环形缓冲区
-        let ring_buffer = AtomicRingBuf::new(buffer_size);
+        let max_samples = base_size.max(MIN_BUFFER_SIZE).min(MAX_BUFFER_SIZE);
 
         Self {
-            ring_buffer,
+            samples: VecDeque::with_capacity(max_samples),
+            max_samples,
             min_samples_for_regression: MIN_SAMPLES_FOR_REGRESSION,
             instant_speed_window,
             window_avg_duration,
-            start_time: OnceLock::new(),
-            last_sample_packed: AtomicU128::new(0),
+            start_time: None,
             sample_interval_ns: sample_interval.as_nanos() as u64,
         }
     }
 
-    /// 记录采样点（无锁并发写入）
+    /// 记录采样点
     ///
     /// 根据配置的采样间隔自动判断是否需要记录采样点。
-    /// 多个线程可以并发调用此方法，通过原子操作保证线程安全。
     ///
     /// # Arguments
     ///
     /// * `current_bytes` - 当前累计下载的总字节数
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let calculator = SpeedCalculator::from_config(&config);
-    /// calculator.record_sample(1024 * 1024);
-    /// ```
-    pub(crate) fn record_sample(&self, current_bytes: u64) {
+    pub(crate) fn record_sample(&mut self, current_bytes: u64) {
         // 第一次调用时初始化开始时间
-        let start_time = *self.start_time.get_or_init(Instant::now);
+        let start_time = *self.start_time.get_or_insert_with(Instant::now);
 
         // 自动采样逻辑：根据配置的采样间隔记录采样点
         let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
-        let last_packed = self.last_sample_packed.load(Ordering::Relaxed);
-        let last_sample = Sample::from_u128(last_packed);
-        let last_sample_ns = last_sample.timestamp_ns.get();
 
-        // 数据一致性检查：
-        // 1. 如果当前字节数小于上次记录的字节数，说明这是滞后的数据，直接丢弃
-        //    这种情况可能发生在高并发下，线程 A (bytes=100) 被抢占，
-        //    线程 B (bytes=200) 先执行并记录，然后线程 A 恢复执行。
-        // 2. 时间戳必须单调递增（隐含在 interval check 中，但如果时间倒流则不应记录）
-        if current_bytes < last_sample.bytes {
-            return;
-        }
+        // 数据一致性检查
+        if let Some(last_sample) = self.samples.back() {
+            // 1. 如果当前字节数小于上次记录的字节数，说明这是滞后的数据，直接丢弃
+            if current_bytes < last_sample.bytes {
+                return;
+            }
 
-        // 检查是否需要采样（距离上次采样超过配置的采样间隔，或者是首次采样）
-        if last_packed == 0
-            || current_elapsed_ns.saturating_sub(last_sample_ns) >= self.sample_interval_ns
-        {
-            let sample = Sample::new(current_elapsed_ns, current_bytes);
-            let new_packed = sample.into_u128();
-
-            // 尝试更新采样点（使用 compare_exchange 避免重复采样）
-            // 允许多个线程竞争，只有一个会成功
-            if self
-                .last_sample_packed
-                .compare_exchange(
-                    last_packed,
-                    new_packed,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                // 成功获取采样权限，记录采样点
-                let _ = self.ring_buffer.push(sample, Ordering::Relaxed);
+            // 2. 检查是否需要采样（距离上次采样超过配置的采样间隔）
+            let last_sample_ns = last_sample.timestamp_ns.get();
+            if current_elapsed_ns.saturating_sub(last_sample_ns) < self.sample_interval_ns {
+                return;
             }
         }
+
+        let sample = Sample::new(current_elapsed_ns, current_bytes);
+
+        if self.samples.len() >= self.max_samples {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
     }
 
     /// 读取最近的有效采样点（保留纳秒精度）
-    ///
-    /// 从环形缓冲区读取所有有效的采样点（时间戳不为 0）。
-    /// 返回的采样点按时间排序（最旧的在前，最新的在后）。
-    ///
-    /// 为了提高精度，内部使用纳秒精度进行计算，避免浮点运算导致的精度丧失。
-    ///
-    /// # Returns
-    ///
-    /// `Vec<(时间戳纳秒, 字节数)>`
     fn read_recent_samples(&self) -> Vec<(i128, u64)> {
-        // 使用 read_all 方法从环形缓冲区读取所有采样点
-        let all_samples = self.ring_buffer.read_all(Ordering::Acquire);
-
-        // 转换为 (时间戳纳秒, 字节数) 格式
-        let mut samples: Vec<(i128, u64)> = all_samples
-            .into_iter()
+        self.samples
+            .iter()
             .map(|sample| {
                 let timestamp_ns = sample.timestamp_ns.get() as i128;
                 (timestamp_ns, sample.bytes)
             })
-            .collect();
-
-        // 按时间戳排序（从旧到新）
-        samples.sort_unstable_by_key(|a| a.0);
-        samples
+            .collect()
     }
 
     /// 使用 Theil-Sen 估计器进行鲁棒回归计算速度
@@ -443,17 +266,6 @@ impl SpeedCalculator {
     ///
     /// - `Some(DownloadSpeed)`: 如果成功计算出有效速度
     /// - `None`: 如果采样点不足或速度计算失败
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let calculator = SpeedCalculator::from_config(&config);
-    /// if let Some(speed) = calculator.get_instant_speed() {
-    ///     println!("瞬时速度: {}", speed);
-    /// } else {
-    ///     println!("速度数据不足");
-    /// }
-    /// ```
     pub fn get_instant_speed(&self) -> Option<DownloadSpeed> {
         let start_time = self.get_start_time()?;
         let samples = self.read_samples_in_window(self.instant_speed_window, start_time);
@@ -470,17 +282,6 @@ impl SpeedCalculator {
     ///
     /// - `Some(DownloadSpeed)`: 如果成功计算出有效速度
     /// - `None`: 如果采样点不足或速度计算失败
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let calculator = SpeedCalculator::from_config(&config);
-    /// if let Some(speed) = calculator.get_window_avg_speed() {
-    ///     println!("窗口平均速度: {}", speed);
-    /// } else {
-    ///     println!("速度数据不足");
-    /// }
-    /// ```
     pub fn get_window_avg_speed(&self) -> Option<DownloadSpeed> {
         let start_time = self.get_start_time()?;
         let samples = self.read_samples_in_window(self.window_avg_duration, start_time);
@@ -496,21 +297,6 @@ impl SpeedCalculator {
     ///
     /// - `Some(acceleration)`: 如果成功计算出有效加速度
     /// - `None`: 如果采样点不足
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let calculator = SpeedCalculator::from_config(&config);
-    /// if let Some(accel) = calculator.get_instant_acceleration() {
-    ///     if accel.as_i64() > 0 {
-    ///         println!("网络加速中: {}", accel);
-    ///     } else if accel.as_i64() < 0 {
-    ///         println!("网络减速中: {}", accel);
-    ///     }
-    /// } else {
-    ///     println!("加速度数据不足");
-    /// }
-    /// ```
     pub fn get_instant_acceleration(&self) -> Option<DownloadAcceleration> {
         let samples =
             self.read_samples_in_window(self.instant_speed_window, self.get_start_time()?);
@@ -562,6 +348,9 @@ impl SpeedCalculator {
     /// `Option<Instant>` - 下载开始时间，如果尚未初始化则返回 None
     #[inline]
     pub(crate) fn get_start_time(&self) -> Option<Instant> {
-        self.start_time.get().copied()
+        self.start_time
     }
 }
+
+#[cfg(test)]
+mod tests;

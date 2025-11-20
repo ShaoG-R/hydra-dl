@@ -14,11 +14,11 @@ use crate::{
 };
 use log::{error, info};
 use parking_lot::RwLock;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smr_swap::SmrSwap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use smr_swap::Swapper;
 
 /// 下载任务执行器
 ///
@@ -41,8 +41,7 @@ pub struct DownloadTask<C: HttpClient> {
     /// 任务完成通知接收器（由 task_allocator 发送）
     completion_rx: tokio::sync::oneshot::Receiver<CompletionResult>,
     /// Worker 句柄缓存（worker_id -> handle）
-    /// 使用 SMR-Swap + im::HashMap 实现无锁原子更新和共享
-    worker_handles: Swapper<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: SmrSwap<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// 健康检查器（actor 模式）
     health_checker: WorkerHealthChecker<C>,
 }
@@ -63,10 +62,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         } = params;
 
         // 获取 global_stats
-        let global_stats = Arc::new(crate::utils::stats::TaskStats::from_config(config.speed()));
+        let global_stats = crate::utils::stats::TaskStats::from_config(config.speed());
 
         // worker_handles 占位，稍后填充
-        let (mut swapper, reader) = smr_swap::new(im::HashMap::new());
+        let mut swap = SmrSwap::new(FxHashMap::default());
 
         // 基准时间间隔：50ms
         let base_offset = std::time::Duration::from_millis(50);
@@ -74,10 +73,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
         let mut progressive_launcher = ProgressiveLauncher::new(
             Arc::clone(&config),
-            reader.clone(),
+            swap.reader().fork(),
             writer.total_size(),
             writer.written_bytes_ref(),
-            Arc::clone(&global_stats),
+            global_stats.clone(),
             config.speed().instant_speed_window(),
             std::time::Duration::ZERO,
         );
@@ -93,7 +92,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建健康检查器（actor 模式） - 偏移 50ms
         let mut health_checker = WorkerHealthChecker::new(
             Arc::clone(&config),
-            reader.clone(),
+            swap.reader().fork(),
             config.speed().instant_speed_window(),
             Arc::clone(&active_workers),
             base_offset,
@@ -115,15 +114,15 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             initial_worker_count,
             writer.clone(),
             Arc::clone(&config),
-            Arc::clone(&global_stats),
+            global_stats.clone(),
         )?;
 
         // 使用实际的 worker_id（从 handle 获取）填充 worker_handles
-        let initial_worker_handles: im::HashMap<u64, _> = initial_handles
+        let initial_worker_handles: FxHashMap<u64, _> = initial_handles
             .into_iter()
             .map(|handle| (handle.worker_id(), handle))
             .collect();
-        swapper.update(initial_worker_handles);
+        swap.update(initial_worker_handles);
 
         // 创建并启动任务分配器 Actor
         let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(
@@ -133,7 +132,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             result_receiver,
             cancel_request_rx,
             Arc::clone(&config),
-            reader.clone(),
+            swap.reader().fork(),
             Arc::clone(&active_workers),
         );
 
@@ -141,8 +140,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let progress_reporter = ProgressReporter::new(
             progress_sender,
             total_size,
-            reader.clone(),
-            Arc::clone(&global_stats),
+            swap.reader().fork(),
+            global_stats.clone(),
             config.speed().instant_speed_window(),
             base_offset * 2,
         );
@@ -150,13 +149,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 注册第一批 workers（会自动触发任务分配）
         {
             let worker_ids = {
-                let local_epoch = reader.register_reader();
-                let guard = reader.read(&local_epoch);
+                let guard = swap.reader().load();
                 guard.keys().cloned().collect()
             };
-            task_allocator_handle
-                .register_new_workers(worker_ids)
-                .await;
+            task_allocator_handle.register_new_workers(worker_ids).await;
         }
 
         Ok(Self {
@@ -168,7 +164,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             progressive_launcher,
             launch_request_rx,
             completion_rx,
-            worker_handles: swapper,
+            worker_handles: swap,
             health_checker,
         })
     }
@@ -319,8 +315,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         &self,
         worker_id: u64,
     ) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
-        let local_epoch = self.worker_handles.register_reader();
-        let guard = self.worker_handles.read(&local_epoch);
+        let guard = self.worker_handles.load();
         guard.get(&worker_id).cloned()
     }
 
@@ -358,18 +353,17 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 动态添加新 worker，收集实际的 worker_id
         let new_worker_ids: Vec<u64> = match self.pool.add_workers(count).await {
-            Ok(handles) => {
+            Ok(new_handles) => {
                 let mut ids = Vec::new();
-                let local_epoch = self.worker_handles.register_reader();
-                let guard = self.worker_handles.read(&local_epoch);
-                // load() 返回 Guard，解引用两次得到 im::HashMap，然后 clone (O(1) 操作)
-                let mut new_handles = (*guard).clone();
-                for handle in handles {
-                    let worker_id = handle.worker_id();
-                    ids.push(worker_id);
-                    new_handles = new_handles.update(worker_id, handle);
-                }
-                self.worker_handles.update(new_handles);
+                self.worker_handles.update_and_fetch(|handles| {
+                    let mut handles = handles.clone();
+                    for handle in new_handles {
+                        let worker_id = handle.worker_id();
+                        ids.push(worker_id);
+                        handles.insert(worker_id, handle);
+                    }
+                    handles
+                });
                 ids
             }
             Err(e) => {

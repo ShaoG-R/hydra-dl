@@ -5,9 +5,9 @@
 
 use log::debug;
 use net_bytes::{DownloadAcceleration, DownloadSpeed};
+use rustc_hash::FxHashMap;
 use smr_swap::SwapReader;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Worker 统计信息
@@ -105,9 +105,9 @@ struct ProgressReporterActor<C: crate::utils::io_traits::HttpClient> {
     /// 消息接收器（async channel）
     message_rx: mpsc::Receiver<ActorMessage>,
     /// 共享的 worker handles（用于直接获取统计信息）
-    worker_handles: SwapReader<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+    worker_handles: SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
     /// 全局统计管理器（用于获取总体统计数据）
-    global_stats: Arc<crate::utils::stats::TaskStats>,
+    global_stats: crate::utils::stats::TaskStats,
     /// 进度更新定时器（内部管理）
     progress_timer: tokio::time::Interval,
 }
@@ -118,8 +118,8 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
         progress_sender: Option<mpsc::Sender<DownloadProgress>>,
         total_size: NonZeroU64,
         message_rx: mpsc::Receiver<ActorMessage>,
-        worker_handles: SwapReader<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
-        global_stats: Arc<crate::utils::stats::TaskStats>,
+        worker_handles: SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+        global_stats: crate::utils::stats::TaskStats,
         update_interval: std::time::Duration,
         start_offset: std::time::Duration,
     ) -> Self {
@@ -141,23 +141,39 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
     async fn run(mut self) {
         debug!("ProgressReporterActor started");
 
+        // 提取 sender 用于发送，避免在 await 期间持有 &self
+        let sender = self.progress_sender.clone();
+
         loop {
             tokio::select! {
                 // 内部定时器：自主触发进度更新
                 _ = self.progress_timer.tick() => {
-                    self.send_progress_update().await;
+                    if let Some(ref tx) = sender {
+                        if let Some(msg) = self.generate_progress_update() {
+                            let _ = tx.send(msg).await;
+                        }
+                    }
                 }
                 // 外部消息
                 msg = self.message_rx.recv() => {
                     match msg {
                         Some(ActorMessage::SendStarted { worker_count, initial_chunk_size }) => {
-                            self.send_started_event(worker_count, initial_chunk_size).await;
+                            if let Some(ref tx) = sender {
+                                let msg = self.generate_started_event(worker_count, initial_chunk_size);
+                                let _ = tx.send(msg).await;
+                            }
                         }
                         Some(ActorMessage::SendCompletion) => {
-                            self.send_completion_stats().await;
+                            if let Some(ref tx) = sender {
+                                let msg = self.generate_completion_stats();
+                                let _ = tx.send(msg).await;
+                            }
                         }
                         Some(ActorMessage::SendError { message }) => {
-                            self.send_error(&message).await;
+                            if let Some(ref tx) = sender {
+                                let msg = self.generate_error(&message);
+                                let _ = tx.send(msg).await;
+                            }
                         }
                         Some(ActorMessage::Shutdown) => {
                             debug!("ProgressReporterActor shutting down");
@@ -176,23 +192,22 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
         debug!("ProgressReporterActor stopped");
     }
 
-    /// 发送开始事件
-    async fn send_started_event(&self, worker_count: u64, initial_chunk_size: u64) {
-        if let Some(ref sender) = self.progress_sender {
-            let _ = sender
-                .send(DownloadProgress::Started {
-                    total_size: self.total_size,
-                    worker_count,
-                    initial_chunk_size,
-                })
-                .await;
+    /// 生成开始事件消息
+    fn generate_started_event(
+        &self,
+        worker_count: u64,
+        initial_chunk_size: u64,
+    ) -> DownloadProgress {
+        DownloadProgress::Started {
+            total_size: self.total_size,
+            worker_count,
+            initial_chunk_size,
         }
     }
 
     /// 计算 worker 统计快照（直接从 worker_handles 中获取）
     fn compute_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
-        let local_epoch = self.worker_handles.register_reader();
-        let handles = self.worker_handles.read(&local_epoch);
+        let handles = self.worker_handles.load();
         handles
             .iter()
             .map(|(worker_id, handle)| {
@@ -214,65 +229,58 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
             .collect()
     }
 
-    /// 发送进度更新（从 global_stats 获取所有数据）
-    async fn send_progress_update(&self) {
-        if let Some(ref sender) = self.progress_sender {
-            // 从 global_stats 获取总体统计
-            let summary = self.global_stats.get_full_summary();
+    /// 生成进度更新消息（从 global_stats 获取所有数据）
+    fn generate_progress_update(&self) -> Option<DownloadProgress> {
+        // 只有当有 sender 时才生成消息（虽然调用方也会检查，但双重检查无害）
+        if self.progress_sender.is_none() {
+            return None;
+        }
 
-            // 计算百分比
-            let percentage = if self.total_size.get() > 0 {
-                (summary.total_bytes as f64 / self.total_size.get() as f64) * 100.0
-            } else {
-                0.0
-            };
+        // 从 global_stats 获取总体统计
+        let summary = self.global_stats.get_full_summary();
 
-            // 在 actor 内部从 worker_handles 计算 worker 快照
-            let workers_snapshots = self.compute_worker_snapshots();
+        // 计算百分比
+        let percentage = if self.total_size.get() > 0 {
+            (summary.total_bytes as f64 / self.total_size.get() as f64) * 100.0
+        } else {
+            0.0
+        };
 
-            let _ = sender
-                .send(DownloadProgress::Progress {
-                    bytes_downloaded: summary.total_bytes,
-                    total_size: self.total_size,
-                    percentage,
-                    avg_speed: summary.avg_speed,
-                    instant_speed: summary.instant_speed,
-                    window_avg_speed: summary.window_avg_speed,
-                    instant_acceleration: summary.instant_acceleration,
-                    worker_stats: workers_snapshots,
-                })
-                .await;
+        // 在 actor 内部从 worker_handles 计算 worker 快照
+        let workers_snapshots = self.compute_worker_snapshots();
+
+        Some(DownloadProgress::Progress {
+            bytes_downloaded: summary.total_bytes,
+            total_size: self.total_size,
+            percentage,
+            avg_speed: summary.avg_speed,
+            instant_speed: summary.instant_speed,
+            window_avg_speed: summary.window_avg_speed,
+            instant_acceleration: summary.instant_acceleration,
+            worker_stats: workers_snapshots,
+        })
+    }
+
+    /// 生成完成统计消息（从 global_stats 获取所有数据）
+    fn generate_completion_stats(&self) -> DownloadProgress {
+        // 从 global_stats 获取总体统计
+        let summary = self.global_stats.get_full_summary();
+
+        // 在 actor 内部从 worker_handles 计算 worker 快照
+        let workers_snapshots = self.compute_worker_snapshots();
+
+        DownloadProgress::Completed {
+            total_bytes: summary.total_bytes,
+            total_time: summary.elapsed_secs,
+            avg_speed: summary.avg_speed,
+            worker_stats: workers_snapshots,
         }
     }
 
-    /// 发送完成统计（从 global_stats 获取所有数据）
-    async fn send_completion_stats(&self) {
-        if let Some(ref sender) = self.progress_sender {
-            // 从 global_stats 获取总体统计
-            let summary = self.global_stats.get_full_summary();
-
-            // 在 actor 内部从 worker_handles 计算 worker 快照
-            let workers_snapshots = self.compute_worker_snapshots();
-
-            let _ = sender
-                .send(DownloadProgress::Completed {
-                    total_bytes: summary.total_bytes,
-                    total_time: summary.elapsed_secs,
-                    avg_speed: summary.avg_speed,
-                    worker_stats: workers_snapshots,
-                })
-                .await;
-        }
-    }
-
-    /// 发送错误事件
-    async fn send_error(&self, error_msg: &str) {
-        if let Some(ref sender) = self.progress_sender {
-            let _ = sender
-                .send(DownloadProgress::Error {
-                    message: error_msg.to_string(),
-                })
-                .await;
+    /// 生成错误事件消息
+    fn generate_error(&self, error_msg: &str) -> DownloadProgress {
+        DownloadProgress::Error {
+            message: error_msg.to_string(),
         }
     }
 }
@@ -293,8 +301,8 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
     pub(super) fn new(
         progress_sender: Option<mpsc::Sender<DownloadProgress>>,
         total_size: NonZeroU64,
-        worker_handles: SwapReader<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
-        global_stats: Arc<crate::utils::stats::TaskStats>,
+        worker_handles: SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+        global_stats: crate::utils::stats::TaskStats,
         update_interval: std::time::Duration,
         start_offset: std::time::Duration,
     ) -> Self {
@@ -362,16 +370,16 @@ mod tests {
 
     // 辅助函数：创建空的 worker_handles
     fn create_empty_worker_handles<C: crate::utils::io_traits::HttpClient>()
-    -> SwapReader<im::HashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>> {
-        let (_swapper, reader)  = smr_swap::new(im::HashMap::new());
+    -> SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>> {
+        let (_swapper, reader) = smr_swap::new_smr_pair(FxHashMap::default());
         reader
     }
 
     // 辅助函数：创建模拟的 global_stats
-    fn create_mock_global_stats() -> Arc<crate::utils::stats::TaskStats> {
+    fn create_mock_global_stats() -> crate::utils::stats::TaskStats {
         // 使用默认的配置来创建 TaskStats
         let config = crate::config::DownloadConfig::default();
-        Arc::new(crate::utils::stats::TaskStats::from_config(config.speed()))
+        crate::utils::stats::TaskStats::from_config(config.speed())
     }
 
     #[tokio::test]

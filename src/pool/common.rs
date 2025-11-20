@@ -75,6 +75,7 @@
 use async_trait::async_trait;
 use deferred_map::DeferredMap;
 use log::{debug, error, info};
+use smr_swap::{ReaderGuard, SmrSwap, SwapReader};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -108,7 +109,7 @@ pub trait WorkerResult: Send + Debug + 'static {}
 /// # 要求
 ///
 /// - `Send + Sync`: 统计数据可以在线程间安全共享（通过 Arc）
-pub trait WorkerStats: Send + Sync + 'static {}
+pub trait WorkerStats: Send + 'static {}
 
 /// Worker 上下文 trait
 ///
@@ -162,7 +163,7 @@ pub trait WorkerExecutor: Send + Sync + Clone + 'static {
         worker_id: u64,
         task: Self::Task,
         context: &mut Self::Context,
-        stats: &Self::Stats,
+        stats: &mut SmrSwap<Self::Stats>,
     ) -> Self::Result;
 }
 
@@ -175,7 +176,7 @@ pub(crate) struct WorkerConfig<E: WorkerExecutor> {
     pub task_receiver: Receiver<E::Task>,
     pub result_sender: Sender<E::Result>,
     pub context: E::Context,
-    pub stats: Arc<E::Stats>,
+    pub stats: SmrSwap<E::Stats>,
     pub shutdown_receiver: tokio::sync::oneshot::Receiver<()>,
 }
 
@@ -195,7 +196,7 @@ pub(crate) async fn run_worker<E: WorkerExecutor>(config: WorkerConfig<E>) {
         mut task_receiver,
         result_sender,
         mut context,
-        stats,
+        mut stats,
         mut shutdown_receiver,
     } = config;
 
@@ -212,7 +213,7 @@ pub(crate) async fn run_worker<E: WorkerExecutor>(config: WorkerConfig<E>) {
                 debug!("Worker #{} 接收到任务: {:?}", id, task);
 
                 // 执行任务
-                let result = executor.execute(id, task, &mut context, &stats).await;
+                let result = executor.execute(id, task, &mut context, &mut stats).await;
 
                 // 发送结果
                 if let Err(e) = result_sender.send(result).await {
@@ -262,8 +263,8 @@ pub struct WorkerHandle<E: WorkerExecutor> {
     worker_id: u64,
     /// 向 worker 发送任务的通道
     task_sender: Arc<Sender<E::Task>>,
-    /// 该 worker 的统计数据（Arc 包装以便外部访问）
-    stats: Arc<E::Stats>,
+    /// 该 worker 的统计数据（SwapReader 包装以便外部访问）
+    stats: SwapReader<E::Stats>,
 }
 
 impl<E: WorkerExecutor> Clone for WorkerHandle<E> {
@@ -271,7 +272,7 @@ impl<E: WorkerExecutor> Clone for WorkerHandle<E> {
         Self {
             worker_id: self.worker_id,
             task_sender: Arc::clone(&self.task_sender),
-            stats: Arc::clone(&self.stats),
+            stats: self.stats.fork(),
         }
     }
 }
@@ -287,7 +288,7 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
     pub(crate) fn new(
         worker_id: u64,
         task_sender: Arc<Sender<E::Task>>,
-        stats: Arc<E::Stats>,
+        stats: SwapReader<E::Stats>,
     ) -> Self {
         Self {
             worker_id,
@@ -305,7 +306,7 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
         self.worker_id
     }
 
-    /// 提交任务给该 worker
+    /// 向 worker 发送任务
     ///
     /// # Arguments
     ///
@@ -314,12 +315,15 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
     /// # Returns
     ///
     /// 成功时返回 `Ok(())`，如果 worker 不存在或已关闭则返回 `Err`
-    pub async fn send_task(&self, task: E::Task) -> Result<()> {
-        self.task_sender
-            .send(task)
-            .await
-            .map_err(|e| DownloadError::TaskSend(e.to_string()))?;
-        Ok(())
+    pub fn send_task(&self, task: E::Task) -> impl std::future::Future<Output = Result<()>> + Send {
+        let sender = self.task_sender.clone();
+        async move {
+            sender
+                .send(task)
+                .await
+                .map_err(|e| DownloadError::TaskSend(e.to_string()))?;
+            Ok(())
+        }
     }
 
     /// 获取该 worker 的统计数据
@@ -327,8 +331,8 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
     /// # Returns
     ///
     /// Worker 统计数据的 Arc 引用
-    pub fn stats(&self) -> Arc<E::Stats> {
-        Arc::clone(&self.stats)
+    pub fn stats<'a>(&'a self) -> ReaderGuard<'a, E::Stats> {
+        self.stats.load()
     }
 }
 
@@ -368,7 +372,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         &mut self,
         key: u64,
         context: E::Context,
-        stats_arc: Arc<E::Stats>,
+        stats: E::Stats,
     ) -> (WorkerSlot, WorkerHandle<E>) {
         // 创建任务和关闭通道
         let (task_sender, task_receiver) = mpsc::channel::<E::Task>(100);
@@ -376,8 +380,10 @@ impl<E: WorkerExecutor> WorkerPool<E> {
 
         // 克隆 worker 需要的资源
         let result_sender_clone = self.result_sender.clone();
-        let stats_for_worker = Arc::clone(&stats_arc);
         let executor_clone = self.executor.clone();
+
+        let stats = SmrSwap::new(stats);
+        let stats_reader = stats.reader().fork();
 
         // 启动 worker 协程（不再包含自动清理逻辑）
         // 直接使用完整的 key 作为 worker_id
@@ -389,7 +395,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
                 task_receiver,
                 result_sender: result_sender_clone,
                 context,
-                stats: stats_for_worker,
+                stats,
                 shutdown_receiver,
             })
             .await;
@@ -406,7 +412,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         };
 
         // 创建 worker 句柄
-        let handle = WorkerHandle::new(key, task_sender, stats_arc);
+        let handle = WorkerHandle::new(key, task_sender, stats_reader);
 
         (slot, handle)
     }
@@ -431,7 +437,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// ```
     pub fn new(
         executor: E,
-        contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>,
+        contexts_with_stats: Vec<(E::Context, E::Stats)>,
     ) -> Result<(Self, Vec<WorkerHandle<E>>, Receiver<E::Result>)> {
         let worker_count = contexts_with_stats.len();
 
@@ -450,13 +456,13 @@ impl<E: WorkerExecutor> WorkerPool<E> {
 
         // 为每个 worker 创建独立的 task channel、上下文和统计，并启动协程
         let mut handles = Vec::with_capacity(worker_count);
-        for (context, stats_arc) in contexts_with_stats.into_iter() {
+        for (context, state) in contexts_with_stats.into_iter() {
             // 先分配 handle
             let deferred_handle = pool.slots.allocate_handle();
             let key = deferred_handle.key();
 
             // spawn_worker 返回 slot 和 handle
-            let (slot, worker_handle) = pool.spawn_worker(key, context, stats_arc);
+            let (slot, worker_handle) = pool.spawn_worker(key, context, state);
 
             // 将 slot 插入 DeferredMap
             pool.slots
@@ -487,16 +493,16 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     /// ```
     pub async fn add_workers(
         &mut self,
-        contexts_with_stats: Vec<(E::Context, Arc<E::Stats>)>,
+        contexts_with_stats: Vec<(E::Context, E::Stats)>,
     ) -> Result<Vec<WorkerHandle<E>>> {
         let mut handles = Vec::with_capacity(contexts_with_stats.len());
-        for (context, stats_arc) in contexts_with_stats.into_iter() {
+        for (context, stats) in contexts_with_stats.into_iter() {
             // 分配新的 handle
             let deferred_handle = self.slots.allocate_handle();
             let key = deferred_handle.key();
 
             // 启动 worker（spawn_worker 返回 slot 和 handle）
-            let (slot, worker_handle) = self.spawn_worker(key, context, stats_arc);
+            let (slot, worker_handle) = self.spawn_worker(key, context, stats);
 
             // 将 slot 插入 DeferredMap
             self.slots
@@ -611,18 +617,11 @@ pub mod test_utils {
     }
 
     /// 测试用的统计
+    #[derive(Debug, Clone, Default)]
     pub struct TestStats {
-        pub task_count: AtomicUsize,
+        pub task_count: usize,
     }
     impl WorkerStats for TestStats {}
-
-    impl Default for TestStats {
-        fn default() -> Self {
-            Self {
-                task_count: AtomicUsize::new(0),
-            }
-        }
-    }
 
     impl TestStats {
         pub fn new() -> Self {
@@ -646,12 +645,16 @@ pub mod test_utils {
             worker_id: u64,
             task: Self::Task,
             context: &mut Self::Context,
-            stats: &Self::Stats,
+            stats: &mut SmrSwap<Self::Stats>,
         ) -> Self::Result {
             // 模拟处理任务
             sleep(Duration::from_millis(10)).await;
             context.processed_count.fetch_add(1, Ordering::SeqCst);
-            stats.task_count.fetch_add(1, Ordering::SeqCst);
+            stats.update_and_fetch(|s| {
+                let mut s = s.clone();
+                s.task_count += 1;
+                s
+            });
             TestResult::Success {
                 worker_id,
                 task_id: task.id,
@@ -675,7 +678,7 @@ pub mod test_utils {
             worker_id: u64,
             _task: Self::Task,
             _context: &mut Self::Context,
-            _stats: &Self::Stats,
+            _stats: &mut SmrSwap<Self::Stats>,
         ) -> Self::Result {
             TestResult::Failed {
                 worker_id,
@@ -685,12 +688,12 @@ pub mod test_utils {
     }
 
     /// 创建测试用的上下文和统计数据
-    pub fn create_context_with_stats() -> (TestContext, Arc<TestStats>) {
-        (TestContext::new(), Arc::new(TestStats::new()))
+    pub fn create_context_with_stats() -> (TestContext, TestStats) {
+        (TestContext::new(), TestStats::new())
     }
 
     /// 创建指定数量的测试用上下文和统计数据
-    pub fn create_contexts_with_stats(count: usize) -> Vec<(TestContext, Arc<TestStats>)> {
+    pub fn create_contexts_with_stats(count: usize) -> Vec<(TestContext, TestStats)> {
         (0..count).map(|_| create_context_with_stats()).collect()
     }
 }
@@ -699,7 +702,6 @@ pub mod test_utils {
 mod tests {
     use super::test_utils::*;
     use super::*;
-    use std::sync::atomic::Ordering;
     use tokio::time::{Duration, sleep};
 
     /// 测试创建协程池
@@ -773,7 +775,6 @@ mod tests {
     async fn test_worker_stats() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(1);
-        let stats_ref = contexts[0].1.clone();
         let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
 
         // 发送多个任务
@@ -791,8 +792,8 @@ mod tests {
         }
 
         // 验证统计数据
-        let count = stats_ref.task_count.load(Ordering::SeqCst);
-        assert_eq!(count, 5);
+        let stats = handles[0].stats();
+        assert_eq!(stats.task_count, 5);
 
         pool.shutdown().await;
     }

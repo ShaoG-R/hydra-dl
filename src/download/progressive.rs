@@ -8,11 +8,11 @@ use crate::pool::download::DownloadWorkerHandle;
 use lite_sync::oneshot::lite;
 use log::{debug, error, info};
 use net_bytes::{DownloadSpeed, FileSizeFormat};
+use rustc_hash::FxHashMap;
 use smr_swap::SwapReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
-
 
 /// Worker 启动请求
 #[derive(Debug, Clone)]
@@ -69,7 +69,10 @@ impl ProgressiveLauncherLogic {
     ///
     /// 将 `Vec<Option<DownloadSpeed>>` 转换为格式化的速度字符串
     /// 例如: "1.2 MB/s, 1.5 MB/s, N/A"
-    fn format_speeds(speeds: &[Option<DownloadSpeed>], size_standard: net_bytes::SizeStandard) -> String {
+    fn format_speeds(
+        speeds: &[Option<DownloadSpeed>],
+        size_standard: net_bytes::SizeStandard,
+    ) -> String {
         speeds
             .iter()
             .map(|speed| match speed {
@@ -116,7 +119,7 @@ impl ProgressiveLauncherLogic {
     /// 检查所有已启动 Worker 的速度是否达到阈值
     fn check_worker_speeds<C: crate::utils::io_traits::HttpClient>(
         &self,
-        worker_handles: &im::HashMap<u64, DownloadWorkerHandle<C>>,
+        worker_handles: &FxHashMap<u64, DownloadWorkerHandle<C>>,
         config: &DownloadConfig,
     ) -> Result<Vec<Option<DownloadSpeed>>, WaitReason> {
         let mut speeds = Vec::with_capacity(worker_handles.len());
@@ -185,7 +188,7 @@ impl ProgressiveLauncherLogic {
     /// 4. 是否有需要启动的 worker
     fn decide_next_launch<C: crate::utils::io_traits::HttpClient>(
         &self,
-        worker_handles: &im::HashMap<u64, DownloadWorkerHandle<C>>,
+        worker_handles: &FxHashMap<u64, DownloadWorkerHandle<C>>,
         written_bytes: u64,
         total_bytes: u64,
         global_stats: &crate::utils::stats::TaskStats,
@@ -203,7 +206,9 @@ impl ProgressiveLauncherLogic {
             Err(reason) => return LaunchDecision::Wait(reason),
             Ok(speeds) => {
                 // 检查剩余时间
-                if let Err(reason) = self.check_remaining_time(written_bytes, total_bytes, global_stats, config) {
+                if let Err(reason) =
+                    self.check_remaining_time(written_bytes, total_bytes, global_stats, config)
+                {
                     return LaunchDecision::Wait(reason);
                 }
 
@@ -264,13 +269,13 @@ struct ProgressiveLauncherActor<C: crate::utils::io_traits::HttpClient> {
     /// 关闭接收器
     shutdown_rx: lite::Receiver<()>,
     /// 共享的 worker handles
-    worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// 文件总大小
     total_size: u64,
     /// 已写入字节数（共享引用）
     written_bytes: Arc<AtomicU64>,
     /// 全局统计管理器
-    global_stats: Arc<crate::utils::stats::TaskStats>,
+    global_stats: crate::utils::stats::TaskStats,
     /// Worker 启动请求发送器
     launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
     /// 检查定时器（内部管理）
@@ -282,10 +287,10 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
     async fn new(
         config: Arc<DownloadConfig>,
         shutdown_rx: lite::Receiver<()>,
-        worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         total_size: u64,
         written_bytes: Arc<AtomicU64>,
-        global_stats: Arc<crate::utils::stats::TaskStats>,
+        global_stats: crate::utils::stats::TaskStats,
         launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
         check_interval: std::time::Duration,
         start_offset: std::time::Duration,
@@ -353,8 +358,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
         }
 
         let decision = {
-            let local_epoch = self.worker_handles.register_reader();
-            let worker_handles = self.worker_handles.read(&local_epoch);
+            let worker_handles = self.worker_handles.load();
 
             // 检测并调整启动阶段（应对 worker 数量变化）
             let current_worker_count = worker_handles.len() as u64;
@@ -367,7 +371,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
                 &*worker_handles,
                 written,
                 self.total_size,
-                &*self.global_stats,
+                &self.global_stats,
                 &self.config,
             )
         };
@@ -379,7 +383,10 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
                 speeds,
             } => {
                 let next_target = self.logic.worker_launch_stages[self.logic.next_launch_stage];
-                let formatted_speeds = ProgressiveLauncherLogic::format_speeds(&speeds, self.config.speed().size_standard());
+                let formatted_speeds = ProgressiveLauncherLogic::format_speeds(
+                    &speeds,
+                    self.config.speed().size_standard(),
+                );
                 info!(
                     "渐进式启动 - 第{}批: 所有worker速度达标 (当前速度: {})，准备启动 {} 个新 workers (总计 {} 个)",
                     self.logic.next_launch_stage + 1,
@@ -413,7 +420,10 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
     fn log_wait_reason(&self, reason: &WaitReason) {
         match reason {
             WaitReason::InsufficientSpeed { speeds, threshold } => {
-                let formatted_speeds = ProgressiveLauncherLogic::format_speeds(speeds, self.config.speed().size_standard());
+                let formatted_speeds = ProgressiveLauncherLogic::format_speeds(
+                    speeds,
+                    self.config.speed().size_standard(),
+                );
                 match threshold {
                     Some(threshold) => {
                         let threshold_formatted = DownloadSpeed::from_raw(*threshold)
@@ -465,10 +475,10 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
     /// 创建新的渐进式启动管理器（启动 actor）
     pub(super) fn new(
         config: Arc<DownloadConfig>,
-        worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         total_size: u64,
         written_bytes: Arc<AtomicU64>,
-        global_stats: Arc<crate::utils::stats::TaskStats>,
+        global_stats: crate::utils::stats::TaskStats,
         check_interval: std::time::Duration,
         start_offset: std::time::Duration,
     ) -> Self {

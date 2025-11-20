@@ -8,7 +8,7 @@ use crate::pool::download::DownloadWorkerHandle;
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use parking_lot::RwLock;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smr_swap::SwapReader;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -278,7 +278,7 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
     /// 消息接收器
     message_rx: mpsc::Receiver<ActorMessage>,
     /// 单一写入者的 worker handles 持有者
-    worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// Worker 取消请求发送器
     cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
     /// 检查定时器（内部管理）
@@ -292,7 +292,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
     async fn new(
         config: Arc<DownloadConfig>,
         message_rx: mpsc::Receiver<ActorMessage>,
-        worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
         check_interval: std::time::Duration,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
@@ -362,9 +362,8 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
 
         // 使用内部作用域确保锁在 await 之前释放
         {
-            let local_epoch = self.worker_handles.register_reader();
-            let guard = self.worker_handles.read(&local_epoch);
-            let current_worker_count = guard.len() as u64;
+            let handles = self.worker_handles.load();
+            let current_worker_count = handles.len() as u64;
             let min_workers = self.config.health_check().min_workers_for_check();
 
             // worker 数量不足，跳过检查
@@ -375,13 +374,13 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
             // 获取活跃 worker 列表
             let active_workers = self.active_workers.read();
 
-            for &worker_id in guard.keys() {
+            for &worker_id in handles.keys() {
                 // 只检查正在执行任务的 worker
                 if !active_workers.contains(&worker_id) {
                     continue;
                 }
 
-                if let Some(handle) = guard.get(&worker_id) {
+                if let Some(handle) = handles.get(&worker_id) {
                     let speed = handle.window_avg_speed();
                     // 只考虑有效的速度数据
                     if let Some(speed) = speed {
@@ -453,7 +452,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
     /// 创建新的健康检查器（启动 actor）
     pub(super) fn new(
         config: Arc<DownloadConfig>,
-        worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         check_interval: std::time::Duration,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
         start_offset: std::time::Duration,

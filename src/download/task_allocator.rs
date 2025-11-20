@@ -273,7 +273,7 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
     /// 配置
     config: Arc<crate::config::DownloadConfig>,
     /// Worker 句柄映射
-    worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// 任务取消 sender 映射
     cancel_senders: FxHashMap<u64, lite::Sender<()>>,
     /// 活跃 worker 集合（与 WorkerHealthChecker 共享）
@@ -291,7 +291,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         result_rx: mpsc::Receiver<RangeResult>,
         cancel_rx: mpsc::Receiver<WorkerCancelRequest>,
         config: Arc<crate::config::DownloadConfig>,
-        worker_handles: SwapReader<im::HashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
     ) -> (TaskAllocatorHandle, oneshot::Receiver<CompletionResult>) {
         let (message_tx, message_rx) = mpsc::channel(100);
@@ -336,8 +336,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         cancel_tx: lite::Sender<()>,
     ) -> bool {
         let handle = {
-            let local_epoch = self.worker_handles.register_reader();
-            let worker_handles = self.worker_handles.read(&local_epoch);
+            let worker_handles = self.worker_handles.load();
             worker_handles.get(&worker_id).cloned()
         };
         if let Some(handle) = handle {
@@ -570,10 +569,8 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
 
         while let Some(&worker_id) = self.state.idle_workers.front() {
             let chunk_size = {
-                let local_epoch = self.worker_handles.register_reader();
-                self
-                    .worker_handles
-                    .read(&local_epoch)
+                let handles = self.worker_handles.load();
+                handles
                     .get(&worker_id)
                     .map(|h| h.chunk_size())
                     .unwrap_or(self.config.chunk().initial_size())
@@ -597,10 +594,8 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
     /// 尝试为 worker 分配下一个任务
     async fn try_allocate_next_task(&mut self, worker_id: u64) {
         let chunk_size = {
-            let local_epoch = self.worker_handles.register_reader();
-            self
-                .worker_handles
-                .read(&local_epoch)
+            let handles = self.worker_handles.load();
+            handles
                 .get(&worker_id)
                 .map(|h| h.chunk_size())
                 .unwrap_or(self.config.chunk().initial_size())

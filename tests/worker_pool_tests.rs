@@ -5,6 +5,7 @@
 
 use hydra_dl::pool::common::test_utils::*;
 use hydra_dl::pool::common::{WorkerExecutor, WorkerPool};
+use smr_swap::SmrSwap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Barrier;
@@ -293,7 +294,6 @@ async fn test_load_balancing() {
     let executor = TestExecutor;
     let worker_count = 4;
     let contexts = create_contexts_with_stats(worker_count);
-    let stats_refs: Vec<_> = contexts.iter().map(|(_, s)| s.clone()).collect();
     let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
 
     let total_tasks = 100;
@@ -316,8 +316,9 @@ async fn test_load_balancing() {
     }
 
     // 验证每个 worker 处理了大约相同数量的任务
-    for (i, stats) in stats_refs.iter().enumerate() {
-        let count = stats.task_count.load(Ordering::SeqCst);
+    for (i, handle) in handles.iter().enumerate() {
+        let stats = handle.stats();
+        let count = stats.task_count;
         println!("Worker {} processed {} tasks", i, count);
         assert!(
             count >= 20 && count <= 30,
@@ -408,7 +409,7 @@ async fn test_shutdown_while_processing() {
             worker_id: u64,
             task: Self::Task,
             _context: &mut Self::Context,
-            _stats: &Self::Stats,
+            _stats: &mut SmrSwap<Self::Stats>,
         ) -> Self::Result {
             // 模拟长时间处理
             sleep(Duration::from_millis(500)).await;
@@ -499,7 +500,7 @@ async fn test_mixed_success_and_failure() {
             worker_id: u64,
             task: Self::Task,
             _context: &mut Self::Context,
-            _stats: &Self::Stats,
+            _stats: &mut SmrSwap<Self::Stats>,
         ) -> Self::Result {
             // 偶数 ID 的任务失败
             if task.id % 2 == 0 {
@@ -748,7 +749,6 @@ async fn test_statistics_accuracy() {
     let executor = TestExecutor;
     let worker_count = 4;
     let contexts = create_contexts_with_stats(worker_count);
-    let stats_refs: Vec<_> = contexts.iter().map(|(_, s)| s.clone()).collect();
     let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
 
     // 为每个 worker 发送已知数量的任务
@@ -775,7 +775,8 @@ async fn test_statistics_accuracy() {
 
     // 验证每个 worker 的统计数据
     for (i, &expected) in tasks_per_worker.iter().enumerate() {
-        let actual = stats_refs[i].task_count.load(Ordering::SeqCst);
+        let stats = handles[i].stats();
+        let actual = stats.task_count;
         assert_eq!(
             actual, expected,
             "Worker {} should have processed {} tasks",
