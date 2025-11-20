@@ -93,7 +93,7 @@ where
     type Stats = WorkerStats;
 
     async fn execute(
-        &self,
+        &mut self,
         worker_id: u64,
         task: Self::Task,
         context: &mut Self::Context,
@@ -658,7 +658,7 @@ mod tests {
         );
 
         // 创建执行器（直接 move writer）
-        let executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
+        let mut executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
 
         // 创建上下文和统计
         let stats = crate::utils::stats::WorkerStats::default();
@@ -720,7 +720,7 @@ mod tests {
         );
 
         // 创建执行器（直接 move writer）
-        let executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
+        let mut executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
 
         let stats = crate::utils::stats::WorkerStats::default();
         let config = crate::config::DownloadConfig::default();

@@ -6,7 +6,7 @@ use portable_atomic::AtomicU128;
 use smallring::atomic::{AtomicElement, AtomicRingBuf};
 use std::num::NonZeroU64;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
@@ -22,7 +22,7 @@ impl Sample {
     ///
     /// * `timestamp_ns` - 时间戳（纳秒）
     /// * `bytes` - 字节数
-    ///
+    /// 
     /// # Returns
     ///
     /// `Sample` - 创建的采样点
@@ -152,8 +152,8 @@ pub(crate) struct SpeedCalculator {
     window_avg_duration: Duration,
     /// 下载开始时间（只初始化一次）
     start_time: OnceLock<Instant>,
-    /// 上次采样时间戳（纳秒，相对于 start_time）
-    last_sample_timestamp_ns: AtomicU64,
+    /// 上次采样点（打包的 timestamp + bytes）
+    last_sample_packed: AtomicU128,
     /// 采样间隔（纳秒）
     sample_interval_ns: u64,
 }
@@ -221,7 +221,7 @@ impl SpeedCalculator {
             instant_speed_window,
             window_avg_duration,
             start_time: OnceLock::new(),
-            last_sample_timestamp_ns: AtomicU64::new(0),
+            last_sample_packed: AtomicU128::new(0),
             sample_interval_ns: sample_interval.as_nanos() as u64,
         }
     }
@@ -247,21 +247,33 @@ impl SpeedCalculator {
 
         // 自动采样逻辑：根据配置的采样间隔记录采样点
         let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
-        let last_sample_ns = self.last_sample_timestamp_ns.load(Ordering::Relaxed);
+        let last_packed = self.last_sample_packed.load(Ordering::Relaxed);
+        let last_sample = Sample::from_u128(last_packed);
+        let last_sample_ns = last_sample.timestamp_ns.get();
+
+        // 数据一致性检查：
+        // 1. 如果当前字节数小于上次记录的字节数，说明这是滞后的数据，直接丢弃
+        //    这种情况可能发生在高并发下，线程 A (bytes=100) 被抢占，
+        //    线程 B (bytes=200) 先执行并记录，然后线程 A 恢复执行。
+        // 2. 时间戳必须单调递增（隐含在 interval check 中，但如果时间倒流则不应记录）
+        if current_bytes < last_sample.bytes {
+            return;
+        }
 
         // 检查是否需要采样（距离上次采样超过配置的采样间隔，或者是首次采样）
-        if last_sample_ns == 0
+        if last_packed == 0
             || current_elapsed_ns.saturating_sub(last_sample_ns) >= self.sample_interval_ns
         {
             let sample = Sample::new(current_elapsed_ns, current_bytes);
+            let new_packed = sample.into_u128();
 
-            // 尝试更新采样时间戳（使用 compare_exchange 避免重复采样）
-            // 允许多个线程竞争，只有一个会成功，这样可以避免过度采样
+            // 尝试更新采样点（使用 compare_exchange 避免重复采样）
+            // 允许多个线程竞争，只有一个会成功
             if self
-                .last_sample_timestamp_ns
+                .last_sample_packed
                 .compare_exchange(
-                    last_sample_ns,
-                    sample.timestamp_ns.get(),
+                    last_packed,
+                    new_packed,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )

@@ -158,7 +158,7 @@ pub trait WorkerExecutor: Send + Sync + Clone + 'static {
     ///
     /// 任务执行结果
     async fn execute(
-        &self,
+        &mut self,
         worker_id: u64,
         task: Self::Task,
         context: &mut Self::Context,
@@ -191,7 +191,7 @@ pub(crate) struct WorkerConfig<E: WorkerExecutor> {
 pub(crate) async fn run_worker<E: WorkerExecutor>(config: WorkerConfig<E>) {
     let WorkerConfig {
         id,
-        executor,
+        mut executor,
         mut task_receiver,
         result_sender,
         mut context,
@@ -642,7 +642,7 @@ pub mod test_utils {
         type Stats = TestStats;
 
         async fn execute(
-            &self,
+            &mut self,
             worker_id: u64,
             task: Self::Task,
             context: &mut Self::Context,
@@ -671,7 +671,7 @@ pub mod test_utils {
         type Stats = TestStats;
 
         async fn execute(
-            &self,
+            &mut self,
             worker_id: u64,
             _task: Self::Task,
             _context: &mut Self::Context,

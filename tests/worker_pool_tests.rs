@@ -404,7 +404,7 @@ async fn test_shutdown_while_processing() {
         type Stats = TestStats;
 
         async fn execute(
-            &self,
+            &mut self,
             worker_id: u64,
             task: Self::Task,
             _context: &mut Self::Context,
@@ -495,7 +495,7 @@ async fn test_mixed_success_and_failure() {
         type Stats = TestStats;
 
         async fn execute(
-            &self,
+            &mut self,
             worker_id: u64,
             task: Self::Task,
             _context: &mut Self::Context,
