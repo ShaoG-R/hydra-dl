@@ -23,9 +23,9 @@ urlencoding = "2.1"
 rustc-hash = "2.1.1"
 
 # 下面的crates是 hydra-dl 作者维护的
-kestrel-timer = "0.3.4"
+kestrel-timer = "0.3.5"
 ranged-mmap = "0.1.2"
-deferred-map = "0.1.2"
+deferred-map = "0.2.0"
 lite-sync = "0.1.7"
 net-bytes = "0.2.1"
 smr-swap = "0.7.2"

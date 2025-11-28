@@ -455,11 +455,11 @@ where
         writer: MmapWriter,
         config: Arc<crate::config::DownloadConfig>,
         global_stats: TaskStats,
-    ) -> Result<(
+    ) -> (
         Self,
         Vec<DownloadWorkerHandle<C>>,
         tokio::sync::mpsc::Receiver<RangeResult>,
-    )> {
+    ) {
         // 创建执行器（直接 move writer，避免 Arc 克隆）
         let executor = DownloadWorkerExecutor::new(client, writer, config.speed().size_standard());
 
@@ -482,7 +482,7 @@ where
 
         // 创建通用协程池并获取 worker 句柄和 result_receiver
         let (pool, worker_handles, result_receiver) =
-            WorkerPool::new(executor, contexts_with_stats)?;
+            WorkerPool::new(executor, contexts_with_stats);
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
@@ -492,7 +492,7 @@ where
             .map(DownloadWorkerHandle::new)
             .collect();
 
-        Ok((
+        (
             Self {
                 pool,
                 global_stats,
@@ -500,7 +500,7 @@ where
             },
             download_handles,
             result_receiver,
-        ))
+        )
     }
 
     /// 动态添加新的 worker
@@ -512,7 +512,7 @@ where
     /// # Returns
     ///
     /// 成功时返回新添加的所有 worker 的句柄，失败时返回错误信息
-    pub(crate) async fn add_workers(&mut self, count: u64) -> Result<Vec<DownloadWorkerHandle<C>>> {
+    pub(crate) async fn add_workers(&mut self, count: u64) -> Vec<DownloadWorkerHandle<C>> {
         // 创建新的 worker 上下文和统计
         let contexts_with_stats: Vec<(DownloadWorkerContext, crate::utils::stats::WorkerStats)> =
             (0..count)
@@ -531,7 +531,7 @@ where
                 .collect();
 
         // 添加新 workers（使用现有的执行器）并获取句柄
-        let worker_handles = self.pool.add_workers(contexts_with_stats).await?;
+        let worker_handles = self.pool.add_workers(contexts_with_stats).await;
 
         // 将通用句柄转换为下载特定句柄
         let download_handles = worker_handles
@@ -539,7 +539,7 @@ where
             .map(DownloadWorkerHandle::new)
             .collect();
 
-        Ok(download_handles)
+        download_handles
     }
 
     /// 获取当前活跃 worker 总数
@@ -590,7 +590,7 @@ mod tests {
         let config = Arc::new(crate::config::DownloadConfig::default());
         let global_stats = TaskStats::from_config(config.speed());
         let (pool, _handles, _result_receiver) =
-            DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
+            DownloadWorkerPool::new(client, worker_count, writer, config, global_stats);
 
         assert_eq!(pool.worker_count(), 4);
     }
@@ -609,7 +609,7 @@ mod tests {
         let config = Arc::new(crate::config::DownloadConfig::default());
         let global_stats = TaskStats::from_config(config.speed());
         let (pool, _handles, _result_receiver) =
-            DownloadWorkerPool::new(client, worker_count, writer, config, global_stats).unwrap();
+            DownloadWorkerPool::new(client, worker_count, writer, config, global_stats);
 
         // 初始统计应该都是 0
         let (total_bytes, total_secs, ranges) = pool.global_stats.get_summary();
@@ -634,7 +634,7 @@ mod tests {
         let config = Arc::new(crate::config::DownloadConfig::default());
         let global_stats = TaskStats::from_config(config.speed());
         let (mut pool, _handles, _result_receiver) =
-            DownloadWorkerPool::new(client.clone(), 2, writer, config, global_stats).unwrap();
+            DownloadWorkerPool::new(client.clone(), 2, writer, config, global_stats);
 
         // 关闭 workers
         pool.shutdown().await;

@@ -438,7 +438,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     pub fn new(
         executor: E,
         contexts_with_stats: Vec<(E::Context, E::Stats)>,
-    ) -> Result<(Self, Vec<WorkerHandle<E>>, Receiver<E::Result>)> {
+    ) -> (Self, Vec<WorkerHandle<E>>, Receiver<E::Result>) {
         let worker_count = contexts_with_stats.len();
 
         // 创建 DeferredMap
@@ -466,13 +466,12 @@ impl<E: WorkerExecutor> WorkerPool<E> {
 
             // 将 slot 插入 DeferredMap
             pool.slots
-                .insert(deferred_handle, slot)
-                .map_err(|e| DownloadError::Other(format!("插入 slot 失败: {:?}", e)))?;
+                .insert(deferred_handle, slot);
 
             handles.push(worker_handle);
         }
 
-        Ok((pool, handles, result_receiver))
+        (pool, handles, result_receiver)
     }
 
     /// 动态添加新的 worker
@@ -494,7 +493,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
     pub async fn add_workers(
         &mut self,
         contexts_with_stats: Vec<(E::Context, E::Stats)>,
-    ) -> Result<Vec<WorkerHandle<E>>> {
+    ) -> Vec<WorkerHandle<E>> {
         let mut handles = Vec::with_capacity(contexts_with_stats.len());
         for (context, stats) in contexts_with_stats.into_iter() {
             // 分配新的 handle
@@ -506,15 +505,14 @@ impl<E: WorkerExecutor> WorkerPool<E> {
 
             // 将 slot 插入 DeferredMap
             self.slots
-                .insert(deferred_handle, slot)
-                .map_err(|e| DownloadError::Other(format!("插入 slot 失败: {:?}", e)))?;
+                .insert(deferred_handle, slot);
 
             handles.push(worker_handle);
 
             debug!("新 worker 添加到位置 #{}", key);
         }
 
-        Ok(handles)
+        handles
     }
 
     /// 获取当前活跃 worker 总数
@@ -711,9 +709,8 @@ mod tests {
         let contexts = create_contexts_with_stats(4);
 
         let result = WorkerPool::new(executor, contexts);
-        assert!(result.is_ok());
 
-        let (mut pool, handles, _result_receiver) = result.unwrap();
+        let (mut pool, handles, _result_receiver) = result;
         assert_eq!(pool.worker_count(), 4);
         assert_eq!(handles.len(), 4);
 
@@ -728,9 +725,8 @@ mod tests {
         let contexts = vec![];
 
         let result = WorkerPool::new(executor, contexts);
-        assert!(result.is_ok());
 
-        let (mut pool, handles, _result_receiver) = result.unwrap();
+        let (mut pool, handles, _result_receiver) = result;
         assert_eq!(pool.worker_count(), 0);
         assert_eq!(handles.len(), 0);
 
@@ -742,7 +738,7 @@ mod tests {
     async fn test_send_and_receive() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(2);
-        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
         // 向第一个 worker 发送任务
         let task = TestTask {
@@ -775,7 +771,7 @@ mod tests {
     async fn test_worker_stats() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(1);
-        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
         // 发送多个任务
         for i in 0..5 {
@@ -803,13 +799,13 @@ mod tests {
     async fn test_add_workers() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(2);
-        let (mut pool, _, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, _, _result_receiver) = WorkerPool::new(executor, contexts);
 
         assert_eq!(pool.worker_count(), 2);
 
         // 动态添加 3 个新 workers
         let new_contexts = create_contexts_with_stats(3);
-        let new_handles = pool.add_workers(new_contexts).await.unwrap();
+        let new_handles = pool.add_workers(new_contexts).await;
 
         assert_eq!(pool.worker_count(), 5);
         assert_eq!(new_handles.len(), 3);
@@ -822,7 +818,7 @@ mod tests {
     async fn test_worker_handle_id() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(3);
-        let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts);
 
         // 验证每个 handle 的 worker_id 是唯一的
         let ids: Vec<u64> = handles.iter().map(|h| h.worker_id()).collect();
@@ -843,7 +839,7 @@ mod tests {
     async fn test_graceful_shutdown() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(4);
-        let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts);
 
         // 发送一些任务
         for i in 0..10 {
@@ -870,7 +866,7 @@ mod tests {
     async fn test_failing_executor() {
         let executor = FailingExecutor;
         let contexts = create_contexts_with_stats(2);
-        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
         // 发送任务
         let task = TestTask {
@@ -902,7 +898,7 @@ mod tests {
     async fn test_worker_handle_clone() {
         let executor = TestExecutor;
         let contexts = create_contexts_with_stats(1);
-        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+        let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
         // 克隆句柄
         let handle1 = handles[0].clone();

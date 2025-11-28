@@ -51,7 +51,7 @@ pub struct DownloadTask<C: HttpClient> {
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
     /// 创建新的下载任务
-    pub(super) async fn new(params: DownloadTaskParams<C>) -> crate::Result<Self> {
+    pub(super) async fn new(params: DownloadTaskParams<C>) -> Self {
         // 解构参数
         let DownloadTaskParams {
             client,
@@ -111,7 +111,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             writer.clone(),
             Arc::clone(&config),
             global_stats.clone(),
-        )?;
+        );
 
         // 使用实际的 worker_id（从 handle 获取）填充 worker_handles
         let initial_worker_handles: FxHashMap<u64, _> = initial_handles
@@ -145,15 +145,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         });
 
         // 注册第一批 workers（会自动触发任务分配）
-        {
-            let worker_ids = {
-                let guard = swap.load();
-                guard.keys().cloned().collect()
-            };
-            task_allocator_handle.register_new_workers(worker_ids).await;
-        }
+        let worker_ids = {
+            let guard = swap.load();
+            guard.keys().cloned().collect()
+        };
+        task_allocator_handle.register_new_workers(worker_ids).await;
 
-        Ok(Self {
+        Self {
             pool,
             writer,
             task_allocator: task_allocator_handle,
@@ -164,7 +162,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             completion_rx,
             worker_handles: swap,
             health_checker,
-        })
+        }
     }
 
     /// 等待所有 range 完成
@@ -222,9 +220,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     async fn handle_launch_request(&mut self, request: WorkerLaunchRequest) {
         let WorkerLaunchRequest { count, stage } = request;
 
-        if let Err(e) = self.execute_worker_launch(count, stage).await {
-            error!("渐进式启动失败: {:?}", e);
-        }
+        self.execute_worker_launch(count, stage).await
     }
 
     /// 关闭并清理资源
@@ -338,7 +334,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     }
 
     /// 执行 worker 启动（内部方法）
-    async fn execute_worker_launch(&mut self, count: u64, stage: usize) -> crate::Result<()> {
+    async fn execute_worker_launch(&mut self, count: u64, stage: usize) {
         let current_worker_count = self.pool.worker_count();
         let next_target = current_worker_count + count;
 
@@ -350,31 +346,24 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         );
 
         // 动态添加新 worker，收集实际的 worker_id
-        let new_worker_ids: Vec<u64> = match self.pool.add_workers(count).await {
-            Ok(new_handles) => {
-                let mut ids = Vec::new();
-                self.worker_handles.update_and_fetch(|handles| {
-                    let mut handles = handles.clone();
-                    for handle in new_handles {
-                        let worker_id = handle.worker_id();
-                        ids.push(worker_id);
-                        handles.insert(worker_id, handle);
-                    }
-                    handles
-                });
-                ids
-            }
-            Err(e) => {
-                error!("添加新 workers 失败: {:?}", e);
-                return Err(e);
-            }
+        let new_worker_ids: Vec<u64> =  {
+            let new_handles = self.pool.add_workers(count).await;
+            let mut ids = Vec::new();
+            self.worker_handles.update_and_fetch(|handles| {
+                let mut handles = handles.clone();
+                for handle in new_handles {
+                    let worker_id = handle.worker_id();
+                    ids.push(worker_id);
+                    handles.insert(worker_id, handle);
+                }
+                handles
+            });
+            ids
         };
 
         // 为新启动的worker加入队列（使用实际的 worker_id）
         self.task_allocator
             .register_new_workers(new_worker_ids)
             .await;
-
-        Ok(())
     }
 }

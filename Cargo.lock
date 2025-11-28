@@ -228,9 +228,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "deferred-map"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b3d9a9a0d48537ad779dc65d223a55a7ef7ca1f7624ff53af06231472e5860c"
+checksum = "8532bf8d4816ed7372c622825a28ecd0b4eade400d12a2fc8dd261e08efacd67"
 
 [[package]]
 name = "displaydoc"
@@ -818,9 +818,9 @@ dependencies = [
 
 [[package]]
 name = "kestrel-timer"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "039ca23ae026a972655874af73fb71eba1c30b58ccd624239036f5f85f8a8a9a"
+checksum = "74102d13be92a2fbeb00e43200b8c24d12a399646e6be5069cb9352d617858c2"
 dependencies = [
  "deferred-map",
  "futures",

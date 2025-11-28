@@ -20,7 +20,7 @@ use tokio::time::{Duration, sleep, timeout};
 async fn test_single_worker_many_tasks() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(1);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let task_count = 100;
 
@@ -54,7 +54,7 @@ async fn test_many_workers() {
     let executor = TestExecutor;
     let worker_count = 50;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     assert_eq!(pool.worker_count(), worker_count as u64);
 
@@ -84,7 +84,7 @@ async fn test_many_workers() {
 async fn test_operations_on_empty_pool() {
     let executor = TestExecutor;
     let contexts = vec![];
-    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts);
 
     assert_eq!(pool.worker_count(), 0);
     assert_eq!(handles.len(), 0);
@@ -99,7 +99,7 @@ async fn test_operations_on_empty_pool() {
 async fn test_multiple_shutdowns() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, _handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, _handles, _result_receiver) = WorkerPool::new(executor, contexts);
 
     // 第一次关闭
     pool.shutdown().await;
@@ -115,7 +115,7 @@ async fn test_multiple_shutdowns() {
 async fn test_large_data_task() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(1);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     // 创建包含大量数据的任务
     let large_data = "x".repeat(1_000_000); // 1MB 的数据
@@ -150,7 +150,7 @@ async fn test_concurrent_task_processing() {
     let worker_count = 8;
     let tasks_per_worker = 20;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let total_tasks = worker_count * tasks_per_worker;
 
@@ -190,7 +190,7 @@ async fn test_concurrent_task_processing() {
 async fn test_concurrent_handle_usage() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(4);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let task_count = 50;
     let handle = handles[0].clone();
@@ -232,7 +232,7 @@ async fn test_dynamic_scaling() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
     let (mut pool, initial_handles, mut result_receiver) =
-        WorkerPool::new(executor, contexts).unwrap();
+        WorkerPool::new(executor, contexts);
 
     // 发送一些任务到初始 workers
     for i in 0..10 {
@@ -245,7 +245,7 @@ async fn test_dynamic_scaling() {
 
     // 动态添加新 workers
     let new_contexts = create_contexts_with_stats(3);
-    let new_handles = pool.add_workers(new_contexts).await.unwrap();
+    let new_handles = pool.add_workers(new_contexts).await;
 
     assert_eq!(pool.worker_count(), 5);
 
@@ -275,13 +275,13 @@ async fn test_dynamic_scaling() {
 async fn test_concurrent_add_workers() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(1);
-    let (mut pool, _handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, _handles, _result_receiver) = WorkerPool::new(executor, contexts);
 
     // 注意：add_workers 需要 &mut self，所以不能真正并发调用
     // 这里测试顺序添加多批 workers
     for _ in 0..5 {
         let new_contexts = create_contexts_with_stats(2);
-        pool.add_workers(new_contexts).await.unwrap();
+        pool.add_workers(new_contexts).await;
     }
 
     assert_eq!(pool.worker_count(), 11); // 1 + 5*2 = 11
@@ -294,7 +294,7 @@ async fn test_load_balancing() {
     let executor = TestExecutor;
     let worker_count = 4;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let total_tasks = 100;
 
@@ -340,7 +340,7 @@ async fn test_load_balancing() {
 async fn test_all_tasks_fail() {
     let executor = FailingExecutor;
     let contexts = create_contexts_with_stats(3);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     // 发送任务
     for i in 0..10 {
@@ -372,7 +372,7 @@ async fn test_all_tasks_fail() {
 async fn test_send_after_shutdown() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts);
 
     let handle_clone = handles[0].clone();
 
@@ -422,7 +422,7 @@ async fn test_shutdown_while_processing() {
 
     let executor = SlowExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, _result_receiver) = WorkerPool::new(executor, contexts);
 
     // 发送一些任务
     for i in 0..10 {
@@ -446,7 +446,7 @@ async fn test_shutdown_while_processing() {
 async fn test_result_channel_full() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     // 发送大量任务但不接收结果
     // 注意：channel 容量是 100，所以发送超过这个数量可能会阻塞
@@ -519,7 +519,7 @@ async fn test_mixed_success_and_failure() {
 
     let executor = RandomFailExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     // 发送任务
     for i in 0..20 {
@@ -558,7 +558,7 @@ async fn test_mixed_success_and_failure() {
 async fn test_task_chaining() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let handles_clone = handles.clone();
 
@@ -597,7 +597,7 @@ async fn test_task_chaining() {
 async fn test_producer_consumer_pattern() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(4);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let producer_count = 3;
     let tasks_per_producer = 20;
@@ -657,7 +657,7 @@ async fn test_synchronized_workers() {
     let executor = TestExecutor;
     let worker_count = 5;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let barrier = Arc::new(Barrier::new(worker_count));
 
@@ -702,7 +702,7 @@ async fn test_synchronized_workers() {
 async fn test_long_running_scenario() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(3);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     let duration = Duration::from_secs(2);
     let start = tokio::time::Instant::now();
@@ -749,7 +749,7 @@ async fn test_statistics_accuracy() {
     let executor = TestExecutor;
     let worker_count = 4;
     let contexts = create_contexts_with_stats(worker_count);
-    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts).unwrap();
+    let (mut pool, handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     // 为每个 worker 发送已知数量的任务
     let tasks_per_worker = vec![10, 20, 15, 25];
@@ -795,7 +795,7 @@ async fn test_dynamic_resize() {
     // 开始时有 2 个 workers
     let contexts = create_contexts_with_stats(2);
     let (mut pool, initial_handles, mut result_receiver) =
-        WorkerPool::new(executor, contexts).unwrap();
+        WorkerPool::new(executor, contexts);
     assert_eq!(pool.worker_count(), 2);
 
     // 发送一些任务
@@ -809,7 +809,7 @@ async fn test_dynamic_resize() {
 
     // 扩容：添加 5 个新 workers
     let new_contexts = create_contexts_with_stats(5);
-    let new_handles = pool.add_workers(new_contexts).await.unwrap();
+    let new_handles = pool.add_workers(new_contexts).await;
     assert_eq!(pool.worker_count(), 7);
 
     // 发送更多任务到新 workers
