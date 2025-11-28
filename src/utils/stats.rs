@@ -141,6 +141,9 @@ pub(crate) struct WorkerStats {
     /// 当前分块大小
     /// 由 worker 内部的 ChunkStrategy 更新，外部只读访问
     current_chunk_size: u64,
+    /// worker 是否正在执行任务
+    /// 由 worker 内部在 execute 开始和结束时更新
+    is_active: bool,
 }
 
 impl Default for WorkerStats {
@@ -161,6 +164,7 @@ impl WorkerStats {
             speed_calculator: SpeedCalculator::from_config(config),
             parent_aggregator: None,
             current_chunk_size: 0,
+            is_active: false,
         }
     }
 
@@ -175,6 +179,7 @@ impl WorkerStats {
             speed_calculator: SpeedCalculator::from_config(config),
             parent_aggregator: Some(parent_aggregator),
             current_chunk_size: 0,
+            is_active: false,
         }
     }
 
@@ -311,6 +316,26 @@ impl WorkerStats {
         self.speed_calculator.clear_samples();
     }
 
+    /// 设置 worker 活跃状态
+    ///
+    /// # Arguments
+    ///
+    /// * `active` - true 表示 worker 正在执行任务，false 表示空闲
+    #[inline]
+    pub(crate) fn set_active(&mut self, active: bool) {
+        self.is_active = active;
+    }
+
+    /// 获取 worker 活跃状态
+    ///
+    /// # Returns
+    ///
+    /// true 表示 worker 正在执行任务，false 表示空闲
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.is_active
+    }
+
     /// 获取完整的统计摘要（包含平均速度、实时速度和窗口平均速度）
     ///
     /// # Returns
@@ -345,6 +370,7 @@ impl std::fmt::Debug for WorkerStats {
             .field("speed_calculator", &self.speed_calculator)
             .field("has_parent", &self.parent_aggregator.is_some())
             .field("current_chunk_size", &self.current_chunk_size)
+            .field("is_active", &self.is_active)
             .finish()
     }
 }

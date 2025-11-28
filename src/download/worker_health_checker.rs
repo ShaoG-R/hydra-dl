@@ -7,8 +7,7 @@ use crate::config::DownloadConfig;
 use crate::pool::download::DownloadWorkerHandle;
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
-use parking_lot::RwLock;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smr_swap::LocalReader;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -84,8 +83,6 @@ pub(super) struct WorkerHealthCheckerParams<C: crate::utils::io_traits::HttpClie
     pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// 检查间隔
     pub check_interval: std::time::Duration,
-    /// 活跃 worker 集合
-    pub active_workers: Arc<RwLock<FxHashSet<u64>>>,
     /// 启动偏移时间
     pub start_offset: std::time::Duration,
 }
@@ -297,8 +294,6 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
     cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
     /// 检查定时器（内部管理）
     check_timer: tokio::time::Interval,
-    /// 正在执行任务的 worker 集合（由外部更新）
-    active_workers: Arc<RwLock<FxHashSet<u64>>>,
 }
 
 impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
@@ -312,7 +307,6 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
             config,
             worker_handles,
             check_interval,
-            active_workers,
             start_offset,
         } = params;
 
@@ -334,7 +328,6 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
             worker_handles,
             cancel_request_tx,
             check_timer,
-            active_workers,
         }
     }
 
@@ -389,17 +382,17 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
                 return;
             }
 
-            // 获取活跃 worker 列表
-            let active_workers = self.active_workers.read();
-
+            // 遍历所有 worker，检查其 stats 中的活跃状态
             for &worker_id in handles.keys() {
-                // 只检查正在执行任务的 worker
-                if !active_workers.contains(&worker_id) {
-                    continue;
-                }
-
                 if let Some(handle) = handles.get(&worker_id) {
-                    let speed = handle.window_avg_speed();
+                    let stats = handle.stats();
+                    
+                    // 只检查正在执行任务的 worker
+                    if !stats.is_active() {
+                        continue;
+                    }
+
+                    let speed = stats.get_window_avg_speed();
                     // 只考虑有效的速度数据
                     if let Some(speed) = speed {
                         worker_speeds.push(WorkerSpeed {
@@ -409,7 +402,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
                     }
                 }
             }
-            // guard 和 active_workers 的读锁在这里自动释放
+            // handles 的读锁在这里自动释放
         }
 
         // 至少需要 min_workers 个有效速度数据才能进行比较

@@ -16,8 +16,7 @@ use crate::{
     pool::download::DownloadWorkerHandle,
 };
 use log::{error, info};
-use parking_lot::RwLock;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smr_swap::SmrSwap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,16 +84,12 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             },
         );
 
-        // 创建 active_workers 共享状态（使用 RwLock 确保 TaskAllocator 和 HealthChecker 同步）
-        let active_workers = Arc::new(RwLock::new(FxHashSet::default()));
-
         // 创建健康检查器（actor 模式） - 偏移 50ms
         let (health_checker, cancel_request_rx) = WorkerHealthChecker::new(
             WorkerHealthCheckerParams {
                 config: Arc::clone(&config),
                 worker_handles: swap.local(),
                 check_interval: config.speed().instant_speed_window(),
-                active_workers: Arc::clone(&active_workers),
                 start_offset: base_offset,
             },
         );
@@ -140,7 +135,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 cancel_rx: cancel_request_rx,
                 config: Arc::clone(&config),
                 worker_handles: swap.local(),
-                active_workers: Arc::clone(&active_workers),
             },
         );
 

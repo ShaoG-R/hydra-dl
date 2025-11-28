@@ -10,9 +10,8 @@ use crate::{DownloadError, Result};
 use kestrel_timer::{TaskId, TaskNotification, TimerService, TimerTask, spsc};
 use lite_sync::oneshot::lite;
 use log::{debug, error, info, warn};
-use parking_lot::RwLock;
 use ranged_mmap::{AllocatedRange, RangeAllocator};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smr_swap::LocalReader;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
@@ -55,8 +54,6 @@ pub(super) struct TaskAllocatorParams<C: HttpClient> {
     pub config: Arc<crate::config::DownloadConfig>,
     /// Worker 句柄映射
     pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
-    /// 活跃 worker 集合
-    pub active_workers: Arc<RwLock<FxHashSet<u64>>>,
 }
 
 /// 已分配的任务（封装任务和取消通道）
@@ -296,8 +293,6 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
     worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// 任务取消 sender 映射
     cancel_senders: FxHashMap<u64, lite::Sender<()>>,
-    /// 活跃 worker 集合（与 WorkerHealthChecker 共享）
-    active_workers: Arc<RwLock<FxHashSet<u64>>>,
     /// 完成通知发送器（当所有任务完成时发送）
     completion_tx: Option<oneshot::Sender<CompletionResult>>,
 }
@@ -315,7 +310,6 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
             cancel_rx,
             config,
             worker_handles,
-            active_workers,
         } = params;
 
         let (message_tx, message_rx) = mpsc::channel(100);
@@ -335,7 +329,6 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
             config,
             worker_handles,
             cancel_senders: FxHashMap::default(),
-            active_workers,
             completion_tx: Some(completion_tx),
         };
 
@@ -370,7 +363,6 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
                 return false;
             }
             self.cancel_senders.insert(worker_id, cancel_tx);
-            self.active_workers.write().insert(worker_id);
             true
         } else {
             error!("Worker #{} 不存在", worker_id);
@@ -396,7 +388,6 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
     /// 清理 worker 状态并标记为空闲
     fn cleanup_worker(&mut self, worker_id: u64) {
         self.cancel_senders.remove(&worker_id);
-        self.active_workers.write().remove(&worker_id);
         self.state.mark_worker_idle(worker_id);
     }
 
@@ -410,9 +401,15 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         }
 
         // 检查是否所有任务已成功完成
+        // 通过检查 idle_workers 数量来判断是否所有 worker 都空闲
+        let total_workers = {
+            let handles = self.worker_handles.load();
+            handles.len()
+        };
+        
         if self.state.remaining() == 0
             && self.state.pending_retry_count() == 0
-            && self.active_workers.read().is_empty()
+            && self.state.idle_workers.len() == total_workers
         {
             info!("所有任务已成功完成");
             return Some(CompletionResult::Success);
@@ -580,7 +577,6 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
 
         if let Some(cancel_tx) = self.cancel_senders.remove(&worker_id) {
             let _ = cancel_tx.notify(());
-            self.active_workers.write().remove(&worker_id);
             info!("已取消 Worker #{} 的任务", worker_id);
         }
     }

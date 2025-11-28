@@ -100,6 +100,15 @@ where
         context: &mut Self::Context,
         stats: &mut SmrSwap<Self::Stats>,
     ) -> Self::Result {
+        stats.update(|s| {
+            let mut s = s.clone();
+            // 标记 worker 开始执行任务
+            s.set_active(true);
+            // 清空采样点缓冲区，避免旧数据影响新任务的速度计算
+            s.clear_samples();
+            s
+        });
+
         let RangeTask::Range {
             url,
             range,
@@ -116,7 +125,7 @@ where
         // 下载数据（在下载过程中会实时更新 stats）
         let fetch_result = self.fetch_range(&url, &range, stats, cancel_rx).await;
 
-        match fetch_result {
+        let result = match fetch_result {
             Ok(FetchRangeResult::Complete(data)) => {
                 self.handle_download_complete(worker_id, range, data, context, stats)
             }
@@ -131,7 +140,16 @@ where
                 retry_count,
             ),
             Err(e) => self.handle_download_failed(worker_id, range, retry_count, e),
-        }
+        };
+
+        // 标记 worker 结束执行任务
+        stats.update(|s| {
+            let mut s = s.clone();
+            s.set_active(false);
+            s
+        });
+
+        result
     }
 }
 
@@ -147,13 +165,6 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         cancel_rx: lite::Receiver<()>,
     ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
         use crate::utils::fetch::FetchRange;
-
-        // 清空采样点缓冲区，避免旧数据影响新任务的速度计算
-        stats.update(|s| {
-            let mut s = s.clone();
-            s.clear_samples();
-            s
-        });
 
         let fetch_range =
             FetchRange::from_allocated_range(range).expect("AllocatedRange 应该总是有效的");
@@ -397,15 +408,6 @@ impl<C: HttpClient> DownloadWorkerHandle<C> {
     /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
     pub fn instant_speed(&self) -> Option<DownloadSpeed> {
         self.handle.stats().get_instant_speed()
-    }
-
-    /// 获取该 worker 的窗口平均速度
-    ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
-    pub fn window_avg_speed(&self) -> Option<DownloadSpeed> {
-        self.handle.stats().get_window_avg_speed()
     }
 
     /// 获取该 worker 的当前分块大小
