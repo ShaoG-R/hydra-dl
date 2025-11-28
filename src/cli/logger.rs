@@ -1,59 +1,44 @@
 use indicatif::ProgressBar;
 use log::{Level, LevelFilter, Metadata, Record};
-use parking_lot::RwLock;
+use tokio::sync::mpsc;
 
-/// Logger 状态管理器
+/// 控制指令
+#[derive(Debug)]
+enum ControlCommand {
+    Set(ProgressBar),
+    Clear,
+}
+
+/// 日志控制器
 ///
-/// 封装进度条引用的存储和访问逻辑，提供简洁的 API
-struct LoggerState {
-    progress_bar: RwLock<Option<ProgressBar>>,
+/// 持有控制通道的发送端，不再依赖全局变量。
+/// 需要在 main 中初始化后传递给 runner。
+#[derive(Clone)] // Sender 很轻量，可以随意 Clone
+pub struct LogController {
+    tx: mpsc::Sender<ControlCommand>,
 }
 
-impl LoggerState {
-    /// 创建新的 logger 状态（用于静态初始化）
-    #[inline]
-    const fn new() -> Self {
-        Self {
-            progress_bar: RwLock::new(None),
-        }
+impl LogController {
+    /// 设置进度条 (Async)
+    pub async fn set_progress_bar(&self, progress_bar: ProgressBar) {
+        let _ = self.tx.send(ControlCommand::Set(progress_bar)).await;
     }
 
-    /// 设置进度条引用
-    #[inline]
-    fn set_progress_bar(&self, progress_bar: ProgressBar) {
-        *self.progress_bar.write() = Some(progress_bar);
-    }
-
-    /// 清除进度条引用
-    #[inline]
-    fn clear(&self) {
-        *self.progress_bar.write() = None;
-    }
-
-    /// 输出日志消息（自动选择输出方式）
-    #[inline]
-    fn println(&self, message: String) {
-        let guard = self.progress_bar.read();
-        if let Some(progress_bar) = guard.as_ref() {
-            // 通过进度条的 println 输出，不会破坏进度条显示
-            progress_bar.println(message);
-        } else {
-            // 如果没有进度条，直接输出到 stderr
-            eprintln!("{}", message);
-        }
+    /// 清除进度条 (Async)
+    pub async fn clear_progress_bar(&self) {
+        let _ = self.tx.send(ControlCommand::Clear).await;
     }
 }
 
-/// 全局 logger 状态
-static LOGGER_STATE: LoggerState = LoggerState::new();
+/// 自定义 Logger
+///
+/// 直接持有发送端，不再查找全局变量
+struct TokioLogger {
+    tx: mpsc::UnboundedSender<String>,
+}
 
-/// 自定义 Logger，与 indicatif 进度条集成
-struct IndicatifLogger;
-
-impl log::Log for IndicatifLogger {
-    #[inline]
+impl log::Log for TokioLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        // 启用所有级别的日志（具体级别由 log::set_max_level 控制）
         metadata.level() <= log::max_level()
     }
 
@@ -62,58 +47,70 @@ impl log::Log for IndicatifLogger {
             return;
         }
 
-        // 格式化日志消息
         let level_str = match record.level() {
-            Level::Error => "\x1b[31m[ERROR]\x1b[0m", // 红色
-            Level::Warn => "\x1b[33m[WARN]\x1b[0m",   // 黄色
-            Level::Info => "\x1b[32m[INFO]\x1b[0m",   // 绿色
-            Level::Debug => "\x1b[36m[DEBUG]\x1b[0m", // 青色
-            Level::Trace => "\x1b[90m[TRACE]\x1b[0m", // 灰色
+            Level::Error => "\x1b[31m[ERROR]\x1b[0m",
+            Level::Warn => "\x1b[33m[WARN]\x1b[0m",
+            Level::Info => "\x1b[32m[INFO]\x1b[0m",
+            Level::Debug => "\x1b[36m[DEBUG]\x1b[0m",
+            Level::Trace => "\x1b[90m[TRACE]\x1b[0m",
         };
 
-        let message = format!("{} {}", level_str, record.args());
+        let msg = format!("{} {}", level_str, record.args());
 
-        // 通过 logger 状态输出消息
-        LOGGER_STATE.println(message);
+        // 直接使用 self.tx 发送，无需全局查找
+        let _ = self.tx.send(msg);
     }
 
-    #[inline]
-    fn flush(&self) {
-        // 不需要特殊的 flush 操作
+    fn flush(&self) {}
+}
+
+/// 后台 Actor 逻辑 (保持不变)
+async fn logger_actor(
+    mut log_rx: mpsc::UnboundedReceiver<String>,
+    mut ctrl_rx: mpsc::Receiver<ControlCommand>,
+) {
+    let mut current_pb: Option<ProgressBar> = None;
+
+    loop {
+        tokio::select! {
+            Some(msg) = log_rx.recv() => {
+                if let Some(ref pb) = current_pb {
+                    pb.println(msg);
+                } else {
+                    eprintln!("{}", msg);
+                }
+            }
+            Some(cmd) = ctrl_rx.recv() => {
+                match cmd {
+                    ControlCommand::Set(pb) => current_pb = Some(pb),
+                    ControlCommand::Clear => current_pb = None,
+                }
+            }
+            else => break,
+        }
     }
 }
 
 /// 初始化日志系统
 ///
-/// # Arguments
-/// * `level` - 日志级别过滤器
-///
-/// # Example
-/// ```
-/// use log::LevelFilter;
-/// use hydra_dl::cli::init_logger;
-/// init_logger(LevelFilter::Info);
-/// ```
-#[inline]
-pub fn init_logger(level: LevelFilter) -> Result<(), log::SetLoggerError> {
-    // 设置静态 logger
-    log::set_logger(&IndicatifLogger)?;
+/// 返回一个 Controller 实例，调用者需要将其传递给需要控制进度条的模块
+pub fn init_logger(level: LevelFilter) -> Result<LogController, log::SetLoggerError> {
+    let (log_tx, log_rx) = mpsc::unbounded_channel();
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(32);
+
+    // 1. 启动 Actor
+    tokio::spawn(logger_actor(log_rx, ctrl_rx));
+
+    // 2. 创建 Logger 实例
+    let logger = TokioLogger { tx: log_tx };
+
+    // 3. 关键点：使用 Box::leak 将 logger 提升为 'static 生命周期
+    // 这样满足了 log::set_logger 的要求，但不需要定义全局 static 变量
+    let static_logger = Box::leak(Box::new(logger));
+
+    log::set_logger(static_logger)?;
     log::set_max_level(level);
 
-    Ok(())
-}
-
-/// 设置进度条引用，使日志输出通过进度条显示
-///
-/// # Arguments
-/// * `progress_bar` - 进度条实例
-#[inline]
-pub fn set_progress_bar(progress_bar: ProgressBar) {
-    LOGGER_STATE.set_progress_bar(progress_bar);
-}
-
-/// 清除进度条引用
-#[inline]
-pub fn clear_progress_bar() {
-    LOGGER_STATE.clear();
+    // 4. 返回控制器
+    Ok(LogController { tx: ctrl_tx })
 }

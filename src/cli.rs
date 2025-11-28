@@ -5,7 +5,7 @@ mod progress;
 mod runner;
 pub mod utils;
 
-pub use logger::{clear_progress_bar, init_logger, set_progress_bar};
+pub use logger::{init_logger, LogController};
 
 /// CLI 错误类型
 #[derive(thiserror::Error, Debug)]
@@ -77,10 +77,10 @@ pub struct Cli {
 }
 
 /// 运行 CLI 程序
-pub async fn run(cli: Cli) -> Result<()> {
+pub async fn run(cli: Cli, logger_ctrl: Option<LogController>) -> Result<()> {
     // 确定保存目录（默认为当前目录）
     let save_dir = cli.output.as_deref().unwrap_or(".");
 
     // 执行下载
-    runner::execute_download(&cli, save_dir).await
+    runner::execute_download(&cli, save_dir, logger_ctrl).await
 }
