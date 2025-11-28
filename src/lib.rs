@@ -60,9 +60,10 @@
 //!             }
 //!             DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
 //!                 // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+//!                 let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
 //!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, {} 个 workers",
 //!                     percentage,
-//!                     avg_speed / 1024.0 / 1024.0,
+//!                     speed_mbps,
 //!                     worker_stats.len());
 //!             }
 //!             DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {
@@ -152,10 +153,11 @@ pub mod utils {
 /// ```
 /// use hydra_dl::constants::*;
 /// use hydra_dl::DownloadConfig;
+/// use std::num::NonZeroU64;
 ///
 /// let config = DownloadConfig::builder()
 ///     .chunk(|c| c.initial_size(10 * MB))  // 10 MB
-///     .progressive(|p| p.min_speed_threshold(5 * MB))  // 5 MB/s
+///     .progressive(|p| p.min_speed_threshold(NonZeroU64::new(5 * MB)))  // 5 MB/s
 ///     .build();
 /// ```
 pub mod constants {

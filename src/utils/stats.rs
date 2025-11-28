@@ -302,6 +302,15 @@ impl WorkerStats {
         self.current_chunk_size = size;
     }
 
+    /// 清空采样点缓冲区
+    ///
+    /// 清空速度计算器中的所有采样点并重置开始时间。
+    /// 用于在新的下载任务开始时重置统计状态，避免旧数据影响速度计算。
+    #[inline]
+    pub(crate) fn clear_samples(&mut self) {
+        self.speed_calculator.clear_samples();
+    }
+
     /// 获取完整的统计摘要（包含平均速度、实时速度和窗口平均速度）
     ///
     /// # Returns

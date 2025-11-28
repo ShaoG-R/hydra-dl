@@ -77,7 +77,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             writer.total_size(),
             writer.written_bytes_ref(),
             global_stats.clone(),
-            config.speed().instant_speed_window(),
             std::time::Duration::ZERO,
         );
 

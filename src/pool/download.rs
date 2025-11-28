@@ -147,6 +147,14 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         cancel_rx: lite::Receiver<()>,
     ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
         use crate::utils::fetch::FetchRange;
+
+        // 清空采样点缓冲区，避免旧数据影响新任务的速度计算
+        stats.update_and_fetch(|s| {
+            let mut s = s.clone();
+            s.clear_samples();
+            s
+        });
+
         let fetch_range =
             FetchRange::from_allocated_range(range).expect("AllocatedRange 应该总是有效的");
         RangeFetcher::new(&self.client, url, fetch_range, stats)

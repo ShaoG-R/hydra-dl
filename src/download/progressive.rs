@@ -479,7 +479,6 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
         total_size: u64,
         written_bytes: Arc<AtomicU64>,
         global_stats: crate::utils::stats::TaskStats,
-        check_interval: std::time::Duration,
         start_offset: std::time::Duration,
     ) -> Self {
         // 先创建临时逻辑对象获取初始 worker 数量
@@ -489,6 +488,8 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
         // 使用 oneshot channel
         let (shutdown_tx, shutdown_rx) = lite::channel();
         let (launch_request_tx, launch_request_rx) = mpsc::channel(10);
+
+        let check_interval = config.speed().instant_speed_window();
 
         // 启动 actor 任务
         let actor_handle = tokio::spawn(async move {

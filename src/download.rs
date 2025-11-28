@@ -65,8 +65,9 @@ impl DownloadHandle {
     ///     match progress {
     ///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
     ///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+    ///             let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
     ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers",
-    ///                 percentage, avg_speed / 1024.0 / 1024.0, worker_stats.len());
+    ///                 percentage, speed_mbps, worker_stats.len());
     ///         }
     ///         DownloadProgress::Completed { .. } => {
     ///             println!("下载完成！");
@@ -302,9 +303,10 @@ where
 ///     match progress {
 ///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
 ///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+///             let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
 ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers",
 ///                 percentage,
-///                 avg_speed / 1024.0 / 1024.0,
+///                 speed_mbps,
 ///                 worker_stats.len());
 ///         }
 ///         DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {

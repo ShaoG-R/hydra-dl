@@ -350,6 +350,16 @@ impl SpeedCalculator {
     pub(crate) fn get_start_time(&self) -> Option<Instant> {
         self.start_time
     }
+
+    /// 清空采样点缓冲区
+    ///
+    /// 清空所有采样点并重置开始时间，用于在新的下载任务开始时重置状态。
+    /// 下次调用 `record_sample` 时会重新初始化开始时间。
+    #[inline]
+    pub(crate) fn clear_samples(&mut self) {
+        self.samples.clear();
+        self.start_time = None;
+    }
 }
 
 #[cfg(test)]

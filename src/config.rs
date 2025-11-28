@@ -1117,8 +1117,9 @@ impl DownloadConfigBuilder {
     ///
     /// ```
     /// # use hydra_dl::DownloadConfig;
+    /// # use std::num::NonZeroU64;
     /// let config = DownloadConfig::builder()
-    ///     .health_check(|h| h.enabled(true).absolute_speed_threshold(100 * 1024))
+    ///     .health_check(|h| h.enabled(true).absolute_speed_threshold(NonZeroU64::new(100 * 1024)))
     ///     .build();
     /// ```
     pub fn health_check<F>(mut self, f: F) -> Self
