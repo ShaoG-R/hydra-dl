@@ -831,9 +831,9 @@ dependencies = [
 
 [[package]]
 name = "lfrlock"
-version = "0.1.4"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99c665390b01cc15dd0296d6af161fd90bcae2209128129de01fdb027dbe8926"
+checksum = "ff1c855d5d4caff3e0932baaa54d571e409b3c110d5c2bc5ac14ec49621d998c"
 dependencies = [
  "antidote",
  "smr-swap",
@@ -1408,9 +1408,9 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smr-swap"
-version = "0.7.2"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4309a4f2858fd0f6fcbaccc4ab9998b3d489acf618fdadd7cdf4e1e68c2007e1"
+checksum = "45e5773ab1f3ba4b599797a27257df94a3e65f157682fb7dce4def29382a9dc6"
 dependencies = [
  "swmr-cell",
 ]
@@ -1445,9 +1445,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swmr-cell"
-version = "0.1.3"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0281c93e06a929b0d016f576411f01b618b64e7a98416bd5afa48ea03324a47"
+checksum = "e40b7669d26053198dce0f93fa4f256622939131b4f15014db50e7a00d72c962"
 dependencies = [
  "antidote",
 ]

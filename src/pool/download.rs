@@ -149,7 +149,7 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         use crate::utils::fetch::FetchRange;
 
         // 清空采样点缓冲区，避免旧数据影响新任务的速度计算
-        stats.update_and_fetch(|s| {
+        stats.update(|s| {
             let mut s = s.clone();
             s.clear_samples();
             s
@@ -183,7 +183,7 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         }
 
         // 记录 range 完成
-        stats.update_and_fetch(|stats| {
+        stats.update(|stats| {
             let mut stats = stats.clone();
             stats.record_range_complete();
             stats
@@ -308,7 +308,7 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
             drop(stats_guard);
 
             // 更新分块大小
-            stats.update_and_fetch(|stats| {
+            stats.update(|stats| {
                 let mut stats = stats.clone();
                 stats.set_current_chunk_size(new_chunk_size);
                 stats

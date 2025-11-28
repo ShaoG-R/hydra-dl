@@ -113,12 +113,22 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             global_stats.clone(),
         );
 
+        // 创建进度报告器（使用配置的统计窗口作为更新间隔） - 偏移 100ms
+        let progress_reporter = ProgressReporter::new(ProgressReporterParams {
+            progress_sender,
+            total_size,
+            worker_handles: swap.local(),
+            global_stats: global_stats.clone(),
+            update_interval: config.speed().instant_speed_window(),
+            start_offset: base_offset * 2,
+        });
+
         // 使用实际的 worker_id（从 handle 获取）填充 worker_handles
         let initial_worker_handles: FxHashMap<u64, _> = initial_handles
             .into_iter()
             .map(|handle| (handle.worker_id(), handle))
             .collect();
-        swap.update(initial_worker_handles);
+        swap.store(initial_worker_handles);
 
         // 创建并启动任务分配器 Actor
         let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(
@@ -133,16 +143,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 active_workers: Arc::clone(&active_workers),
             },
         );
-
-        // 创建进度报告器（使用配置的统计窗口作为更新间隔） - 偏移 100ms
-        let progress_reporter = ProgressReporter::new(ProgressReporterParams {
-            progress_sender,
-            total_size,
-            worker_handles: swap.local(),
-            global_stats: global_stats.clone(),
-            update_interval: config.speed().instant_speed_window(),
-            start_offset: base_offset * 2,
-        });
 
         // 注册第一批 workers（会自动触发任务分配）
         let worker_ids = {
@@ -349,7 +349,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let new_worker_ids: Vec<u64> =  {
             let new_handles = self.pool.add_workers(count).await;
             let mut ids = Vec::new();
-            self.worker_handles.update_and_fetch(|handles| {
+            self.worker_handles.update(|handles| {
                 let mut handles = handles.clone();
                 for handle in new_handles {
                     let worker_id = handle.worker_id();

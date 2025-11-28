@@ -648,7 +648,7 @@ pub mod test_utils {
             // 模拟处理任务
             sleep(Duration::from_millis(10)).await;
             context.processed_count.fetch_add(1, Ordering::SeqCst);
-            stats.update_and_fetch(|s| {
+            stats.update(|s| {
                 let mut s = s.clone();
                 s.task_count += 1;
                 s
