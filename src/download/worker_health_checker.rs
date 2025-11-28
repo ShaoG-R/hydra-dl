@@ -9,7 +9,7 @@ use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smr_swap::SwapReader;
+use smr_swap::LocalReader;
 use std::ops::Deref;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -278,7 +278,7 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
     /// 消息接收器
     message_rx: mpsc::Receiver<ActorMessage>,
     /// 单一写入者的 worker handles 持有者
-    worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// Worker 取消请求发送器
     cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
     /// 检查定时器（内部管理）
@@ -292,7 +292,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
     async fn new(
         config: Arc<DownloadConfig>,
         message_rx: mpsc::Receiver<ActorMessage>,
-        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
         check_interval: std::time::Duration,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
@@ -452,7 +452,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
     /// 创建新的健康检查器（启动 actor）
     pub(super) fn new(
         config: Arc<DownloadConfig>,
-        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         check_interval: std::time::Duration,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
         start_offset: std::time::Duration,

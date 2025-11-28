@@ -13,7 +13,7 @@ use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use ranged_mmap::{AllocatedRange, RangeAllocator};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smr_swap::SwapReader;
+use smr_swap::LocalReader;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -273,7 +273,7 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
     /// 配置
     config: Arc<crate::config::DownloadConfig>,
     /// Worker 句柄映射
-    worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// 任务取消 sender 映射
     cancel_senders: FxHashMap<u64, lite::Sender<()>>,
     /// 活跃 worker 集合（与 WorkerHealthChecker 共享）
@@ -291,7 +291,7 @@ impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
         result_rx: mpsc::Receiver<RangeResult>,
         cancel_rx: mpsc::Receiver<WorkerCancelRequest>,
         config: Arc<crate::config::DownloadConfig>,
-        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         active_workers: Arc<RwLock<FxHashSet<u64>>>,
     ) -> (TaskAllocatorHandle, oneshot::Receiver<CompletionResult>) {
         let (message_tx, message_rx) = mpsc::channel(100);

@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use lite_sync::oneshot::lite;
 use log::{debug, error, info};
 use net_bytes::{DownloadSpeed, FormattedValue, SizeStandard};
-use smr_swap::{ReaderGuard, SmrSwap};
+use smr_swap::{ReadGuard, SmrSwap};
 
 use std::sync::Arc;
 
@@ -330,17 +330,10 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
 /// handle.send_task(range_task).await?;
 /// let speed = handle.instant_speed();
 /// ```
+#[derive(Clone)]
 pub(crate) struct DownloadWorkerHandle<C: HttpClient> {
     /// 底层通用 worker 句柄
     handle: WorkerHandle<DownloadWorkerExecutor<C>>,
-}
-
-impl<C: HttpClient> Clone for DownloadWorkerHandle<C> {
-    fn clone(&self) -> Self {
-        Self {
-            handle: self.handle.clone(),
-        }
-    }
 }
 
 impl<C: HttpClient> DownloadWorkerHandle<C> {
@@ -385,7 +378,7 @@ impl<C: HttpClient> DownloadWorkerHandle<C> {
     ///
     /// Worker 统计数据的 Arc 引用
     #[inline]
-    pub fn stats<'a>(&'a self) -> ReaderGuard<'a, WorkerStats> {
+    pub fn stats<'a>(&'a self) -> ReadGuard<'a, WorkerStats> {
         self.handle.stats()
     }
 

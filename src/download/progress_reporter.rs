@@ -6,7 +6,7 @@
 use log::debug;
 use net_bytes::{DownloadAcceleration, DownloadSpeed};
 use rustc_hash::FxHashMap;
-use smr_swap::SwapReader;
+use smr_swap::LocalReader;
 use std::num::NonZeroU64;
 use tokio::sync::mpsc;
 
@@ -105,7 +105,7 @@ struct ProgressReporterActor<C: crate::utils::io_traits::HttpClient> {
     /// 消息接收器（async channel）
     message_rx: mpsc::Receiver<ActorMessage>,
     /// 共享的 worker handles（用于直接获取统计信息）
-    worker_handles: SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+    worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
     /// 全局统计管理器（用于获取总体统计数据）
     global_stats: crate::utils::stats::TaskStats,
     /// 进度更新定时器（内部管理）
@@ -118,7 +118,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
         progress_sender: Option<mpsc::Sender<DownloadProgress>>,
         total_size: NonZeroU64,
         message_rx: mpsc::Receiver<ActorMessage>,
-        worker_handles: SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
         global_stats: crate::utils::stats::TaskStats,
         update_interval: std::time::Duration,
         start_offset: std::time::Duration,
@@ -301,7 +301,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
     pub(super) fn new(
         progress_sender: Option<mpsc::Sender<DownloadProgress>>,
         total_size: NonZeroU64,
-        worker_handles: SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
         global_stats: crate::utils::stats::TaskStats,
         update_interval: std::time::Duration,
         start_offset: std::time::Duration,
@@ -370,9 +370,9 @@ mod tests {
 
     // 辅助函数：创建空的 worker_handles
     fn create_empty_worker_handles<C: crate::utils::io_traits::HttpClient>()
-    -> SwapReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>> {
-        let (_swapper, reader) = smr_swap::new_smr_pair(FxHashMap::default());
-        reader
+    -> LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>> {
+        let smr = smr_swap::SmrSwap::new(FxHashMap::default());
+        smr.local()
     }
 
     // 辅助函数：创建模拟的 global_stats

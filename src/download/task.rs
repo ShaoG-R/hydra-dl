@@ -73,7 +73,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
         let mut progressive_launcher = ProgressiveLauncher::new(
             Arc::clone(&config),
-            swap.reader().fork(),
+            swap.local(),
             writer.total_size(),
             writer.written_bytes_ref(),
             global_stats.clone(),
@@ -92,7 +92,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建健康检查器（actor 模式） - 偏移 50ms
         let mut health_checker = WorkerHealthChecker::new(
             Arc::clone(&config),
-            swap.reader().fork(),
+            swap.local(),
             config.speed().instant_speed_window(),
             Arc::clone(&active_workers),
             base_offset,
@@ -132,7 +132,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             result_receiver,
             cancel_request_rx,
             Arc::clone(&config),
-            swap.reader().fork(),
+            swap.local(),
             Arc::clone(&active_workers),
         );
 
@@ -140,7 +140,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let progress_reporter = ProgressReporter::new(
             progress_sender,
             total_size,
-            swap.reader().fork(),
+            swap.local(),
             global_stats.clone(),
             config.speed().instant_speed_window(),
             base_offset * 2,
@@ -149,7 +149,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 注册第一批 workers（会自动触发任务分配）
         {
             let worker_ids = {
-                let guard = swap.reader().load();
+                let guard = swap.load();
                 guard.keys().cloned().collect()
             };
             task_allocator_handle.register_new_workers(worker_ids).await;

@@ -9,7 +9,7 @@ use lite_sync::oneshot::lite;
 use log::{debug, error, info};
 use net_bytes::{DownloadSpeed, FileSizeFormat};
 use rustc_hash::FxHashMap;
-use smr_swap::SwapReader;
+use smr_swap::LocalReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -269,7 +269,7 @@ struct ProgressiveLauncherActor<C: crate::utils::io_traits::HttpClient> {
     /// 关闭接收器
     shutdown_rx: lite::Receiver<()>,
     /// 共享的 worker handles
-    worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// 文件总大小
     total_size: u64,
     /// 已写入字节数（共享引用）
@@ -287,7 +287,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
     async fn new(
         config: Arc<DownloadConfig>,
         shutdown_rx: lite::Receiver<()>,
-        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         total_size: u64,
         written_bytes: Arc<AtomicU64>,
         global_stats: crate::utils::stats::TaskStats,
@@ -475,7 +475,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
     /// 创建新的渐进式启动管理器（启动 actor）
     pub(super) fn new(
         config: Arc<DownloadConfig>,
-        worker_handles: SwapReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         total_size: u64,
         written_bytes: Arc<AtomicU64>,
         global_stats: crate::utils::stats::TaskStats,

@@ -75,7 +75,7 @@
 use async_trait::async_trait;
 use deferred_map::DeferredMap;
 use log::{debug, error, info};
-use smr_swap::{ReaderGuard, SmrSwap, SwapReader};
+use smr_swap::{LocalReader, ReadGuard, SmrSwap};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -264,15 +264,15 @@ pub struct WorkerHandle<E: WorkerExecutor> {
     /// 向 worker 发送任务的通道
     task_sender: Arc<Sender<E::Task>>,
     /// 该 worker 的统计数据（SwapReader 包装以便外部访问）
-    stats: SwapReader<E::Stats>,
+    stats: LocalReader<E::Stats>,
 }
 
 impl<E: WorkerExecutor> Clone for WorkerHandle<E> {
     fn clone(&self) -> Self {
         Self {
             worker_id: self.worker_id,
-            task_sender: Arc::clone(&self.task_sender),
-            stats: self.stats.fork(),
+            task_sender: self.task_sender.clone(),
+            stats: self.stats.clone(),
         }
     }
 }
@@ -288,7 +288,7 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
     pub(crate) fn new(
         worker_id: u64,
         task_sender: Arc<Sender<E::Task>>,
-        stats: SwapReader<E::Stats>,
+        stats: LocalReader<E::Stats>,
     ) -> Self {
         Self {
             worker_id,
@@ -331,7 +331,7 @@ impl<E: WorkerExecutor> WorkerHandle<E> {
     /// # Returns
     ///
     /// Worker 统计数据的 Arc 引用
-    pub fn stats<'a>(&'a self) -> ReaderGuard<'a, E::Stats> {
+    pub fn stats<'a>(&'a self) -> ReadGuard<'a, E::Stats> {
         self.stats.load()
     }
 }
@@ -383,7 +383,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
         let executor_clone = self.executor.clone();
 
         let stats = SmrSwap::new(stats);
-        let stats_reader = stats.reader().fork();
+        let stats_reader = stats.local();
 
         // 启动 worker 协程（不再包含自动清理逻辑）
         // 直接使用完整的 key 作为 worker_id
