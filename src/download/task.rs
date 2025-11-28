@@ -5,10 +5,13 @@ use crate::utils::io_traits::HttpClient;
 use crate::utils::writer::MmapWriter;
 use crate::{
     download::{
-        progress_reporter::ProgressReporter,
-        progressive::{ProgressiveLauncher, WorkerLaunchRequest},
-        task_allocator::{CompletionResult, FailedRange, TaskAllocatorActor, TaskAllocatorHandle},
-        worker_health_checker::WorkerHealthChecker,
+        progress_reporter::{ProgressReporter, ProgressReporterParams},
+        progressive::{ProgressiveLauncher, ProgressiveLauncherParams, WorkerLaunchRequest},
+        task_allocator::{
+            CompletionResult, FailedRange, TaskAllocatorActor, TaskAllocatorHandle,
+            TaskAllocatorParams,
+        },
+        worker_health_checker::{WorkerHealthChecker, WorkerHealthCheckerParams},
     },
     pool::download::DownloadWorkerHandle,
 };
@@ -71,36 +74,30 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let base_offset = std::time::Duration::from_millis(50);
 
         // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
-        let mut progressive_launcher = ProgressiveLauncher::new(
-            Arc::clone(&config),
-            swap.local(),
-            writer.total_size(),
-            writer.written_bytes_ref(),
-            global_stats.clone(),
-            std::time::Duration::ZERO,
+        let (progressive_launcher, launch_request_rx) = ProgressiveLauncher::new(
+            ProgressiveLauncherParams {
+                config: Arc::clone(&config),
+                worker_handles: swap.local(),
+                total_size: writer.total_size(),
+                written_bytes: writer.written_bytes_ref(),
+                global_stats: global_stats.clone(),
+                start_offset: std::time::Duration::ZERO,
+            },
         );
-
-        // 取出启动请求接收器
-        let launch_request_rx = progressive_launcher
-            .take_launch_request_rx()
-            .expect("launch_request_rx should be available");
 
         // 创建 active_workers 共享状态（使用 RwLock 确保 TaskAllocator 和 HealthChecker 同步）
         let active_workers = Arc::new(RwLock::new(FxHashSet::default()));
 
         // 创建健康检查器（actor 模式） - 偏移 50ms
-        let mut health_checker = WorkerHealthChecker::new(
-            Arc::clone(&config),
-            swap.local(),
-            config.speed().instant_speed_window(),
-            Arc::clone(&active_workers),
-            base_offset,
+        let (health_checker, cancel_request_rx) = WorkerHealthChecker::new(
+            WorkerHealthCheckerParams {
+                config: Arc::clone(&config),
+                worker_handles: swap.local(),
+                check_interval: config.speed().instant_speed_window(),
+                active_workers: Arc::clone(&active_workers),
+                start_offset: base_offset,
+            },
         );
-
-        // 取出取消请求接收器
-        let cancel_request_rx = health_checker
-            .take_cancel_request_rx()
-            .expect("cancel_request_rx should be available");
 
         // 第一批 worker 数量
         let initial_worker_count = progressive_launcher.initial_worker_count();
@@ -125,25 +122,27 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 创建并启动任务分配器 Actor
         let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(
-            allocator,
-            url,
-            timer_service,
-            result_receiver,
-            cancel_request_rx,
-            Arc::clone(&config),
-            swap.local(),
-            Arc::clone(&active_workers),
+            TaskAllocatorParams {
+                allocator,
+                url,
+                timer_service,
+                result_rx: result_receiver,
+                cancel_rx: cancel_request_rx,
+                config: Arc::clone(&config),
+                worker_handles: swap.local(),
+                active_workers: Arc::clone(&active_workers),
+            },
         );
 
         // 创建进度报告器（使用配置的统计窗口作为更新间隔） - 偏移 100ms
-        let progress_reporter = ProgressReporter::new(
+        let progress_reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender,
             total_size,
-            swap.local(),
-            global_stats.clone(),
-            config.speed().instant_speed_window(),
-            base_offset * 2,
-        );
+            worker_handles: swap.local(),
+            global_stats: global_stats.clone(),
+            update_interval: config.speed().instant_speed_window(),
+            start_offset: base_offset * 2,
+        });
 
         // 注册第一批 workers（会自动触发任务分配）
         {

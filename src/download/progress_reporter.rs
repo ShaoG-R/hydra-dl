@@ -94,6 +94,22 @@ enum ActorMessage {
     Shutdown,
 }
 
+/// 进度报告器参数
+pub(super) struct ProgressReporterParams<C: crate::utils::io_traits::HttpClient> {
+    /// 进度发送器
+    pub progress_sender: Option<mpsc::Sender<DownloadProgress>>,
+    /// 文件总大小
+    pub total_size: NonZeroU64,
+    /// 共享的 worker handles
+    pub worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+    /// 全局统计管理器
+    pub global_stats: crate::utils::stats::TaskStats,
+    /// 更新间隔
+    pub update_interval: std::time::Duration,
+    /// 启动偏移时间
+    pub start_offset: std::time::Duration,
+}
+
 /// 进度报告器 Actor
 ///
 /// 独立运行的 actor，负责管理进度报告和统计信息收集
@@ -114,15 +130,16 @@ struct ProgressReporterActor<C: crate::utils::io_traits::HttpClient> {
 
 impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
     /// 创建新的 actor
-    async fn new(
-        progress_sender: Option<mpsc::Sender<DownloadProgress>>,
-        total_size: NonZeroU64,
-        message_rx: mpsc::Receiver<ActorMessage>,
-        worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
-        global_stats: crate::utils::stats::TaskStats,
-        update_interval: std::time::Duration,
-        start_offset: std::time::Duration,
-    ) -> Self {
+    fn new(params: ProgressReporterParams<C>, message_rx: mpsc::Receiver<ActorMessage>) -> Self {
+        let ProgressReporterParams {
+            progress_sender,
+            total_size,
+            worker_handles,
+            global_stats,
+            update_interval,
+            start_offset,
+        } = params;
+
         debug!("ProgressReporter 启动偏移: {:?}", start_offset);
         let start_time = tokio::time::Instant::now() + start_offset;
         let progress_timer = tokio::time::interval_at(start_time, update_interval);
@@ -298,31 +315,13 @@ pub(super) struct ProgressReporter<C: crate::utils::io_traits::HttpClient> {
 
 impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
     /// 创建新的进度报告器（启动 actor）
-    pub(super) fn new(
-        progress_sender: Option<mpsc::Sender<DownloadProgress>>,
-        total_size: NonZeroU64,
-        worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
-        global_stats: crate::utils::stats::TaskStats,
-        update_interval: std::time::Duration,
-        start_offset: std::time::Duration,
-    ) -> Self {
+    pub(super) fn new(params: ProgressReporterParams<C>) -> Self {
         // 使用有界 channel，容量 100
         let (message_tx, message_rx) = mpsc::channel(100);
 
         // 启动 actor 任务
         tokio::spawn(async move {
-            ProgressReporterActor::new(
-                progress_sender,
-                total_size,
-                message_rx,
-                worker_handles,
-                global_stats,
-                update_interval,
-                start_offset,
-            )
-            .await
-            .run()
-            .await;
+            ProgressReporterActor::new(params, message_rx).run().await;
         });
 
         Self {
@@ -387,14 +386,14 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let worker_handles = create_empty_worker_handles::<reqwest::Client>();
         let global_stats = create_mock_global_stats();
-        let _reporter = ProgressReporter::new(
-            Some(tx),
-            NonZeroU64::new(1000).unwrap(),
+        let _reporter = ProgressReporter::new(ProgressReporterParams {
+            progress_sender: Some(tx),
+            total_size: NonZeroU64::new(1000).unwrap(),
             worker_handles,
             global_stats,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::ZERO,
-        );
+            update_interval: std::time::Duration::from_secs(1),
+            start_offset: std::time::Duration::ZERO,
+        });
         // Actor 已启动，只验证创建成功
     }
 
@@ -402,14 +401,14 @@ mod tests {
     async fn test_progress_reporter_without_sender() {
         let worker_handles = create_empty_worker_handles::<reqwest::Client>();
         let global_stats = create_mock_global_stats();
-        let _reporter = ProgressReporter::new(
-            None,
-            NonZeroU64::new(1000).unwrap(),
+        let _reporter = ProgressReporter::new(ProgressReporterParams {
+            progress_sender: None,
+            total_size: NonZeroU64::new(1000).unwrap(),
             worker_handles,
             global_stats,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::ZERO,
-        );
+            update_interval: std::time::Duration::from_secs(1),
+            start_offset: std::time::Duration::ZERO,
+        });
         // Actor 已启动，只验证创建成功
     }
 
@@ -418,14 +417,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let worker_handles = create_empty_worker_handles::<reqwest::Client>();
         let global_stats = create_mock_global_stats();
-        let reporter = ProgressReporter::new(
-            Some(tx),
-            NonZeroU64::new(1000).unwrap(),
+        let reporter = ProgressReporter::new(ProgressReporterParams {
+            progress_sender: Some(tx),
+            total_size: NonZeroU64::new(1000).unwrap(),
             worker_handles,
             global_stats,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::ZERO,
-        );
+            update_interval: std::time::Duration::from_secs(1),
+            start_offset: std::time::Duration::ZERO,
+        });
 
         reporter.send_started_event(4, 256).await;
 
@@ -453,14 +452,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let worker_handles = create_empty_worker_handles::<reqwest::Client>();
         let global_stats = create_mock_global_stats();
-        let reporter = ProgressReporter::new(
-            Some(tx),
-            NonZeroU64::new(1000).unwrap(),
+        let reporter = ProgressReporter::new(ProgressReporterParams {
+            progress_sender: Some(tx),
+            total_size: NonZeroU64::new(1000).unwrap(),
             worker_handles,
             global_stats,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::ZERO,
-        );
+            update_interval: std::time::Duration::from_secs(1),
+            start_offset: std::time::Duration::ZERO,
+        });
 
         reporter.send_error("Test error").await;
 
@@ -481,14 +480,14 @@ mod tests {
     async fn test_send_events_without_sender() {
         let worker_handles = create_empty_worker_handles::<reqwest::Client>();
         let global_stats = create_mock_global_stats();
-        let reporter = ProgressReporter::new(
-            None,
-            NonZeroU64::new(1000).unwrap(),
+        let reporter = ProgressReporter::new(ProgressReporterParams {
+            progress_sender: None,
+            total_size: NonZeroU64::new(1000).unwrap(),
             worker_handles,
             global_stats,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::ZERO,
-        );
+            update_interval: std::time::Duration::from_secs(1),
+            start_offset: std::time::Duration::ZERO,
+        });
 
         // 这些调用不应该 panic
         reporter.send_started_event(4, 256).await;

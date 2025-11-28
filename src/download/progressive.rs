@@ -258,6 +258,22 @@ impl ProgressiveLauncherLogic {
     }
 }
 
+/// 渐进式启动 Actor 参数
+pub(super) struct ProgressiveLauncherParams<C: crate::utils::io_traits::HttpClient> {
+    /// 配置
+    pub config: Arc<DownloadConfig>,
+    /// 共享的 worker handles
+    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    /// 文件总大小
+    pub total_size: u64,
+    /// 已写入字节数（共享引用）
+    pub written_bytes: Arc<AtomicU64>,
+    /// 全局统计管理器
+    pub global_stats: crate::utils::stats::TaskStats,
+    /// 启动偏移时间
+    pub start_offset: std::time::Duration,
+}
+
 /// 渐进式启动 Actor
 ///
 /// 独立运行的 actor，负责定期检测并自动启动新 worker
@@ -284,18 +300,22 @@ struct ProgressiveLauncherActor<C: crate::utils::io_traits::HttpClient> {
 
 impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
     /// 创建新的 actor
-    async fn new(
-        config: Arc<DownloadConfig>,
+    fn new(
+        params: ProgressiveLauncherParams<C>,
         shutdown_rx: lite::Receiver<()>,
-        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
-        total_size: u64,
-        written_bytes: Arc<AtomicU64>,
-        global_stats: crate::utils::stats::TaskStats,
         launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
-        check_interval: std::time::Duration,
-        start_offset: std::time::Duration,
     ) -> Self {
+        let ProgressiveLauncherParams {
+            config,
+            worker_handles,
+            total_size,
+            written_bytes,
+            global_stats,
+            start_offset,
+        } = params;
+
         let logic = ProgressiveLauncherLogic::new(&config);
+        let check_interval = config.speed().instant_speed_window();
 
         info!(
             "渐进式启动配置: 目标 {} workers, 阶段: {:?}, 启动偏移: {:?}",
@@ -459,8 +479,6 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
 ///
 /// 提供与 ProgressiveLauncherActor 通信的接口
 pub(super) struct ProgressiveLauncher<C: crate::utils::io_traits::HttpClient> {
-    /// Worker 启动请求接收器（仅在创建时持有，之后转移）
-    launch_request_rx: Option<mpsc::Receiver<WorkerLaunchRequest>>,
     /// 初始 worker 数量
     initial_worker_count: u64,
     /// Actor 任务句柄
@@ -473,59 +491,39 @@ pub(super) struct ProgressiveLauncher<C: crate::utils::io_traits::HttpClient> {
 
 impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
     /// 创建新的渐进式启动管理器（启动 actor）
+    ///
+    /// 返回 `(Self, mpsc::Receiver<WorkerLaunchRequest>)`，调用者需持有接收器
     pub(super) fn new(
-        config: Arc<DownloadConfig>,
-        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
-        total_size: u64,
-        written_bytes: Arc<AtomicU64>,
-        global_stats: crate::utils::stats::TaskStats,
-        start_offset: std::time::Duration,
-    ) -> Self {
+        params: ProgressiveLauncherParams<C>,
+    ) -> (Self, mpsc::Receiver<WorkerLaunchRequest>) {
         // 先创建临时逻辑对象获取初始 worker 数量
-        let temp_logic = ProgressiveLauncherLogic::new(&config);
+        let temp_logic = ProgressiveLauncherLogic::new(&params.config);
         let initial_worker_count = temp_logic.initial_worker_count();
 
         // 使用 oneshot channel
         let (shutdown_tx, shutdown_rx) = lite::channel();
         let (launch_request_tx, launch_request_rx) = mpsc::channel(10);
 
-        let check_interval = config.speed().instant_speed_window();
-
         // 启动 actor 任务
         let actor_handle = tokio::spawn(async move {
-            ProgressiveLauncherActor::new(
-                config,
-                shutdown_rx,
-                worker_handles,
-                total_size,
-                written_bytes,
-                global_stats,
-                launch_request_tx,
-                check_interval,
-                start_offset,
-            )
-            .await
-            .run()
-            .await;
+            ProgressiveLauncherActor::new(params, shutdown_rx, launch_request_tx)
+                .run()
+                .await;
         });
 
-        Self {
+        let launcher = Self {
             shutdown_tx,
-            launch_request_rx: Some(launch_request_rx),
             initial_worker_count,
             actor_handle: Some(actor_handle),
             _phantom: std::marker::PhantomData,
-        }
+        };
+
+        (launcher, launch_request_rx)
     }
 
     /// 获取第一批 Worker 的数量
     pub(super) fn initial_worker_count(&self) -> u64 {
         self.initial_worker_count
-    }
-
-    /// 取出启动请求接收器（只能调用一次）
-    pub(super) fn take_launch_request_rx(&mut self) -> Option<mpsc::Receiver<WorkerLaunchRequest>> {
-        self.launch_request_rx.take()
     }
 
     /// 关闭 actor 并等待其完全停止

@@ -76,6 +76,20 @@ pub(super) struct WorkerCancelRequest {
     pub reason: String,
 }
 
+/// 健康检查器参数
+pub(super) struct WorkerHealthCheckerParams<C: crate::utils::io_traits::HttpClient> {
+    /// 配置
+    pub config: Arc<DownloadConfig>,
+    /// 共享的 worker handles
+    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    /// 检查间隔
+    pub check_interval: std::time::Duration,
+    /// 活跃 worker 集合
+    pub active_workers: Arc<RwLock<FxHashSet<u64>>>,
+    /// 启动偏移时间
+    pub start_offset: std::time::Duration,
+}
+
 /// Worker 健康检查器（内部逻辑）
 ///
 /// 使用最大间隙检测算法来识别速度异常的 worker：
@@ -289,15 +303,19 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
 
 impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
     /// 创建新的 actor
-    async fn new(
-        config: Arc<DownloadConfig>,
+    fn new(
+        params: WorkerHealthCheckerParams<C>,
         message_rx: mpsc::Receiver<ActorMessage>,
-        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
-        check_interval: std::time::Duration,
-        active_workers: Arc<RwLock<FxHashSet<u64>>>,
-        start_offset: std::time::Duration,
     ) -> Self {
+        let WorkerHealthCheckerParams {
+            config,
+            worker_handles,
+            check_interval,
+            active_workers,
+            start_offset,
+        } = params;
+
         let absolute_threshold = config
             .health_check()
             .absolute_speed_threshold()
@@ -440,8 +458,6 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
 pub(super) struct WorkerHealthChecker<C: crate::utils::io_traits::HttpClient> {
     /// 消息发送器
     message_tx: mpsc::Sender<ActorMessage>,
-    /// Worker 取消请求接收器（仅在创建时持有，之后转移）
-    cancel_request_rx: Option<mpsc::Receiver<WorkerCancelRequest>>,
     /// Actor 任务句柄
     actor_handle: Option<tokio::task::JoinHandle<()>>,
     /// PhantomData 用于持有泛型参数
@@ -450,44 +466,29 @@ pub(super) struct WorkerHealthChecker<C: crate::utils::io_traits::HttpClient> {
 
 impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
     /// 创建新的健康检查器（启动 actor）
+    ///
+    /// 返回 `(Self, mpsc::Receiver<WorkerCancelRequest>)`，调用者需持有接收器
     pub(super) fn new(
-        config: Arc<DownloadConfig>,
-        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
-        check_interval: std::time::Duration,
-        active_workers: Arc<RwLock<FxHashSet<u64>>>,
-        start_offset: std::time::Duration,
-    ) -> Self {
+        params: WorkerHealthCheckerParams<C>,
+    ) -> (Self, mpsc::Receiver<WorkerCancelRequest>) {
         // 使用有界 channel，容量 10
         let (message_tx, message_rx) = mpsc::channel(10);
         let (cancel_request_tx, cancel_request_rx) = mpsc::channel(10);
 
         // 启动 actor 任务
         let actor_handle = tokio::spawn(async move {
-            WorkerHealthCheckerActor::new(
-                config,
-                message_rx,
-                worker_handles,
-                cancel_request_tx,
-                check_interval,
-                active_workers,
-                start_offset,
-            )
-            .await
-            .run()
-            .await;
+            WorkerHealthCheckerActor::new(params, message_rx, cancel_request_tx)
+                .run()
+                .await;
         });
 
-        Self {
+        let checker = Self {
             message_tx,
-            cancel_request_rx: Some(cancel_request_rx),
             actor_handle: Some(actor_handle),
             _phantom: std::marker::PhantomData,
-        }
-    }
+        };
 
-    /// 取出取消请求接收器（只能调用一次）
-    pub(super) fn take_cancel_request_rx(&mut self) -> Option<mpsc::Receiver<WorkerCancelRequest>> {
-        self.cancel_request_rx.take()
+        (checker, cancel_request_rx)
     }
 
     /// 关闭 actor 并等待其完全停止

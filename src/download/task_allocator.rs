@@ -39,6 +39,26 @@ pub(super) enum AllocatorMessage {
     Shutdown,
 }
 
+/// TaskAllocator Actor 参数
+pub(super) struct TaskAllocatorParams<C: HttpClient> {
+    /// Range 分配器
+    pub allocator: RangeAllocator,
+    /// 下载 URL
+    pub url: String,
+    /// 定时器服务
+    pub timer_service: TimerService,
+    /// Worker 结果接收器
+    pub result_rx: mpsc::Receiver<RangeResult>,
+    /// 取消请求接收器
+    pub cancel_rx: mpsc::Receiver<WorkerCancelRequest>,
+    /// 配置
+    pub config: Arc<crate::config::DownloadConfig>,
+    /// Worker 句柄映射
+    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    /// 活跃 worker 集合
+    pub active_workers: Arc<RwLock<FxHashSet<u64>>>,
+}
+
 /// 已分配的任务（封装任务和取消通道）
 pub(super) struct AllocatedTask {
     /// 任务本身
@@ -285,15 +305,19 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
 impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
     /// 创建新的 TaskAllocator Actor 并启动
     pub(super) fn new(
-        allocator: RangeAllocator,
-        url: String,
-        mut timer_service: TimerService,
-        result_rx: mpsc::Receiver<RangeResult>,
-        cancel_rx: mpsc::Receiver<WorkerCancelRequest>,
-        config: Arc<crate::config::DownloadConfig>,
-        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
-        active_workers: Arc<RwLock<FxHashSet<u64>>>,
+        params: TaskAllocatorParams<C>,
     ) -> (TaskAllocatorHandle, oneshot::Receiver<CompletionResult>) {
+        let TaskAllocatorParams {
+            allocator,
+            url,
+            mut timer_service,
+            result_rx,
+            cancel_rx,
+            config,
+            worker_handles,
+            active_workers,
+        } = params;
+
         let (message_tx, message_rx) = mpsc::channel(100);
         let (completion_tx, completion_rx) = oneshot::channel();
 
