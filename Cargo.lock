@@ -537,6 +537,7 @@ dependencies = [
  "lite-sync",
  "log",
  "net-bytes",
+ "parking_lot",
  "ranged-mmap",
  "reqwest",
  "rustc-hash",
