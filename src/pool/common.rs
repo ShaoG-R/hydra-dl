@@ -465,8 +465,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
             let (slot, worker_handle) = pool.spawn_worker(key, context, state);
 
             // 将 slot 插入 DeferredMap
-            pool.slots
-                .insert(deferred_handle, slot);
+            pool.slots.insert(deferred_handle, slot);
 
             handles.push(worker_handle);
         }
@@ -504,8 +503,7 @@ impl<E: WorkerExecutor> WorkerPool<E> {
             let (slot, worker_handle) = self.spawn_worker(key, context, stats);
 
             // 将 slot 插入 DeferredMap
-            self.slots
-                .insert(deferred_handle, slot);
+            self.slots.insert(deferred_handle, slot);
 
             handles.push(worker_handle);
 

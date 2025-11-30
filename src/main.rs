@@ -14,9 +14,11 @@ async fn main() {
         LevelFilter::Info // normal/verbose 模式：显示 INFO、WARN 和 ERROR
     };
 
-    let logger_ctrl = cli::init_logger(log_level).map_err(|e| {
-        eprintln!("警告: 无法初始化日志系统: {}", e);
-    }).ok();
+    let logger_ctrl = cli::init_logger(log_level)
+        .map_err(|e| {
+            eprintln!("警告: 无法初始化日志系统: {}", e);
+        })
+        .ok();
 
     // 执行下载任务
     if let Err(e) = cli::run(cli, logger_ctrl).await {

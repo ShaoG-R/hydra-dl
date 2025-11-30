@@ -386,7 +386,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
             for &worker_id in handles.keys() {
                 if let Some(handle) = handles.get(&worker_id) {
                     let stats = handle.stats();
-                    
+
                     // 只检查正在执行任务的 worker
                     if !stats.is_active() {
                         continue;

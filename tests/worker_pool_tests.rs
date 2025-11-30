@@ -231,8 +231,7 @@ async fn test_concurrent_handle_usage() {
 async fn test_dynamic_scaling() {
     let executor = TestExecutor;
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, initial_handles, mut result_receiver) =
-        WorkerPool::new(executor, contexts);
+    let (mut pool, initial_handles, mut result_receiver) = WorkerPool::new(executor, contexts);
 
     // 发送一些任务到初始 workers
     for i in 0..10 {
@@ -794,8 +793,7 @@ async fn test_dynamic_resize() {
 
     // 开始时有 2 个 workers
     let contexts = create_contexts_with_stats(2);
-    let (mut pool, initial_handles, mut result_receiver) =
-        WorkerPool::new(executor, contexts);
+    let (mut pool, initial_handles, mut result_receiver) = WorkerPool::new(executor, contexts);
     assert_eq!(pool.worker_count(), 2);
 
     // 发送一些任务

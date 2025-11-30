@@ -5,7 +5,7 @@ mod progress;
 mod runner;
 pub mod utils;
 
-pub use logger::{init_logger, LogController};
+pub use logger::{LogController, init_logger};
 
 /// CLI 错误类型
 #[derive(thiserror::Error, Debug)]

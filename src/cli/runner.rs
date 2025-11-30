@@ -10,7 +10,11 @@ use kestrel_timer::{TimerWheel, config::ServiceConfig};
 /// 执行下载任务
 ///
 /// 根据 CLI 参数构建配置并启动下载
-pub async fn execute_download(cli: &Cli, save_dir: &str, logger_ctrl: Option<LogController>) -> Result<()> {
+pub async fn execute_download(
+    cli: &Cli,
+    save_dir: &str,
+    logger_ctrl: Option<LogController>,
+) -> Result<()> {
     // 构建下载配置
     let config = DownloadConfig::builder()
         .concurrency(|c| c.worker_count(cli.workers))
@@ -45,7 +49,9 @@ pub async fn execute_download(cli: &Cli, save_dir: &str, logger_ctrl: Option<Log
             let mut progress_manager = ProgressManager::new(cli.verbose, size_standard);
 
             // 将进度条引用传给 logger，使日志输出不破坏进度条
-            logger_ctrl.set_progress_bar(progress_manager.main_bar()).await;
+            logger_ctrl
+                .set_progress_bar(progress_manager.main_bar())
+                .await;
 
             // 循环接收进度更新
             while let Some(progress) = handle.progress_receiver().recv().await {

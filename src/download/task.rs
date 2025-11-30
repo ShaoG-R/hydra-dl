@@ -73,26 +73,24 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let base_offset = std::time::Duration::from_millis(50);
 
         // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
-        let (progressive_launcher, launch_request_rx) = ProgressiveLauncher::new(
-            ProgressiveLauncherParams {
+        let (progressive_launcher, launch_request_rx) =
+            ProgressiveLauncher::new(ProgressiveLauncherParams {
                 config: Arc::clone(&config),
                 worker_handles: swap.local(),
                 total_size: writer.total_size(),
                 written_bytes: writer.written_bytes_ref(),
                 global_stats: global_stats.clone(),
                 start_offset: std::time::Duration::ZERO,
-            },
-        );
+            });
 
         // 创建健康检查器（actor 模式） - 偏移 50ms
-        let (health_checker, cancel_request_rx) = WorkerHealthChecker::new(
-            WorkerHealthCheckerParams {
+        let (health_checker, cancel_request_rx) =
+            WorkerHealthChecker::new(WorkerHealthCheckerParams {
                 config: Arc::clone(&config),
                 worker_handles: swap.local(),
                 check_interval: config.speed().instant_speed_window(),
                 start_offset: base_offset,
-            },
-        );
+            });
 
         // 第一批 worker 数量
         let initial_worker_count = progressive_launcher.initial_worker_count();
@@ -126,17 +124,15 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         swap.store(initial_worker_handles);
 
         // 创建并启动任务分配器 Actor
-        let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(
-            TaskAllocatorParams {
-                allocator,
-                url,
-                timer_service,
-                result_rx: result_receiver,
-                cancel_rx: cancel_request_rx,
-                config: Arc::clone(&config),
-                worker_handles: swap.local(),
-            },
-        );
+        let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(TaskAllocatorParams {
+            allocator,
+            url,
+            timer_service,
+            result_rx: result_receiver,
+            cancel_rx: cancel_request_rx,
+            config: Arc::clone(&config),
+            worker_handles: swap.local(),
+        });
 
         // 注册第一批 workers（会自动触发任务分配）
         let worker_ids = {
@@ -340,7 +336,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         );
 
         // 动态添加新 worker，收集实际的 worker_id
-        let new_worker_ids: Vec<u64> =  {
+        let new_worker_ids: Vec<u64> = {
             let new_handles = self.pool.add_workers(count).await;
             let mut ids = Vec::new();
             self.worker_handles.update(|handles| {
