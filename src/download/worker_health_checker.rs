@@ -5,6 +5,7 @@
 
 use crate::config::DownloadConfig;
 use crate::pool::download::DownloadWorkerHandle;
+use lite_sync::oneshot::lite;
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use rustc_hash::FxHashMap;
@@ -57,13 +58,6 @@ pub struct HealthCheckResult {
     pub health_baseline: Speed,
     /// 最大间隙值
     pub max_gap: Speed,
-}
-
-/// Actor 消息类型
-#[derive(Debug)]
-enum ActorMessage {
-    /// 关闭 actor
-    Shutdown,
 }
 
 /// Worker 取消请求
@@ -286,8 +280,8 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
     logic: WorkerHealthCheckerLogic,
     /// 配置
     config: Arc<DownloadConfig>,
-    /// 消息接收器
-    message_rx: mpsc::Receiver<ActorMessage>,
+    /// 关闭信号接收器
+    shutdown_rx: lite::Receiver<()>,
     /// 单一写入者的 worker handles 持有者
     worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
     /// Worker 取消请求发送器
@@ -300,7 +294,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
     /// 创建新的 actor
     fn new(
         params: WorkerHealthCheckerParams<C>,
-        message_rx: mpsc::Receiver<ActorMessage>,
+        shutdown_rx: lite::Receiver<()>,
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
     ) -> Self {
         let WorkerHealthCheckerParams {
@@ -324,7 +318,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
         Self {
             logic,
             config,
-            message_rx,
+            shutdown_rx,
             worker_handles,
             cancel_request_tx,
             check_timer,
@@ -342,18 +336,9 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
                     self.check_and_handle().await;
                 }
                 // 外部消息
-                msg = self.message_rx.recv() => {
-                    match msg {
-                        Some(ActorMessage::Shutdown) => {
-                            debug!("WorkerHealthCheckerActor shutting down");
-                            break;
-                        }
-                        None => {
-                            // Channel 已关闭
-                            debug!("WorkerHealthCheckerActor message channel closed");
-                            break;
-                        }
-                    }
+                _ = &mut self.shutdown_rx => {
+                    debug!("WorkerHealthCheckerActor shutting down");
+                    break;
                 }
             }
         }
@@ -449,8 +434,8 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
 ///
 /// 提供与 WorkerHealthCheckerActor 通信的接口
 pub(super) struct WorkerHealthChecker<C: crate::utils::io_traits::HttpClient> {
-    /// 消息发送器
-    message_tx: mpsc::Sender<ActorMessage>,
+    /// 关闭信号发送器
+    shutdown_tx: lite::Sender<()>,
     /// Actor 任务句柄
     actor_handle: Option<tokio::task::JoinHandle<()>>,
     /// PhantomData 用于持有泛型参数
@@ -464,19 +449,18 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
     pub(super) fn new(
         params: WorkerHealthCheckerParams<C>,
     ) -> (Self, mpsc::Receiver<WorkerCancelRequest>) {
-        // 使用有界 channel，容量 10
-        let (message_tx, message_rx) = mpsc::channel(10);
+        let (shutdown_tx, shutdown_rx) = lite::channel();
         let (cancel_request_tx, cancel_request_rx) = mpsc::channel(10);
 
         // 启动 actor 任务
         let actor_handle = tokio::spawn(async move {
-            WorkerHealthCheckerActor::new(params, message_rx, cancel_request_tx)
+            WorkerHealthCheckerActor::new(params, shutdown_rx, cancel_request_tx)
                 .run()
                 .await;
         });
 
         let checker = Self {
-            message_tx,
+            shutdown_tx,
             actor_handle: Some(actor_handle),
             _phantom: std::marker::PhantomData,
         };
@@ -487,7 +471,7 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
     /// 关闭 actor 并等待其完全停止
     pub(super) async fn shutdown_and_wait(mut self) {
         // 发送关闭消息
-        let _ = self.message_tx.send(ActorMessage::Shutdown).await;
+        let _ = self.shutdown_tx.notify(());
 
         // 等待 actor 任务完成
         if let Some(handle) = self.actor_handle.take() {
