@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use crate::DownloadConfig;
+
 use super::speed_calculator::SpeedCalculator;
 use lfrlock::LfrLock;
 use net_bytes::{DownloadAcceleration, DownloadSpeed};
@@ -405,14 +409,13 @@ pub(crate) struct TaskStats {
     /// 聚合器，存储所有子统计的累加结果，包含速度计算器
     aggregator: StatsAggregator,
     /// 速度配置（用于创建子统计）
-    speed_config: crate::config::SpeedConfig,
+    speed_config: Arc<DownloadConfig>,
 }
 
 impl Default for TaskStats {
     #[inline]
     fn default() -> Self {
-        use crate::config::SpeedConfig;
-        Self::from_config(&SpeedConfig::default())
+        Self::from_config(Arc::new(DownloadConfig::default()))
     }
 }
 
@@ -427,18 +430,18 @@ impl TaskStats {
     ///
     /// ```ignore
     /// use hydra_dl::TaskStats;
-    /// use hydra_dl::config::SpeedConfig;
+    /// use hydra_dl::config::DownloadConfig;
     ///
-    /// let config = SpeedConfig::default();
+    /// let config = DownloadConfig::default();
     /// let parent = TaskStats::from_config(&config);
     /// ```
-    pub(crate) fn from_config(config: &crate::config::SpeedConfig) -> Self {
+    pub(crate) fn from_config(config: Arc<crate::config::DownloadConfig>) -> Self {
         Self {
             aggregator: StatsAggregator {
                 inner: LfrLock::new(StatsAggregatorInner {
                     total_bytes: 0,
                     completed_ranges: 0,
-                    speed_calculator: SpeedCalculator::from_config(config),
+                    speed_calculator: SpeedCalculator::from_config(config.speed()),
                 }),
             },
             speed_config: config.clone(),
@@ -467,7 +470,7 @@ impl TaskStats {
     /// ```
     #[inline]
     pub(crate) fn create_child(&self) -> WorkerStats {
-        WorkerStats::from_config_with_parent(&self.speed_config, self.aggregator.clone())
+        WorkerStats::from_config_with_parent(self.speed_config.speed(), self.aggregator.clone())
     }
 
     /// 获取聚合统计摘要

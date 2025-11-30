@@ -64,7 +64,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         } = params;
 
         // 获取 global_stats
-        let global_stats = crate::utils::stats::TaskStats::from_config(config.speed());
+        let global_stats = crate::utils::stats::TaskStats::from_config(config.clone());
 
         // worker_handles 占位，稍后填充
         let mut swap = SmrSwap::new(FxHashMap::default());

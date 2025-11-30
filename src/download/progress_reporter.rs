@@ -378,7 +378,7 @@ mod tests {
     fn create_mock_global_stats() -> crate::utils::stats::TaskStats {
         // 使用默认的配置来创建 TaskStats
         let config = crate::config::DownloadConfig::default();
-        crate::utils::stats::TaskStats::from_config(config.speed())
+        crate::utils::stats::TaskStats::from_config(config.into())
     }
 
     #[tokio::test]

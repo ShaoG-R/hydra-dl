@@ -590,7 +590,7 @@ mod tests {
 
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let global_stats = TaskStats::from_config(config.speed());
+        let global_stats = TaskStats::from_config(config.clone());
         let (pool, _handles, _result_receiver) =
             DownloadWorkerPool::new(client, worker_count, writer, config, global_stats);
 
@@ -609,7 +609,7 @@ mod tests {
 
         let worker_count = 3;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let global_stats = TaskStats::from_config(config.speed());
+        let global_stats = TaskStats::from_config(config.clone());
         let (pool, _handles, _result_receiver) =
             DownloadWorkerPool::new(client, worker_count, writer, config, global_stats);
 
@@ -634,7 +634,7 @@ mod tests {
         let (writer, _) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let global_stats = TaskStats::from_config(config.speed());
+        let global_stats = TaskStats::from_config(config.clone());
         let (mut pool, _handles, _result_receiver) =
             DownloadWorkerPool::new(client.clone(), 2, writer, config, global_stats);
 
