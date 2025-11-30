@@ -274,28 +274,26 @@ pub(super) struct ProgressiveLauncherParams<C: crate::utils::io_traits::HttpClie
     pub start_offset: std::time::Duration,
 }
 
+/// Actor 通信通道
+struct ActorChannels {
+    /// 关闭接收器
+    shutdown_rx: lite::Receiver<()>,
+    /// Worker 启动请求发送器
+    launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
+    /// 检查定时器
+    check_timer: tokio::time::Interval,
+}
+
 /// 渐进式启动 Actor
 ///
 /// 独立运行的 actor，负责定期检测并自动启动新 worker
 struct ProgressiveLauncherActor<C: crate::utils::io_traits::HttpClient> {
     /// 内部逻辑管理器
     logic: ProgressiveLauncherLogic,
-    /// 配置
-    config: Arc<DownloadConfig>,
-    /// 关闭接收器
-    shutdown_rx: lite::Receiver<()>,
-    /// 共享的 worker handles
-    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
-    /// 文件总大小
-    total_size: u64,
-    /// 已写入字节数（共享引用）
-    written_bytes: Arc<AtomicU64>,
-    /// 全局统计管理器
-    global_stats: crate::utils::stats::TaskStats,
-    /// Worker 启动请求发送器
-    launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
-    /// 检查定时器（内部管理）
-    check_timer: tokio::time::Interval,
+    /// 下载状态参数
+    params: ProgressiveLauncherParams<C>,
+    /// 通信通道
+    channels: ActorChannels,
 }
 
 impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
@@ -305,38 +303,29 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
         shutdown_rx: lite::Receiver<()>,
         launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
     ) -> Self {
-        let ProgressiveLauncherParams {
-            config,
-            worker_handles,
-            total_size,
-            written_bytes,
-            global_stats,
-            start_offset,
-        } = params;
-
-        let logic = ProgressiveLauncherLogic::new(&config);
-        let check_interval = config.speed().instant_speed_window();
+        let logic = ProgressiveLauncherLogic::new(&params.config);
+        let check_interval = params.config.speed().instant_speed_window();
 
         info!(
             "渐进式启动配置: 目标 {} workers, 阶段: {:?}, 启动偏移: {:?}",
-            config.concurrency().worker_count(),
+            params.config.concurrency().worker_count(),
             logic.worker_launch_stages,
-            start_offset
+            params.start_offset
         );
 
-        let start_time = tokio::time::Instant::now() + start_offset;
+        let start_time = tokio::time::Instant::now() + params.start_offset;
         let check_timer = tokio::time::interval_at(start_time, check_interval);
+
+        let channels = ActorChannels {
+            shutdown_rx,
+            launch_request_tx,
+            check_timer,
+        };
 
         Self {
             logic,
-            config,
-            shutdown_rx,
-            worker_handles,
-            total_size,
-            written_bytes,
-            global_stats,
-            launch_request_tx,
-            check_timer,
+            params,
+            channels,
         }
     }
 
@@ -347,11 +336,11 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
         loop {
             tokio::select! {
                 // 内部定时器：自主触发检查
-                _ = self.check_timer.tick() => {
+                _ = self.channels.check_timer.tick() => {
                     self.check_and_launch().await;
                 }
                 // 外部消息
-                msg = &mut self.shutdown_rx => {
+                msg = &mut self.channels.shutdown_rx => {
                     match msg {
                         Ok(_) => {
                             debug!("ProgressiveLauncherActor shutting down");
@@ -378,7 +367,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
         }
 
         let decision = {
-            let worker_handles = self.worker_handles.load();
+            let worker_handles = self.params.worker_handles.load();
 
             // 检测并调整启动阶段（应对 worker 数量变化）
             let current_worker_count = worker_handles.len() as u64;
@@ -386,13 +375,13 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
                 .adjust_stage_for_worker_count(current_worker_count);
 
             // 从共享数据获取信息并决策
-            let written = self.written_bytes.load(Ordering::SeqCst);
+            let written = self.params.written_bytes.load(Ordering::SeqCst);
             self.logic.decide_next_launch(
                 &*worker_handles,
                 written,
-                self.total_size,
-                &self.global_stats,
-                &self.config,
+                self.params.total_size,
+                &self.params.global_stats,
+                &self.params.config,
             )
         };
 
@@ -405,7 +394,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
                 let next_target = self.logic.worker_launch_stages[self.logic.next_launch_stage];
                 let formatted_speeds = ProgressiveLauncherLogic::format_speeds(
                     &speeds,
-                    self.config.speed().size_standard(),
+                    self.params.config.speed().size_standard(),
                 );
                 info!(
                     "渐进式启动 - 第{}批: 所有worker速度达标 (当前速度: {})，准备启动 {} 个新 workers (总计 {} 个)",
@@ -420,7 +409,7 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
                     stage: self.logic.next_launch_stage,
                 };
 
-                if let Err(e) = self.launch_request_tx.send(request).await {
+                if let Err(e) = self.channels.launch_request_tx.send(request).await {
                     error!("发送 worker 启动请求失败: {:?}", e);
                 } else {
                     // 成功发送后推进到下一阶段
@@ -442,12 +431,12 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
             WaitReason::InsufficientSpeed { speeds, threshold } => {
                 let formatted_speeds = ProgressiveLauncherLogic::format_speeds(
                     speeds,
-                    self.config.speed().size_standard(),
+                    self.params.config.speed().size_standard(),
                 );
                 match threshold {
                     Some(threshold) => {
                         let threshold_formatted = DownloadSpeed::from_raw(*threshold)
-                            .to_formatted(self.config.speed().size_standard());
+                            .to_formatted(self.params.config.speed().size_standard());
                         debug!(
                             "渐进式启动 - 等待第{}批worker速度达标 (当前速度: {}, 阈值: {})",
                             self.logic.next_launch_stage + 1,
