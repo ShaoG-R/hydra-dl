@@ -1,5 +1,5 @@
 use log::info;
-use ranged_mmap::{AllocatedRange, MmapFile, allocator::sequential::Allocator as RangeAllocator};
+use ranged_mmap::{AllocatedRange, MmapFile, allocator::concurrent::Allocator as RangeAllocator};
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ impl MmapWriter {
         );
 
         // 创建内存映射文件
-        let (file, allocator) = MmapFile::create_default(path, total_size)?;
+        let (file, allocator) = MmapFile::create(path, total_size)?;
 
         let writer = Self {
             file,

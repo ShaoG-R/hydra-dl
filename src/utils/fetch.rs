@@ -1,9 +1,8 @@
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use lite_sync::oneshot::lite;
 use log::{debug, info};
+use tokio::sync::mpsc;
 use ranged_mmap::AllocatedRange;
-use smr_swap::SmrSwap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -403,7 +402,7 @@ pub struct RangeFetcher<'a, C: HttpClient> {
     client: &'a C,
     url: &'a str,
     range: FetchRange,
-    stats: &'a mut SmrSwap<WorkerStats>,
+    stats: &'a mut WorkerStats,
 }
 
 impl<'a, C: HttpClient> RangeFetcher<'a, C> {
@@ -418,7 +417,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
         client: &'a C,
         url: &'a str,
         range: FetchRange,
-        stats: &'a mut SmrSwap<WorkerStats>,
+        stats: &'a mut WorkerStats,
     ) -> Self {
         Self {
             client,
@@ -440,7 +439,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     /// - `Cancelled { data, bytes_downloaded }`: 下载被取消，包含已下载的部分数据和已下载的字节数
     pub async fn fetch_with_cancel(
         mut self,
-        cancel_rx: lite::Receiver<()>,
+        cancel_rx: &mut mpsc::Receiver<()>,
     ) -> Result<FetchRangeResult> {
         let (http_start, http_end) = self.range.as_http_range();
         debug!(
@@ -483,7 +482,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
     async fn download_stream_with_cancel<S>(
         &mut self,
         mut stream: S,
-        mut cancel_rx: lite::Receiver<()>,
+        cancel_rx: &mut mpsc::Receiver<()>,
     ) -> Result<FetchRangeResult>
     where
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
@@ -508,11 +507,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
                             let chunk_size = chunk.len() as u64;
 
                             // 实时记录 chunk
-                            self.stats.update_and_fetch(|stats| {
-                                let mut stats = stats.clone();
-                                stats.record_chunk(chunk_size);
-                                stats
-                            });
+                            self.stats.record_chunk(chunk_size);
 
                             chunks.push(chunk);
                             downloaded_bytes += chunk_size;
@@ -530,7 +525,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
                         }
                     }
                 }
-                _ = &mut cancel_rx => {
+                _ = cancel_rx.recv() => {
                     // 收到取消信号，返回已下载的字节数和数据
                     let data = self.merge_chunks(chunks);
                     return Ok(FetchRangeResult::Cancelled {
@@ -912,7 +907,7 @@ mod tests {
         let full_data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
 
         let client = MockHttpClient::new();
-        let mut stats = SmrSwap::new(WorkerStats::default());
+        let mut stats = WorkerStats::default();
 
         // 创建临时文件和 allocator
         let dir = tempdir().unwrap();
@@ -939,12 +934,12 @@ mod tests {
         );
 
         // 创建一个永远不会发送的取消信号
-        let (_cancel_tx, cancel_rx) = lite::channel();
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
-            .fetch_with_cancel(cancel_rx)
+            .fetch_with_cancel(&mut cancel_rx)
             .await;
 
         assert!(result.is_ok(), "下载应该成功: {:?}", result);
@@ -960,7 +955,7 @@ mod tests {
         }
 
         // 验证统计信息
-        let (total_bytes, _, _) = stats.load().get_summary();
+        let (total_bytes, _, _) = stats.get_summary();
         assert_eq!(
             total_bytes,
             expected_data.len() as u64,
@@ -976,7 +971,7 @@ mod tests {
         // 测试 HTTP 错误
         let test_url = "http://example.com/file.bin";
         let client = MockHttpClient::new();
-        let mut stats = SmrSwap::new(WorkerStats::default());
+        let mut stats = WorkerStats::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -994,12 +989,12 @@ mod tests {
         );
 
         // 创建取消通道（虽然不会用到）
-        let (_cancel_tx, cancel_rx) = lite::channel();
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
-            .fetch_with_cancel(cancel_rx)
+            .fetch_with_cancel(&mut cancel_rx)
             .await;
 
         assert!(result.is_err(), "应该返回错误");
@@ -1086,7 +1081,7 @@ mod tests {
         let end = large_data.len() as u64;
 
         let client = MockHttpClient::new();
-        let mut stats = SmrSwap::new(WorkerStats::default());
+        let mut stats = WorkerStats::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -1111,12 +1106,12 @@ mod tests {
         );
 
         // 创建取消通道（不发送取消信号）
-        let (_cancel_tx, cancel_rx) = lite::channel();
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
-            .fetch_with_cancel(cancel_rx)
+            .fetch_with_cancel(&mut cancel_rx)
             .await;
 
         assert!(result.is_ok(), "大数据下载应该成功");
@@ -1133,7 +1128,7 @@ mod tests {
         }
 
         // 验证统计信息（应该记录了多个 chunk）
-        let (total_bytes, _, _) = stats.load().get_summary();
+        let (total_bytes, _, _) = stats.get_summary();
         assert_eq!(total_bytes, large_data.len() as u64, "统计的字节数应该匹配");
     }
 
@@ -1147,7 +1142,7 @@ mod tests {
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
 
         let client = MockHttpClient::new();
-        let mut stats = SmrSwap::new(WorkerStats::default());
+        let mut stats = WorkerStats::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -1173,18 +1168,18 @@ mod tests {
         );
 
         // 创建取消通道，在稍后发送取消信号
-        let (cancel_tx, cancel_rx) = lite::channel();
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
 
         tokio::spawn(async move {
             // 给予一点时间让下载开始
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _ = cancel_tx.notify(());
+            let _ = cancel_tx.send(());
         });
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
-            .fetch_with_cancel(cancel_rx)
+            .fetch_with_cancel(&mut cancel_rx)
             .await;
 
         assert!(result.is_ok(), "调用应该成功");
@@ -1223,7 +1218,7 @@ mod tests {
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
         let client = MockHttpClient::new();
-        let mut stats = SmrSwap::new(WorkerStats::default());
+        let mut stats = WorkerStats::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -1249,13 +1244,13 @@ mod tests {
         );
 
         // 立即发送取消信号
-        let (cancel_tx, cancel_rx) = lite::channel();
-        let _ = cancel_tx.notify(()); // 立即取消
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let _ = cancel_tx.send(()); // 立即取消
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
-            .fetch_with_cancel(cancel_rx)
+            .fetch_with_cancel(&mut cancel_rx)
             .await;
 
         // 应该成功（可能完成也可能取消，取决于执行时机）

@@ -21,7 +21,7 @@ async fn test_concurrent_writes_simulation() {
     let range_count = 10;
     let total_size = range_size * range_count as u64;
 
-    let (writer, mut allocator) =
+    let (writer, allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
     // 预先分配所有 Range
@@ -69,7 +69,7 @@ async fn test_partial_completion() {
     let range_size = 4096u64;
     let total_size = range_size * 5; // 20KB
 
-    let (writer, mut allocator) =
+    let (writer, allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
     // 分配 5 个 4K Range
@@ -125,7 +125,7 @@ async fn test_single_range() {
     let file_path = dir.path().join("single_range.dat");
 
     let total_size = 1000u64;
-    let (writer, mut allocator) =
+    let (writer, allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
     let range = allocator
@@ -153,7 +153,7 @@ async fn test_uneven_ranges() {
     let range_size = 4096u64;
     let total_size = range_size * 3; // 12KB
 
-    let (writer, mut allocator) =
+    let (writer, allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
     // 分配 3 个 4K Range
@@ -187,7 +187,7 @@ async fn test_many_small_ranges() {
     let range_size = 4096u64;
     let total_size = range_count as u64 * range_size;
 
-    let (writer, mut allocator) =
+    let (writer, allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
     // 分配并写入所有 Range
@@ -226,7 +226,7 @@ async fn test_progress_tracking() {
     let range_count = 10;
     let total_size = range_size * range_count as u64;
 
-    let (writer, mut allocator) =
+    let (writer, allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
     // 逐步写入并检查进度

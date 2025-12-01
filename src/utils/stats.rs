@@ -53,13 +53,16 @@ impl StatsAggregator {
     /// # Arguments
     ///
     /// * `bytes` - 本次下载的字节数
+    ///
+    /// # Returns
+    ///
+    /// `true` 表示成功采样，`false` 表示跳过
     #[inline]
-    pub(crate) fn record_chunk(&self, bytes: u64) {
+    pub(crate) fn record_chunk(&self, bytes: u64) -> bool {
         let mut inner = self.inner.write();
         inner.total_bytes += bytes;
-
-        let total_bytes = inner.total_bytes;
-        inner.speed_calculator.record_sample(total_bytes);
+        let total = inner.total_bytes;
+        inner.speed_calculator.record_sample(total)
     }
 
     /// 记录一个 range 完成
@@ -67,17 +70,6 @@ impl StatsAggregator {
     pub(crate) fn record_range_complete(&self) {
         let mut inner = self.inner.write();
         inner.completed_ranges += 1;
-    }
-
-    /// 获取实时下载速度
-    ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
-    #[inline]
-    pub(crate) fn get_instant_speed(&self) -> Option<DownloadSpeed> {
-        let inner = self.inner.read();
-        inner.speed_calculator.get_instant_speed()
     }
 
     /// 获取窗口平均下载速度
@@ -91,18 +83,6 @@ impl StatsAggregator {
         inner.speed_calculator.get_window_avg_speed()
     }
 
-    /// 获取实时下载加速度
-    ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadAcceleration)` 如果加速度计算有效，否则返回 `None`
-    ///
-    /// 注意：需要至少3个采样点才能计算加速度
-    #[inline]
-    pub(crate) fn get_instant_acceleration(&self) -> Option<DownloadAcceleration> {
-        let inner = self.inner.read();
-        inner.speed_calculator.get_instant_acceleration()
-    }
 }
 
 /// 下载速度统计
@@ -200,24 +180,25 @@ impl WorkerStats {
     /// # Arguments
     ///
     /// * `bytes` - 本次下载的字节数
+    ///
+    /// # Returns
+    ///
+    /// `true` 表示成功采样，`false` 表示跳过
     #[inline]
-    pub(crate) fn record_chunk(&mut self, bytes: u64) {
+    pub(crate) fn record_chunk(&mut self, bytes: u64) -> bool {
         // 第一次记录时初始化 worker 开始时间（用于计算整体平均速度）
         if self.worker_start_time.is_none() {
             self.worker_start_time = Some(std::time::Instant::now());
         }
 
-        // 原子增加字节数（使用 Relaxed 顺序，性能最佳）
         self.total_bytes += bytes;
-        let current_total = self.total_bytes;
-
-        // 自动采样逻辑由 SpeedCalculator 内部处理
-        self.speed_calculator.record_sample(current_total);
+        let sampled = self.speed_calculator.record_sample(self.total_bytes);
 
         // 同步到父级聚合器（如果存在）
         if let Some(parent) = &self.parent_aggregator {
             parent.record_chunk(bytes);
         }
+        sampled
     }
 
     /// 记录一个 range 完成
@@ -528,6 +509,7 @@ impl TaskStats {
     /// }
     /// ```
     #[inline]
+    #[allow(unused)]
     pub(crate) fn get_speed(&self) -> Option<DownloadSpeed> {
         let inner = self.aggregator.inner.read();
         let start_time = inner.speed_calculator.get_start_time()?;
@@ -538,27 +520,6 @@ impl TaskStats {
         } else {
             None
         }
-    }
-
-    /// 获取聚合实时速度
-    ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use hydra_dl::TaskStats;
-    ///
-    /// let parent = TaskStats::default();
-    /// if let Some(speed) = parent.get_instant_speed() {
-    ///     println!("实时速度: {}", speed);
-    /// }
-    /// ```
-    #[inline]
-    pub(crate) fn get_instant_speed(&self) -> Option<DownloadSpeed> {
-        self.aggregator.get_instant_speed()
     }
 
     /// 获取聚合窗口平均速度
@@ -582,18 +543,6 @@ impl TaskStats {
         self.aggregator.get_window_avg_speed()
     }
 
-    /// 获取聚合实时加速度
-    ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadAcceleration)` 如果加速度计算有效，否则返回 `None`
-    ///
-    /// 注意：需要至少3个采样点才能计算加速度
-    #[inline]
-    pub(crate) fn get_instant_acceleration(&self) -> Option<DownloadAcceleration> {
-        self.aggregator.get_instant_acceleration()
-    }
-
     /// 获取完整的聚合统计
     ///
     /// # Returns
@@ -612,23 +561,33 @@ impl TaskStats {
     /// }
     /// ```
     pub(crate) fn get_full_summary(&self) -> StatsSummary {
+        // 单次读锁获取所有统计数据
         let inner = self.aggregator.inner.read();
         let total_bytes = inner.total_bytes;
         let completed_ranges = inner.completed_ranges;
-        let elapsed_secs = inner
-            .speed_calculator
-            .get_start_time()
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+
+        let (elapsed_secs, avg_speed) =
+            if let Some(start_time) = inner.speed_calculator.get_start_time() {
+                let elapsed = start_time.elapsed();
+                let secs = elapsed.as_secs_f64();
+                let speed = if secs > 0.0 {
+                    Some(DownloadSpeed::new(total_bytes, elapsed))
+                } else {
+                    None
+                };
+                (secs, speed)
+            } else {
+                (0.0, None)
+            };
 
         StatsSummary {
             total_bytes,
             elapsed_secs,
             completed_ranges,
-            avg_speed: self.get_speed(),
-            instant_speed: self.get_instant_speed(),
-            window_avg_speed: self.get_window_avg_speed(),
-            instant_acceleration: self.get_instant_acceleration(),
+            avg_speed,
+            instant_speed: inner.speed_calculator.get_instant_speed(),
+            window_avg_speed: inner.speed_calculator.get_window_avg_speed(),
+            instant_acceleration: inner.speed_calculator.get_instant_acceleration(),
         }
     }
 }

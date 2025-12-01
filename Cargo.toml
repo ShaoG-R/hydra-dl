@@ -8,7 +8,7 @@ name = "hydra-dl"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.48.0", default-features = false }
+tokio = { version = "1.48.0", features = ["full"] }
 reqwest = { version = "0.12.24", features = ["stream"] }
 futures = "0.3"
 thiserror = "2.0.17"
@@ -22,7 +22,6 @@ urlencoding = "2.1"
 rustc-hash = "2.1.1"
 
 # 下面的crates是 hydra-dl 作者维护的
-kestrel-timer = "0.3.5"
 ranged-mmap = "0.2.0"
 deferred-map = "0.2.0"
 lite-sync = "0.1.7"

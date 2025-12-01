@@ -1,21 +1,19 @@
 use crate::DownloadError;
 use crate::download::DownloadTaskParams;
-use crate::pool::download::DownloadWorkerPool;
+use crate::pool::download::{DownloadWorkerPool, ExecutorResult};
 use crate::utils::io_traits::HttpClient;
 use crate::utils::writer::MmapWriter;
 use crate::{
     download::{
         progress_reporter::{ProgressReporter, ProgressReporterParams},
         progressive::{ProgressiveLauncher, ProgressiveLauncherParams, WorkerLaunchRequest},
-        task_allocator::{
-            CompletionResult, FailedRange, TaskAllocatorActor, TaskAllocatorHandle,
-            TaskAllocatorParams,
-        },
         worker_health_checker::{WorkerHealthChecker, WorkerHealthCheckerParams},
     },
     pool::download::DownloadWorkerHandle,
 };
-use log::{error, info};
+use futures::stream::{FuturesUnordered, StreamExt};
+use log::{error, info, warn};
+use ranged_mmap::AllocatedRange;
 use rustc_hash::FxHashMap;
 use smr_swap::SmrSwap;
 use std::path::PathBuf;
@@ -24,14 +22,12 @@ use tokio::sync::mpsc;
 
 /// 下载任务执行器
 ///
-/// 封装了下载任务的执行逻辑，使用辅助结构体管理任务分配和进度报告
+/// 封装了下载任务的执行逻辑，使用辅助结构体管理进度报告
 pub struct DownloadTask<C: HttpClient> {
     /// Worker 协程池
     pool: DownloadWorkerPool<C>,
     /// 文件写入器
     writer: MmapWriter,
-    /// 任务分配器句柄
-    task_allocator: TaskAllocatorHandle,
     /// 进度报告器
     progress_reporter: ProgressReporter,
     /// 下载配置
@@ -40,12 +36,16 @@ pub struct DownloadTask<C: HttpClient> {
     progressive_launcher: ProgressiveLauncher,
     /// Worker 启动请求接收器（由 progressive_launcher 发送）
     launch_request_rx: mpsc::Receiver<WorkerLaunchRequest>,
-    /// 任务完成通知接收器（由 task_allocator 发送）
-    completion_rx: tokio::sync::oneshot::Receiver<CompletionResult>,
+    /// Worker 结果接收器集合（每个 worker 一个 oneshot）
+    result_futures: FuturesUnordered<tokio::sync::oneshot::Receiver<ExecutorResult>>,
     /// Worker 句柄缓存（worker_id -> handle）
     worker_handles: SmrSwap<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 健康检查器（actor 模式）
     health_checker: WorkerHealthChecker,
+    /// 永久失败的 ranges
+    failed_ranges: Vec<(AllocatedRange, String)>,
+    /// 完成的 worker 数量
+    completed_workers: usize,
 }
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
@@ -59,7 +59,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             allocator,
             url,
             total_size,
-            timer_service,
             config,
         } = params;
 
@@ -84,13 +83,12 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             });
 
         // 创建健康检查器（actor 模式） - 偏移 50ms
-        let (health_checker, cancel_request_rx) =
-            WorkerHealthChecker::new(WorkerHealthCheckerParams {
-                config: Arc::clone(&config),
-                worker_handles: swap.local(),
-                check_interval: config.speed().instant_speed_window(),
-                start_offset: base_offset,
-            });
+        let health_checker = WorkerHealthChecker::new(WorkerHealthCheckerParams {
+            config: Arc::clone(&config),
+            worker_handles: swap.local(),
+            check_interval: config.speed().instant_speed_window(),
+            start_offset: base_offset,
+        });
 
         // 第一批 worker 数量
         let initial_worker_count = progressive_launcher.initial_worker_count();
@@ -98,10 +96,12 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         info!("初始启动 {} 个 workers", initial_worker_count);
 
         // 创建 DownloadWorkerPool（只启动第一批 worker）
-        let (pool, initial_handles, result_receiver) = DownloadWorkerPool::new(
+        let (pool, initial_handles, initial_result_rxs) = DownloadWorkerPool::new(
             client.clone(),
             initial_worker_count,
             writer.clone(),
+            allocator,
+            url.clone(),
             Arc::clone(&config),
             global_stats.clone(),
         );
@@ -123,86 +123,116 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             .collect();
         swap.store(initial_worker_handles);
 
-        // 创建并启动任务分配器 Actor
-        let (task_allocator_handle, completion_rx) = TaskAllocatorActor::new(TaskAllocatorParams {
-            allocator,
-            url,
-            timer_service,
-            result_rx: result_receiver,
-            cancel_rx: cancel_request_rx,
-            config: Arc::clone(&config),
-            worker_handles: swap.local(),
-        });
-
-        // 注册第一批 workers（会自动触发任务分配）
-        let worker_ids = {
-            let guard = swap.load();
-            guard.keys().cloned().collect()
-        };
-        task_allocator_handle.register_new_workers(worker_ids).await;
+        // 初始化 result_futures
+        let result_futures: FuturesUnordered<_> = initial_result_rxs.into_iter().collect();
 
         Self {
             pool,
             writer,
-            task_allocator: task_allocator_handle,
             progress_reporter,
             config,
             progressive_launcher,
             launch_request_rx,
-            completion_rx,
+            result_futures,
             worker_handles: swap,
             health_checker,
+            failed_ranges: Vec::new(),
+            completed_workers: 0,
         }
     }
 
     /// 等待所有 range 完成
     ///
-    /// 动态分配任务，支持失败重试
+    /// Worker 自主分配任务并重试，这里只监听结果
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
-    pub(super) async fn wait_for_completion(&mut self) -> crate::Result<Vec<FailedRange>> {
-        // 注意：任务分配已在注册 workers 时自动触发，这里直接进入事件循环
+    pub(super) async fn wait_for_completion(&mut self) -> crate::Result<Vec<(AllocatedRange, String)>> {
+        let total_workers = self.pool.worker_count() as usize;
+        info!("等待 {} 个 workers 完成", total_workers);
 
-        // 事件循环：分发各种事件到对应的处理器
-        let completion_result = loop {
+        // 事件循环：处理 worker 结果和启动请求
+        loop {
             tokio::select! {
+                // 处理 worker 启动请求
                 Some(request) = self.launch_request_rx.recv() => {
                     self.handle_launch_request(request).await;
                 },
-                result = &mut self.completion_rx => {
+                // 处理 worker 结果（从 FuturesUnordered 中获取）
+                Some(result) = self.result_futures.next() => {
                     match result {
-                        Ok(completion) => {
-                            info!("收到任务完成通知: {:?}", completion);
-                            break completion;
-                        },
+                        Ok(ExecutorResult::Success { worker_id }) => {
+                            info!("Worker #{} 完成任务", worker_id);
+                            self.completed_workers += 1;
+                            
+                            // 检查是否所有 worker 都完成了
+                            if self.completed_workers >= total_workers {
+                                info!("所有 {} 个 workers 已完成", total_workers);
+                                break;
+                            }
+                        }
+                        Ok(ExecutorResult::DownloadFailed { worker_id, failed_ranges }) => {
+                            // Worker 有任务永久失败
+                            for (range, error) in &failed_ranges {
+                                let (start, end) = range.as_range_tuple();
+                                error!(
+                                    "Worker #{} Range {}..{} 永久失败: {}",
+                                    worker_id, start, end, error
+                                );
+                            }
+                            self.failed_ranges.extend(failed_ranges);
+                            self.completed_workers += 1;
+                            
+                            // 检查是否所有 worker 都完成了
+                            if self.completed_workers >= total_workers {
+                                warn!("所有 workers 已完成，但有 {} 个永久失败", self.failed_ranges.len());
+                                break;
+                            }
+                        }
+                        Ok(ExecutorResult::WriteFailed { worker_id, range, error }) => {
+                            // 写入失败是致命错误，立即终止
+                            let (start, end) = range.as_range_tuple();
+                            error!(
+                                "Worker #{} Range {}..{} 写入失败: {}",
+                                worker_id, start, end, error
+                            );
+                            return Err(DownloadError::Other(format!("写入失败: {}", error)));
+                        }
                         Err(_) => {
-                            error!("完成通知 channel 已关闭");
-                            return Err(DownloadError::Other("TaskAllocator 异常终止".to_string()));
+                            // oneshot 通道被取消（worker 异常退出）
+                            warn!("Worker result channel cancelled");
+                            self.completed_workers += 1;
+                            
+                            if self.completed_workers >= total_workers {
+                                break;
+                            }
                         }
                     }
                 },
+                else => {
+                    error!("所有通道已关闭");
+                    break;
+                }
             }
-        };
+        }
 
-        // 根据完成结果返回相应的值
-        match completion_result {
-            CompletionResult::Success => Ok(Vec::new()),
-            CompletionResult::PermanentFailure { failures } => {
-                let error_details: Vec<String> = failures
-                    .iter()
-                    .map(|(range, error)| {
-                        let (start, end) = range.as_range_tuple();
-                        format!("range {}..{}: {}", start, end, error)
-                    })
-                    .collect();
+        // 返回失败的 ranges
+        if self.failed_ranges.is_empty() {
+            Ok(Vec::new())
+        } else {
+            let error_details: Vec<String> = self.failed_ranges
+                .iter()
+                .map(|(range, error)| {
+                    let (start, end) = range.as_range_tuple();
+                    format!("range {}..{}: {}", start, end, error)
+                })
+                .collect();
 
-                let error_msg = format!(
-                    "有 {} 个任务达到最大重试次数后失败:\n  {}",
-                    failures.len(),
-                    error_details.join("\n  ")
-                );
+            let error_msg = format!(
+                "有 {} 个任务达到最大重试次数后失败:\n  {}",
+                self.failed_ranges.len(),
+                error_details.join("\n  ")
+            );
 
-                Err(DownloadError::Other(error_msg))
-            }
+            Err(DownloadError::Other(error_msg))
         }
     }
 
@@ -235,9 +265,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 关闭 health checker actor 并等待其完全停止
         self.health_checker.shutdown_and_wait().await;
 
-        // 关闭 TaskAllocator Actor 并等待其完全停止
-        self.task_allocator.shutdown_and_wait().await;
-
         if let Some(msg) = error_msg {
             return Err(DownloadError::Other(msg));
         }
@@ -267,9 +294,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 关闭 health checker actor 并等待其完全停止
         self.health_checker.shutdown_and_wait().await;
-
-        // 关闭 TaskAllocator Actor 并等待其完全停止
-        self.task_allocator.shutdown_and_wait().await;
 
         // 完成写入
         self.writer.finalize()?;
@@ -335,25 +359,22 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             next_target
         );
 
-        // 动态添加新 worker，收集实际的 worker_id
-        let new_worker_ids: Vec<u64> = {
-            let new_handles = self.pool.add_workers(count);
-            let mut ids = Vec::new();
-            self.worker_handles.update(|handles| {
-                let mut handles = handles.clone();
-                for handle in new_handles {
-                    let worker_id = handle.worker_id();
-                    ids.push(worker_id);
-                    handles.insert(worker_id, handle);
-                }
-                handles
-            });
-            ids
-        };
+        // 动态添加新 worker，更新 worker_handles 和 result_futures
+        let (new_handles, new_result_rxs) = self.pool.add_workers(count);
+        self.worker_handles.update(|handles| {
+            let mut handles = handles.clone();
+            for handle in &new_handles {
+                let worker_id = handle.worker_id();
+                handles.insert(worker_id, handle.clone());
+            }
+            handles
+        });
 
-        // 为新启动的worker加入队列（使用实际的 worker_id）
-        self.task_allocator
-            .register_new_workers(new_worker_ids)
-            .await;
+        // 添加新的 result receivers 到 FuturesUnordered
+        for rx in new_result_rxs {
+            self.result_futures.push(rx);
+        }
+
+        // Worker 会自动从 allocator 分配任务并开始下载，无需额外操作
     }
 }

@@ -96,44 +96,40 @@ impl SpeedCalculator {
     /// # Arguments
     ///
     /// * `current_bytes` - 当前累计下载的总字节数
-    pub(crate) fn record_sample(&mut self, current_bytes: u64) {
+    ///
+    /// # Returns
+    ///
+    /// `true` 表示成功采样，`false` 表示跳过（未达到采样间隔）
+    #[inline]
+    pub(crate) fn record_sample(&mut self, current_bytes: u64) -> bool {
         // 第一次调用时初始化开始时间
         let start_time = *self.start_time.get_or_insert_with(Instant::now);
-
-        // 自动采样逻辑：根据配置的采样间隔记录采样点
         let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
 
-        // 数据一致性检查
+        // 检查是否需要采样（距离上次采样超过配置的采样间隔）
         if let Some(last_sample) = self.samples.back() {
-            // 1. 如果当前字节数小于上次记录的字节数，说明这是滞后的数据，直接丢弃
-            if current_bytes < last_sample.bytes {
-                return;
-            }
-
-            // 2. 检查是否需要采样（距离上次采样超过配置的采样间隔）
-            let last_sample_ns = last_sample.timestamp_ns.get();
-            if current_elapsed_ns.saturating_sub(last_sample_ns) < self.sample_interval_ns {
-                return;
+            if current_elapsed_ns.saturating_sub(last_sample.timestamp_ns.get())
+                < self.sample_interval_ns
+            {
+                return false;
             }
         }
 
-        let sample = Sample::new(current_elapsed_ns, current_bytes);
-
+        // 环形缓冲区：满时移除最旧的采样点
         if self.samples.len() >= self.max_samples {
             self.samples.pop_front();
         }
-        self.samples.push_back(sample);
+        self.samples
+            .push_back(Sample::new(current_elapsed_ns, current_bytes));
+        true
     }
 
-    /// 读取最近的有效采样点（保留纳秒精度）
-    fn read_recent_samples(&self) -> Vec<(i128, u64)> {
+    /// 采样点迭代器（保留纳秒精度）
+    #[inline]
+    fn iter_samples(&self) -> impl Iterator<Item = (i128, u64)> + '_ {
         self.samples
             .iter()
-            .map(|sample| {
-                let timestamp_ns = sample.timestamp_ns.get() as i128;
-                (timestamp_ns, sample.bytes)
-            })
-            .collect()
+            .map(|s| (s.timestamp_ns.get() as i128, s.bytes))
     }
 
     /// 使用 Theil-Sen 估计器进行鲁棒回归计算速度
@@ -180,8 +176,8 @@ impl SpeedCalculator {
             return None;
         }
 
-        // 计算所有点对的斜率
-        let mut speed_pairs = Vec::new();
+        // 计算所有点对的斜率，预分配容量 n*(n-1)/2
+        let mut speed_pairs = Vec::with_capacity(n * (n - 1) / 2);
 
         for i in 0..n {
             for j in (i + 1)..n {
@@ -233,25 +229,11 @@ impl SpeedCalculator {
     }
 
     /// 读取最近时间窗口内的采样点（保留纳秒精度）
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - 时间窗口
-    /// * `start_time` - 下载开始时间
-    ///
-    /// # Returns
-    ///
-    /// `Vec<(时间戳纳秒, 字节数)>`
     #[inline]
     fn read_samples_in_window(&self, window: Duration, start_time: Instant) -> Vec<(i128, u64)> {
-        let current_elapsed_ns = start_time.elapsed().as_nanos() as i128;
-        let window_start_ns = current_elapsed_ns - window.as_nanos() as i128;
-
-        let all_samples = self.read_recent_samples();
-
-        // 只保留时间窗口内的采样点
-        all_samples
-            .into_iter()
+        let window_start_ns =
+            start_time.elapsed().as_nanos() as i128 - window.as_nanos() as i128;
+        self.iter_samples()
             .filter(|(t, _)| *t >= window_start_ns)
             .collect()
     }

@@ -12,7 +12,6 @@ use rustc_hash::FxHashMap;
 use smr_swap::LocalReader;
 use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 /// 速度类型（字节/秒）
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
@@ -58,15 +57,6 @@ pub struct HealthCheckResult {
     pub health_baseline: Speed,
     /// 最大间隙值
     pub max_gap: Speed,
-}
-
-/// Worker 取消请求
-#[derive(Debug)]
-pub(super) struct WorkerCancelRequest {
-    /// Worker ID
-    pub worker_id: u64,
-    /// 取消原因
-    pub reason: String,
 }
 
 /// 健康检查器参数
@@ -284,19 +274,13 @@ struct WorkerHealthCheckerActor {
     shutdown_rx: lite::Receiver<()>,
     /// 单一写入者的 worker handles 持有者
     worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
-    /// Worker 取消请求发送器
-    cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
     /// 检查定时器（内部管理）
     check_timer: tokio::time::Interval,
 }
 
 impl WorkerHealthCheckerActor {
     /// 创建新的 actor
-    fn new(
-        params: WorkerHealthCheckerParams,
-        shutdown_rx: lite::Receiver<()>,
-        cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
-    ) -> Self {
+    fn new(params: WorkerHealthCheckerParams, shutdown_rx: lite::Receiver<()>) -> Self {
         let WorkerHealthCheckerParams {
             config,
             worker_handles,
@@ -320,7 +304,6 @@ impl WorkerHealthCheckerActor {
             config,
             shutdown_rx,
             worker_handles,
-            cancel_request_tx,
             check_timer,
         }
     }
@@ -400,7 +383,8 @@ impl WorkerHealthCheckerActor {
             return;
         };
 
-        // 发送取消请求
+        // 直接取消不健康的 worker 的当前下载
+        let handles = self.worker_handles.load();
         for (worker_id, speed) in result.unhealthy_workers {
             let reason = match self.logic.absolute_threshold {
                 Some(threshold) => format!(
@@ -422,9 +406,11 @@ impl WorkerHealthCheckerActor {
 
             warn!("检测到不健康的 Worker #{}: {}", worker_id, reason);
 
-            let request = WorkerCancelRequest { worker_id, reason };
-            if let Err(e) = self.cancel_request_tx.send(request).await {
-                warn!("发送 worker 取消请求失败: {:?}", e);
+            // 直接发送取消信号给 worker
+            if let Some(handle) = handles.get(&worker_id) {
+                if let Err(e) = handle.cancel_current_download() {
+                    warn!("Worker #{} 发送取消信号失败: {:?}", worker_id, e);
+                }
             }
         }
     }
@@ -442,27 +428,18 @@ pub(super) struct WorkerHealthChecker {
 
 impl WorkerHealthChecker {
     /// 创建新的健康检查器（启动 actor）
-    ///
-    /// 返回 `(Self, mpsc::Receiver<WorkerCancelRequest>)`，调用者需持有接收器
-    pub(super) fn new(
-        params: WorkerHealthCheckerParams,
-    ) -> (Self, mpsc::Receiver<WorkerCancelRequest>) {
+    pub(super) fn new(params: WorkerHealthCheckerParams) -> Self {
         let (shutdown_tx, shutdown_rx) = lite::channel();
-        let (cancel_request_tx, cancel_request_rx) = mpsc::channel(10);
 
         // 启动 actor 任务
         let actor_handle = tokio::spawn(async move {
-            WorkerHealthCheckerActor::new(params, shutdown_rx, cancel_request_tx)
-                .run()
-                .await;
+            WorkerHealthCheckerActor::new(params, shutdown_rx).run().await;
         });
 
-        let checker = Self {
+        Self {
             shutdown_tx,
             actor_handle: Some(actor_handle),
-        };
-
-        (checker, cancel_request_rx)
+        }
     }
 
     /// 关闭 actor 并等待其完全停止

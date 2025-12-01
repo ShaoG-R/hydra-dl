@@ -33,19 +33,15 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use hydra_dl::{DownloadConfig, DownloadProgress};
-//! use kestrel_timer::{TimerWheel, config::ServiceConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), hydra_dl::DownloadError> {
 //!     // 使用默认配置：4个worker，动态分块（2-50 MB）
 //!     let config = DownloadConfig::default();
-//!     let timer = TimerWheel::with_defaults();
-//!     let timer_service = timer.create_service(ServiceConfig::default());
 //!     let (mut handle, save_path) = hydra_dl::download_ranged(
 //!         "https://example.com/large_file.zip",
 //!         PathBuf::from("."),  // 保存到当前目录
 //!         config,
-//!         timer_service
 //!     ).await?;
 //!
 //!     println!("文件将保存到: {:?}", save_path);
@@ -88,7 +84,6 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use hydra_dl::{DownloadConfig, DownloadProgress, constants::*};
-//! use kestrel_timer::{TimerWheel, config::ServiceConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), hydra_dl::DownloadError> {
@@ -101,13 +96,10 @@
 //!             .max_size(100 * MB))                    // 最大 100 MB（高速时）
 //!         .build();
 //!     
-//!     let timer = TimerWheel::with_defaults();
-//!     let timer_service = timer.create_service(ServiceConfig::default());
 //!     let (handle, save_path) = hydra_dl::download_ranged(
 //!         "https://example.com/large_file.zip",
 //!         PathBuf::from("."),
 //!         config,
-//!         timer_service
 //!     ).await?;
 //!
 //!     println!("文件将保存到: {:?}", save_path);
@@ -180,9 +172,6 @@ pub use config::{
 pub use download::{DownloadHandle, DownloadProgress, WorkerStatSnapshot, download_ranged};
 pub use task::FileTask;
 pub use utils::fetch::{FileMetadata, fetch_file_metadata};
-pub mod timer {
-    pub use kestrel_timer::{TimerService, TimerWheel, config::ServiceConfig};
-}
 
 use std::path::Path;
 

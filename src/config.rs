@@ -81,10 +81,11 @@ impl ProgressiveDefaults {
 pub struct RetryDefaults;
 
 impl RetryDefaults {
-    /// 最大重试次数：3 次
-    pub const MAX_RETRY_COUNT: usize = 3;
-    /// 重试延迟序列：[1s, 2s, 3s]
-    pub const RETRY_DELAYS_SECS: &'static [u64] = &[1, 2, 3];
+    /// 重试延迟序列：等待 n 个任务完成后重试
+    /// [1, 2, 4] 表示第一次重试等待1个任务完成，第二次等待2个，第三次等待4个
+    pub const RETRY_TASK_COUNTS: &'static [u64] = &[1, 2, 4];
+    /// 无新任务时的等待重试延迟（毫秒）
+    pub const RETRY_DELAY_MILLIS: u64 = 1000;
 }
 
 /// 健康检查配置常量
@@ -353,35 +354,68 @@ impl ProgressiveConfig {
 /// 重试配置
 ///
 /// 控制失败任务的重试策略
+/// 
+/// # 重试机制
+/// 
+/// 当任务失败时，根据 `retry_task_counts` 计算下一次重试的时机：
+/// - 等待指定数量的其他任务完成后自动重试
+/// - 如果没有新任务可执行，则等待 `retry_delay` 后重试
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
-    /// 最大重试次数
-    pub max_retry_count: usize,
-    /// 重试延迟序列
-    pub retry_delays: Vec<Duration>,
+    /// 重试任务数序列：等待 n 个任务完成后重试
+    /// 例如 [1, 2, 4] 表示：
+    /// - 第1次失败后，等待1个任务完成后重试
+    /// - 第2次失败后，等待2个任务完成后重试
+    /// - 第3次失败后，等待4个任务完成后重试
+    pub retry_task_counts: Vec<u64>,
+    /// 无新任务时的等待重试延迟
+    pub retry_delay: Duration,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retry_count: RetryDefaults::MAX_RETRY_COUNT,
-            retry_delays: RetryDefaults::RETRY_DELAYS_SECS
-                .iter()
-                .map(|&secs| Duration::from_secs(secs))
-                .collect(),
+            retry_task_counts: RetryDefaults::RETRY_TASK_COUNTS.to_vec(),
+            retry_delay: Duration::from_millis(RetryDefaults::RETRY_DELAY_MILLIS),
         }
     }
 }
 
 impl RetryConfig {
+    /// 获取最大重试次数
     #[inline]
     pub fn max_retry_count(&self) -> usize {
-        self.max_retry_count
+        self.retry_task_counts.len()
     }
 
+    /// 获取重试任务数序列
     #[inline]
-    pub fn retry_delays(&self) -> &[Duration] {
-        &self.retry_delays
+    pub fn retry_task_counts(&self) -> &[u64] {
+        &self.retry_task_counts
+    }
+
+    /// 获取指定重试次数对应的等待任务数
+    /// 
+    /// # Arguments
+    /// 
+    /// - `retry_count`: 当前重试次数（从0开始）
+    /// 
+    /// # Returns
+    /// 
+    /// 返回需要等待的任务数，如果超出序列长度则返回最后一个值
+    #[inline]
+    pub fn get_wait_task_count(&self, retry_count: usize) -> u64 {
+        self.retry_task_counts
+            .get(retry_count)
+            .or_else(|| self.retry_task_counts.last())
+            .copied()
+            .unwrap_or(1)
+    }
+
+    /// 获取无新任务时的等待重试延迟
+    #[inline]
+    pub fn retry_delay(&self) -> Duration {
+        self.retry_delay
     }
 }
 
@@ -824,47 +858,42 @@ impl Default for ProgressiveConfigBuilder {
 /// 重试配置构建器
 #[derive(Debug, Clone)]
 pub struct RetryConfigBuilder {
-    max_retry_count: usize,
-    retry_delays: Vec<Duration>,
+    retry_task_counts: Vec<u64>,
+    retry_delay: Duration,
 }
 
 impl RetryConfigBuilder {
     /// 创建新的重试配置构建器（使用默认值）
     pub fn new() -> Self {
         Self {
-            max_retry_count: RetryDefaults::MAX_RETRY_COUNT,
-            retry_delays: RetryDefaults::RETRY_DELAYS_SECS
-                .iter()
-                .map(|&secs| Duration::from_secs(secs))
-                .collect(),
+            retry_task_counts: RetryDefaults::RETRY_TASK_COUNTS.to_vec(),
+            retry_delay: Duration::from_millis(RetryDefaults::RETRY_DELAY_MILLIS),
         }
     }
 
-    /// 设置最大重试次数
-    pub fn max_retry_count(mut self, count: usize) -> Self {
-        self.max_retry_count = count;
+    /// 设置重试任务数序列
+    /// 
+    /// 序列中的每个元素表示第 n 次重试需要等待的任务完成数
+    pub fn retry_task_counts(mut self, counts: Vec<u64>) -> Self {
+        if counts.is_empty() {
+            self.retry_task_counts = RetryDefaults::RETRY_TASK_COUNTS.to_vec();
+        } else {
+            self.retry_task_counts = counts;
+        }
         self
     }
 
-    /// 设置重试延迟序列
-    pub fn retry_delays(mut self, delays: Vec<Duration>) -> Self {
-        if delays.is_empty() {
-            // 使用默认延迟序列
-            self.retry_delays = RetryDefaults::RETRY_DELAYS_SECS
-                .iter()
-                .map(|&secs| Duration::from_secs(secs))
-                .collect();
-        } else {
-            self.retry_delays = delays;
-        }
+    /// 设置无新任务时的等待重试延迟
+    pub fn retry_delay(mut self, delay: Duration) -> Self {
+        self.retry_delay = delay;
         self
     }
 
     /// 构建重试配置
     pub fn build(self) -> RetryConfig {
         RetryConfig {
-            max_retry_count: self.max_retry_count,
-            retry_delays: self.retry_delays,
+            retry_task_counts: self.retry_task_counts,
+            retry_delay: self.retry_delay,
         }
     }
 }
@@ -1095,8 +1124,11 @@ impl DownloadConfigBuilder {
     ///
     /// ```
     /// # use hydra_dl::DownloadConfig;
+    /// # use std::time::Duration;
     /// let config = DownloadConfig::builder()
-    ///     .retry(|r| r.max_retry_count(5))
+    ///     .retry(|r| r
+    ///         .retry_task_counts(vec![1, 2, 4, 8])  // 第n次重试等待的任务数
+    ///         .retry_delay(Duration::from_millis(500)))  // 无新任务时的等待延迟
     ///     .build();
     /// ```
     pub fn retry<F>(mut self, f: F) -> Self
@@ -1104,8 +1136,8 @@ impl DownloadConfigBuilder {
         F: FnOnce(RetryConfigBuilder) -> RetryConfigBuilder,
     {
         let builder = RetryConfigBuilder {
-            max_retry_count: self.retry.max_retry_count,
-            retry_delays: self.retry.retry_delays.clone(),
+            retry_task_counts: self.retry.retry_task_counts.clone(),
+            retry_delay: self.retry.retry_delay,
         };
         self.retry = f(builder).build();
         self
@@ -1336,43 +1368,53 @@ mod tests {
     fn test_retry_config() {
         let config = DownloadConfig::builder()
             .retry(|r| {
-                r.max_retry_count(5).retry_delays(vec![
-                    Duration::from_secs(1),
-                    Duration::from_secs(2),
-                    Duration::from_secs(5),
-                ])
+                r.retry_task_counts(vec![1, 3, 5])
+                    .retry_delay(Duration::from_secs(2))
             })
             .build();
 
-        assert_eq!(config.retry().max_retry_count(), 5);
-        assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
-        assert_eq!(config.retry().retry_delays()[1], Duration::from_secs(2));
-        assert_eq!(config.retry().retry_delays()[2], Duration::from_secs(5));
+        assert_eq!(config.retry().max_retry_count(), 3);
+        assert_eq!(config.retry().retry_task_counts().len(), 3);
+        assert_eq!(config.retry().retry_task_counts()[0], 1);
+        assert_eq!(config.retry().retry_task_counts()[1], 3);
+        assert_eq!(config.retry().retry_task_counts()[2], 5);
+        assert_eq!(config.retry().retry_delay(), Duration::from_secs(2));
     }
 
     #[test]
     fn test_retry_config_default() {
         let config = DownloadConfig::default();
 
-        assert_eq!(
-            config.retry().max_retry_count(),
-            RetryDefaults::MAX_RETRY_COUNT
-        );
-        assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
-        assert_eq!(config.retry().retry_delays()[1], Duration::from_secs(2));
-        assert_eq!(config.retry().retry_delays()[2], Duration::from_secs(3));
+        assert_eq!(config.retry().max_retry_count(), 3);
+        assert_eq!(config.retry().retry_task_counts().len(), 3);
+        assert_eq!(config.retry().retry_task_counts()[0], 1);
+        assert_eq!(config.retry().retry_task_counts()[1], 2);
+        assert_eq!(config.retry().retry_task_counts()[2], 4);
+        assert_eq!(config.retry().retry_delay(), Duration::from_millis(1000));
     }
 
     #[test]
-    fn test_retry_delays_empty_uses_default() {
+    fn test_retry_task_counts_empty_uses_default() {
         let config = DownloadConfig::builder()
-            .retry(|r| r.retry_delays(vec![]))
+            .retry(|r| r.retry_task_counts(vec![]))
             .build();
 
-        assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(config.retry().retry_delays()[0], Duration::from_secs(1));
+        assert_eq!(config.retry().retry_task_counts().len(), 3);
+        assert_eq!(config.retry().retry_task_counts()[0], 1);
+    }
+
+    #[test]
+    fn test_retry_get_wait_task_count() {
+        let config = DownloadConfig::builder()
+            .retry(|r| r.retry_task_counts(vec![1, 2, 4]))
+            .build();
+
+        assert_eq!(config.retry().get_wait_task_count(0), 1);
+        assert_eq!(config.retry().get_wait_task_count(1), 2);
+        assert_eq!(config.retry().get_wait_task_count(2), 4);
+        // 超出范围时返回最后一个值
+        assert_eq!(config.retry().get_wait_task_count(3), 4);
+        assert_eq!(config.retry().get_wait_task_count(100), 4);
     }
 
     #[test]

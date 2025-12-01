@@ -5,7 +5,6 @@ use super::utils::format_bytes;
 use super::{Cli, Result};
 use crate::cli::LogController;
 use crate::{DownloadConfig, download_ranged};
-use kestrel_timer::{TimerWheel, config::ServiceConfig};
 
 /// 执行下载任务
 ///
@@ -27,9 +26,6 @@ pub async fn execute_download(
 
     let size_standard = config.speed().size_standard();
 
-    let timer = TimerWheel::with_defaults();
-    let timer_service = timer.create_service(ServiceConfig::default());
-
     info!("开始下载: {}", cli.url);
     info!(
         "配置: {} workers, 分块大小: {} ~ {} (初始: {})",
@@ -41,7 +37,7 @@ pub async fn execute_download(
 
     // 启动下载任务（会自动检测文件名）
     let (mut handle, save_path) =
-        download_ranged(&cli.url, save_dir, config, timer_service).await?;
+        download_ranged(&cli.url, save_dir, config).await?;
 
     match logger_ctrl {
         Some(logger_ctrl) if !cli.quiet => {

@@ -1,9 +1,8 @@
 use crate::utils::io_traits::HttpClient;
 use crate::utils::writer::MmapWriter;
 use crate::{DownloadError, Result};
-use kestrel_timer::TimerService;
 use log::{info, warn};
-use ranged_mmap::allocator::sequential::Allocator as RangeAllocator;
+use ranged_mmap::allocator::concurrent::Allocator as RangeAllocator;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use tokio::task::JoinHandle;
 mod progress_reporter;
 mod progressive;
 pub mod task;
-mod task_allocator;
 mod worker_health_checker;
 
 pub use progress_reporter::{DownloadProgress, WorkerStatSnapshot};
@@ -52,14 +50,11 @@ impl DownloadHandle {
     ///
     /// ```no_run
     /// # use hydra_dl::{download_ranged, DownloadProgress, DownloadConfig};
-    /// # use kestrel_timer::{TimerWheel, config::ServiceConfig};
     /// # use std::path::PathBuf;
     /// # #[tokio::main]
     /// # async fn main() {
     /// let config = DownloadConfig::default();
-    /// let timer = TimerWheel::with_defaults();
-    /// let timer_service = timer.create_service(ServiceConfig::default());
-    /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config, timer_service).await.unwrap();
+    /// let (mut handle, save_path) = download_ranged("http://example.com/file", PathBuf::from("."), config).await.unwrap();
     ///
     /// while let Some(progress) = handle.progress_receiver().recv().await {
     ///     match progress {
@@ -139,8 +134,6 @@ pub struct DownloadTaskParams<C: HttpClient> {
     url: String,
     /// 文件总大小（字节）
     total_size: NonZeroU64,
-    /// 定时器服务
-    timer_service: TimerService,
     /// 下载配置
     config: Arc<crate::config::DownloadConfig>,
 }
@@ -161,7 +154,6 @@ async fn download_ranged_generic<C>(
     save_path: PathBuf,
     config: &crate::config::DownloadConfig,
     progress_sender: Option<Sender<DownloadProgress>>,
-    timer_service: TimerService,
 ) -> Result<()>
 where
     C: HttpClient + Clone + Send + 'static,
@@ -220,7 +212,6 @@ where
         allocator,
         url: url.to_string(),
         total_size: content_length,
-        timer_service,
         config: Arc::clone(&config),
     })
     .await;
@@ -281,19 +272,15 @@ where
 ///
 /// ```no_run
 /// # use hydra_dl::{download_ranged, DownloadConfig, DownloadProgress};
-/// # use hydra_dl::timer::{TimerWheel, TimerService, ServiceConfig};
 /// # use std::path::PathBuf;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), hydra_dl::DownloadError> {
 /// // 使用默认配置（推荐）
 /// let config = DownloadConfig::default();
-/// let timer = TimerWheel::with_defaults();
-/// let service = timer.create_service(ServiceConfig::default());
 /// let (mut handle, save_path) = download_ranged(
 ///     "http://example.com/file.bin",
 ///     PathBuf::from("."),  // 保存到当前目录
 ///     config,
-///     service,
 /// ).await?;
 ///
 /// println!("文件将保存到: {:?}", save_path);
@@ -326,7 +313,6 @@ pub async fn download_ranged(
     url: &str,
     save_dir: impl AsRef<std::path::Path>,
     config: crate::config::DownloadConfig,
-    timer_service: TimerService,
 ) -> Result<(DownloadHandle, std::path::PathBuf)> {
     use reqwest::Client;
 
@@ -366,7 +352,6 @@ pub async fn download_ranged(
             save_path_clone,
             &config,
             Some(progress_tx),
-            timer_service,
         )
         .await
     });
@@ -385,18 +370,10 @@ mod tests {
     use super::*;
     use crate::utils::io_traits::mock::MockHttpClient;
     use bytes::Bytes;
-    use kestrel_timer::{TimerWheel, config::ServiceConfig};
     use reqwest::{StatusCode, header::HeaderMap};
-
-    fn create_timer_service() -> (TimerWheel, TimerService) {
-        let timer = TimerWheel::with_defaults();
-        let service = timer.create_service(ServiceConfig::default());
-        (timer, service)
-    }
 
     #[tokio::test]
     async fn test_download_ranged_basic() {
-        let (_timer, timer_service) = create_timer_service();
 
         let test_url = "http://example.com/file.bin";
         // 使用 12KB 文件以适应 4K 对齐的分配器
@@ -460,7 +437,6 @@ mod tests {
             save_path.clone(),
             &config,
             None, // 测试中不需要进度更新
-            timer_service,
         )
         .await;
 
@@ -474,7 +450,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_ranged_fallback_to_normal() {
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data = b"Test data without range support";
         let temp_dir = tempfile::tempdir().unwrap();
@@ -520,7 +495,6 @@ mod tests {
             save_path.clone(),
             &config,
             None, // 测试中不需要进度更新
-            timer_service,
         )
         .await;
 
@@ -542,7 +516,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_ranged_multiple_workers() {
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         // 使用 16KB 文件以适应 4K 对齐
         let test_data: Vec<u8> = (0..16384u32).map(|i| (i % 256) as u8).collect();
@@ -600,7 +573,6 @@ mod tests {
             save_path.clone(),
             &config,
             None, // 测试中不需要进度更新
-            timer_service,
         )
         .await;
 
@@ -610,7 +582,6 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_chunking_small_file() {
         // 测试小文件（< 2MB）自动调整为 1 个分块
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/small_file.bin";
         let test_data: Vec<u8> = vec![0; 1024 * 1024]; // 1 MB 文件
         let temp_dir = tempfile::tempdir().unwrap();
@@ -660,7 +631,6 @@ mod tests {
             save_path.clone(),
             &config,
             None,
-            timer_service,
         )
         .await;
 
@@ -670,7 +640,6 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_chunking_medium_file() {
         // 测试中等文件正确计算分块数
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/medium_file.bin";
         let file_size = 10 * 1024 * 1024; // 10 MB 文件
         let test_data: Vec<u8> = vec![0; file_size];
@@ -731,7 +700,6 @@ mod tests {
             save_path.clone(),
             &config,
             None,
-            timer_service,
         )
         .await;
 
@@ -741,7 +709,6 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_chunking_large_file() {
         // 测试大文件不受最小分块限制影响
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/large_file.bin";
         let file_size = 100 * 1024 * 1024; // 100 MB 文件
         let temp_dir = tempfile::tempdir().unwrap();
@@ -801,7 +768,6 @@ mod tests {
             save_path.clone(),
             &config,
             None,
-            timer_service,
         )
         .await;
 
@@ -811,7 +777,6 @@ mod tests {
     #[tokio::test]
     async fn test_progressive_worker_launch() {
         // 测试渐进式启动配置
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         // 使用 16KB 文件以适应 4K 对齐
         let test_data: Vec<u8> = (0..16384u32).map(|i| (i % 256) as u8).collect();
@@ -873,7 +838,6 @@ mod tests {
             save_path.clone(),
             &config,
             None,
-            timer_service,
         )
         .await;
 
@@ -907,28 +871,17 @@ mod tests {
         // 测试重试配置的正确性
         let config = crate::config::DownloadConfig::builder()
             .retry(|r| {
-                r.max_retry_count(5).retry_delays(vec![
-                    std::time::Duration::from_secs(1),
-                    std::time::Duration::from_secs(2),
-                    std::time::Duration::from_secs(5),
-                ])
+                r.retry_task_counts(vec![1, 3, 5])
+                    .retry_delay(std::time::Duration::from_secs(2))
             })
             .build();
 
-        assert_eq!(config.retry().max_retry_count(), 5);
-        assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(
-            config.retry().retry_delays()[0],
-            std::time::Duration::from_secs(1)
-        );
-        assert_eq!(
-            config.retry().retry_delays()[1],
-            std::time::Duration::from_secs(2)
-        );
-        assert_eq!(
-            config.retry().retry_delays()[2],
-            std::time::Duration::from_secs(5)
-        );
+        assert_eq!(config.retry().max_retry_count(), 3);
+        assert_eq!(config.retry().retry_task_counts().len(), 3);
+        assert_eq!(config.retry().retry_task_counts()[0], 1);
+        assert_eq!(config.retry().retry_task_counts()[1], 3);
+        assert_eq!(config.retry().retry_task_counts()[2], 5);
+        assert_eq!(config.retry().retry_delay(), std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -937,39 +890,27 @@ mod tests {
         let config = crate::config::DownloadConfig::default();
 
         assert_eq!(config.retry().max_retry_count(), 3);
-        assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(
-            config.retry().retry_delays()[0],
-            std::time::Duration::from_secs(1)
-        );
-        assert_eq!(
-            config.retry().retry_delays()[1],
-            std::time::Duration::from_secs(2)
-        );
-        assert_eq!(
-            config.retry().retry_delays()[2],
-            std::time::Duration::from_secs(3)
-        );
+        assert_eq!(config.retry().retry_task_counts().len(), 3);
+        assert_eq!(config.retry().retry_task_counts()[0], 1);
+        assert_eq!(config.retry().retry_task_counts()[1], 2);
+        assert_eq!(config.retry().retry_task_counts()[2], 4);
+        assert_eq!(config.retry().retry_delay(), std::time::Duration::from_millis(1000));
     }
 
     #[test]
-    fn test_retry_delays_empty_uses_default() {
-        // 测试空延迟序列使用默认值
+    fn test_retry_task_counts_empty_uses_default() {
+        // 测试空任务数序列使用默认值
         let config = crate::config::DownloadConfig::builder()
-            .retry(|r| r.retry_delays(vec![]))
+            .retry(|r| r.retry_task_counts(vec![]))
             .build();
 
-        assert_eq!(config.retry().retry_delays().len(), 3);
-        assert_eq!(
-            config.retry().retry_delays()[0],
-            std::time::Duration::from_secs(1)
-        );
+        assert_eq!(config.retry().retry_task_counts().len(), 3);
+        assert_eq!(config.retry().retry_task_counts()[0], 1);
     }
 
     #[tokio::test]
     async fn test_download_with_retry_success() {
         // 测试失败任务重试成功
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         // 使用 8KB 文件以适应 4K 对齐
         let test_data: Vec<u8> = (0..8192u32).map(|i| (i % 256) as u8).collect();
@@ -1036,7 +977,7 @@ mod tests {
             }
         }
 
-        // 配置：1 个 worker，最大重试 3 次，快速重试（100ms）
+        // 配置：1 个 worker，最大重试 3 次
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(1))
             .chunk(|c| {
@@ -1045,11 +986,8 @@ mod tests {
                     .max_size(chunk_size as u64)
             })
             .retry(|r| {
-                r.max_retry_count(3).retry_delays(vec![
-                    std::time::Duration::from_millis(100),
-                    std::time::Duration::from_millis(200),
-                    std::time::Duration::from_millis(300),
-                ])
+                r.retry_task_counts(vec![1, 2, 3])
+                    .retry_delay(std::time::Duration::from_millis(100))
             })
             .build();
 
@@ -1059,7 +997,6 @@ mod tests {
             save_path.clone(),
             &config,
             None,
-            timer_service,
         )
         .await;
 
@@ -1069,7 +1006,6 @@ mod tests {
     #[tokio::test]
     async fn test_download_with_retry_permanent_failure() {
         // 测试达到最大重试次数后失败
-        let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1130,7 +1066,7 @@ mod tests {
             }
         }
 
-        // 配置：1 个 worker，最大重试 2 次，快速重试（50ms）
+        // 配置：1 个 worker，最大重试 2 次
         let config = crate::config::DownloadConfig::builder()
             .concurrency(|c| c.worker_count(1))
             .chunk(|c| {
@@ -1139,10 +1075,8 @@ mod tests {
                     .max_size(chunk_size as u64)
             })
             .retry(|r| {
-                r.max_retry_count(2).retry_delays(vec![
-                    std::time::Duration::from_millis(50),
-                    std::time::Duration::from_millis(50),
-                ])
+                r.retry_task_counts(vec![1, 2])
+                    .retry_delay(std::time::Duration::from_millis(50))
             })
             .build();
 
@@ -1152,7 +1086,6 @@ mod tests {
             save_path.clone(),
             &config,
             None,
-            timer_service,
         )
         .await;
 
@@ -1167,39 +1100,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retry_delay_sequence() {
-        // 测试重试延迟序列正确使用
+    async fn test_retry_task_count_sequence() {
+        // 测试重试任务数序列正确使用
         let config = crate::config::DownloadConfig::builder()
-            .retry(|r| {
-                r.max_retry_count(5).retry_delays(vec![
-                    std::time::Duration::from_secs(1),
-                    std::time::Duration::from_secs(2),
-                ])
-            })
+            .retry(|r| r.retry_task_counts(vec![1, 3]))
             .build();
 
-        let delays = config.retry().retry_delays();
+        // 第 0 次重试等待 1 个任务完成
+        assert_eq!(config.retry().get_wait_task_count(0), 1);
 
-        // 第 0 次重试使用第一个延迟
-        assert_eq!(
-            delays[0.min(delays.len() - 1)],
-            std::time::Duration::from_secs(1)
-        );
+        // 第 1 次重试等待 3 个任务完成
+        assert_eq!(config.retry().get_wait_task_count(1), 3);
 
-        // 第 1 次重试使用第二个延迟
-        assert_eq!(
-            delays[1.min(delays.len() - 1)],
-            std::time::Duration::from_secs(2)
-        );
-
-        // 第 2 次及以后重试使用最后一个延迟
-        assert_eq!(
-            delays[2.min(delays.len() - 1)],
-            std::time::Duration::from_secs(2)
-        );
-        assert_eq!(
-            delays[10.min(delays.len() - 1)],
-            std::time::Duration::from_secs(2)
-        );
+        // 第 2 次及以后重试使用最后一个值
+        assert_eq!(config.retry().get_wait_task_count(2), 3);
+        assert_eq!(config.retry().get_wait_task_count(10), 3);
     }
 }
