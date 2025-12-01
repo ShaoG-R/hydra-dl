@@ -4,14 +4,18 @@
 //!
 //! # 核心组件
 //!
-//! - **DownloadWorkerContext**: 下载 worker 的上下文，包含统计和分块策略
-//! - **DownloadWorkerExecutor**: 下载任务执行器，处理 Range 下载和文件写入
+//! - **DownloadWorkerContext**: 下载 worker 的上下文，包含分块策略
+//! - **DownloadWorkerFactory**: 下载任务工厂，处理 Range 下载和文件写入
 //! - **DownloadWorkerPool**: 下载协程池，封装通用 WorkerPool 并提供下载特定方法
+//!
+//! # 设计说明
+//!
+//! 此模块包含所有下载特定的类型（Task、Result、Context、Stats）。
+//! 通用协程池 (common.rs) 仅负责协程生命周期管理。
 
-use super::common::{WorkerContext, WorkerExecutor, WorkerPool, WorkerResult, WorkerTask};
+use super::common::{WorkerFactory, WorkerPool};
 use crate::Result;
-use crate::pool::common::WorkerHandle;
-use crate::task::{RangeResult, WorkerTask as RangeTask};
+use crate::{DownloadError, task::{RangeResult, WorkerTask as RangeTask}};
 use crate::utils::{
     chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy},
     fetch::{FetchRangeResult, RangeFetcher},
@@ -19,45 +23,55 @@ use crate::utils::{
     stats::{TaskStats, WorkerStats},
     writer::MmapWriter,
 };
-use async_trait::async_trait;
 use lite_sync::oneshot::lite;
 use log::{debug, error, info};
 use net_bytes::{DownloadSpeed, FormattedValue, SizeStandard};
-use smr_swap::{ReadGuard, SmrSwap};
+use smr_swap::{LocalReader, ReadGuard, SmrSwap};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinHandle;
 
 use std::sync::Arc;
-
-// ==================== Task 和 Result 实现 ====================
-
-impl WorkerTask for RangeTask {}
-
-impl WorkerResult for RangeResult {}
-
-impl super::common::WorkerStats for WorkerStats {}
 
 // ==================== 下载 Worker 上下文 ====================
 
 /// 下载 Worker 的上下文
 ///
-/// 包含每个 worker 独立的分块策略（统计信息已移至 Stats）
+/// 包含每个 worker 独立的分块策略。
+/// 只由主下载协程持有，其他辅助协程不需要访问。
 pub(crate) struct DownloadWorkerContext {
-    /// 该 worker 的独立分块策略（ChunkStrategy 内部使用原子操作，无需外部锁）
-    pub(crate) chunk_strategy: Box<dyn ChunkStrategy>,
+    /// 该 worker 的独立分块策略
+    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send + Sync>,
 }
 
-impl WorkerContext for DownloadWorkerContext {}
+// ==================== Worker 输入参数 ====================
 
-// ==================== 下载任务执行器 ====================
-
-/// 下载任务执行器
+/// 下载 Worker 的输入参数
 ///
-/// 实现 WorkerExecutor trait，定义了如何执行 Range 下载任务
+/// 包含 spawn_worker 所需的所有下载特定数据
+pub(crate) struct DownloadWorkerInput {
+    /// 上下文（分块策略等）
+    pub(crate) context: DownloadWorkerContext,
+    /// 统计数据（SmrSwap 包装）
+    pub(crate) stats: SmrSwap<WorkerStats>,
+    /// 任务接收通道
+    pub(crate) task_rx: Receiver<RangeTask>,
+    /// 结果发送通道
+    pub(crate) result_tx: Sender<RangeResult>,
+}
+
+// ==================== 下载任务工厂 ====================
+
+/// 下载任务工厂
+///
+/// 实现 WorkerFactory trait，采用 Composite Worker 模式。
+/// 目前包含：
+/// - 协程 0: 主下载循环 (接收任务 -> HTTP请求 -> 写入)
 ///
 /// # 泛型参数
 ///
 /// - `C`: HTTP 客户端类型
 #[derive(Clone)]
-pub(crate) struct DownloadWorkerExecutor<C> {
+pub(crate) struct DownloadWorkerFactory<C> {
     /// HTTP 客户端
     client: C,
     /// 共享的文件写入器
@@ -66,15 +80,13 @@ pub(crate) struct DownloadWorkerExecutor<C> {
     size_standard: SizeStandard,
 }
 
-impl<C> DownloadWorkerExecutor<C> {
-    /// 创建新的下载任务执行器
-    ///
-    /// # Arguments
-    ///
-    /// - `client`: HTTP 客户端
-    /// - `writer`: 共享的文件写入器
-    /// - `size_standard`: 文件大小标准
-    pub(crate) fn new(client: C, writer: MmapWriter, size_standard: SizeStandard) -> Self {
+impl<C> DownloadWorkerFactory<C> {
+    /// 创建新的下载任务工厂
+    pub(crate) fn new(
+        client: C,
+        writer: MmapWriter,
+        size_standard: SizeStandard,
+    ) -> Self {
         Self {
             client,
             writer,
@@ -83,28 +95,82 @@ impl<C> DownloadWorkerExecutor<C> {
     }
 }
 
-#[async_trait]
-impl<C> WorkerExecutor for DownloadWorkerExecutor<C>
+impl<C> WorkerFactory for DownloadWorkerFactory<C>
 where
     C: HttpClient,
 {
-    type Task = RangeTask;
-    type Result = RangeResult;
-    type Context = DownloadWorkerContext;
-    type Stats = WorkerStats;
+    type Input = DownloadWorkerInput;
+    
+    /// 启动 Worker 协程组
+    fn spawn_worker(
+        &self,
+        worker_id: u64,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        input: Self::Input,
+    ) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::new();
 
-    async fn execute(
+        // --- 协程 0: 主下载循环 ---
+        let mut executor = self.clone();
+
+        let DownloadWorkerInput {
+            context,
+            stats,
+            task_rx,
+            result_tx,
+        } = input;
+
+        let main_handle = tokio::spawn(async move {
+            let mut context = context;
+            let mut stats = stats;
+            let mut task_rx = task_rx;
+
+            debug!("Worker #{} 主循环启动", worker_id);
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        info!("Worker #{} 收到关闭信号，主循环退出", worker_id);
+                        break;
+                    }
+                    Some(task) = task_rx.recv() => {
+                        let result = executor.execute_task(worker_id, task, &mut context, &mut stats).await;
+                        if let Err(e) = result_tx.send(result).await {
+                            error!("Worker #{} 发送结果失败: {:?}", worker_id, e);
+                        }
+                    }
+                    else => {
+                        debug!("Worker #{} 任务通道关闭，退出", worker_id);
+                        break;
+                    }
+                }
+            }
+        });
+
+        handles.push(main_handle);
+
+        // --- 协程 1+: 辅助协程 (暂未实现，预留位置) ---
+
+        handles
+    }
+}
+
+// ==================== 辅助方法 ====================
+
+impl<C: HttpClient> DownloadWorkerFactory<C> {
+    /// 核心业务逻辑：执行单个 Range 下载任务
+    ///
+    /// 这个方法对应原本的 `execute`，现在被主循环调用
+    async fn execute_task(
         &mut self,
         worker_id: u64,
-        task: Self::Task,
-        context: &mut Self::Context,
-        stats: &mut SmrSwap<Self::Stats>,
-    ) -> Self::Result {
+        task: RangeTask,
+        context: &mut DownloadWorkerContext,
+        stats: &mut SmrSwap<crate::utils::stats::WorkerStats>,
+    ) -> RangeResult {
         stats.update(|s| {
             let mut s = s.clone();
-            // 标记 worker 开始执行任务
             s.set_active(true);
-            // 清空采样点缓冲区，避免旧数据影响新任务的速度计算
             s.clear_samples();
             s
         });
@@ -122,7 +188,6 @@ where
             worker_id, url, start, end, retry_count
         );
 
-        // 下载数据（在下载过程中会实时更新 stats）
         let fetch_result = self.fetch_range(&url, &range, stats, cancel_rx).await;
 
         let result = match fetch_result {
@@ -142,7 +207,6 @@ where
             Err(e) => self.handle_download_failed(worker_id, range, retry_count, e),
         };
 
-        // 标记 worker 结束执行任务
         stats.update(|s| {
             let mut s = s.clone();
             s.set_active(false);
@@ -151,11 +215,7 @@ where
 
         result
     }
-}
 
-// ==================== 辅助方法 ====================
-
-impl<C: HttpClient> DownloadWorkerExecutor<C> {
     /// 执行 Range 下载
     async fn fetch_range(
         &self,
@@ -179,7 +239,7 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         worker_id: u64,
         range: ranged_mmap::AllocatedRange,
         data: bytes::Bytes,
-        context: &mut DownloadWorkerContext,
+        context: &DownloadWorkerContext,
         stats: &mut SmrSwap<WorkerStats>,
     ) -> RangeResult {
         // 写入文件
@@ -300,7 +360,7 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
     /// 根据当前速度更新分块大小
     fn update_chunk_size(
         &self,
-        context: &mut DownloadWorkerContext,
+        context: &DownloadWorkerContext,
         stats: &mut SmrSwap<WorkerStats>,
     ) {
         let stats_guard = stats.load();
@@ -308,8 +368,8 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
         let window_avg_speed = stats_guard.get_window_avg_speed();
 
         if let (Some(instant_speed), Some(window_avg_speed)) = (instant_speed, window_avg_speed) {
-            // 只有当两个速度都有效时才更新分块大小
             let current_chunk_size = stats_guard.get_current_chunk_size();
+            // Context 现在是 Arc<Inner>，通过解引用访问 chunk_strategy
             let new_chunk_size = context.chunk_strategy.calculate_chunk_size(
                 current_chunk_size,
                 instant_speed,
@@ -318,7 +378,6 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
 
             drop(stats_guard);
 
-            // 更新分块大小
             stats.update(|stats| {
                 let mut stats = stats.clone();
                 stats.set_current_chunk_size(new_chunk_size);
@@ -350,74 +409,60 @@ impl<C: HttpClient> DownloadWorkerExecutor<C> {
 /// let speed = handle.instant_speed();
 /// ```
 #[derive(Clone)]
-pub(crate) struct DownloadWorkerHandle<C: HttpClient> {
-    /// 底层通用 worker 句柄
-    handle: WorkerHandle<DownloadWorkerExecutor<C>>,
+pub(crate) struct DownloadWorkerHandle {
+    /// Worker ID
+    worker_id: u64,
+    /// 向 worker 发送任务的通道
+    task_tx: Arc<Sender<RangeTask>>,
+    /// 该 worker 的统计数据（SwapReader 包装以便外部访问）
+    stats: LocalReader<WorkerStats>,
 }
 
-impl<C: HttpClient> DownloadWorkerHandle<C> {
+impl DownloadWorkerHandle {
     /// 创建新的下载 worker 句柄
-    ///
-    /// # Arguments
-    ///
-    /// - `handle`: 底层通用 worker 句柄
-    pub(crate) fn new(handle: WorkerHandle<DownloadWorkerExecutor<C>>) -> Self {
-        Self { handle }
+    pub(crate) fn new(
+        worker_id: u64,
+        task_tx: Arc<Sender<RangeTask>>,
+        stats: LocalReader<WorkerStats>,
+    ) -> Self {
+        Self { worker_id, task_tx, stats }
     }
 
     /// 获取 worker ID
-    ///
-    /// # Returns
-    ///
-    /// Worker 的 ID
     #[inline]
     pub fn worker_id(&self) -> u64 {
-        self.handle.worker_id()
+        self.worker_id
     }
 
     /// 提交下载任务给该 worker
-    ///
-    /// # Arguments
-    ///
-    /// - `task`: 要执行的下载任务
-    ///
-    /// # Returns
-    ///
-    /// 成功时返回 `Ok(())`，如果 worker 不存在或已关闭则返回 `Err`
     pub fn send_task(
         &self,
         task: RangeTask,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        self.handle.send_task(task)
+        let sender = self.task_tx.clone();
+        async move {
+            sender
+                .send(task)
+                .await
+                .map_err(|e| DownloadError::TaskSend(e.to_string()))?;
+            Ok(())
+        }
     }
 
     /// 获取该 worker 的统计数据
-    ///
-    /// # Returns
-    ///
-    /// Worker 统计数据的 Arc 引用
     #[inline]
     pub fn stats<'a>(&'a self) -> ReadGuard<'a, WorkerStats> {
-        self.handle.stats()
+        self.stats.load()
     }
 
     /// 获取该 worker 的实时速度
-    ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
     pub fn instant_speed(&self) -> Option<DownloadSpeed> {
-        self.handle.stats().get_instant_speed()
+        self.stats.load().get_instant_speed()
     }
 
     /// 获取该 worker 的当前分块大小
-    ///
-    /// # Returns
-    ///
-    /// 当前分块大小 bytes
     pub fn chunk_size(&self) -> u64 {
-        let stats = self.handle.stats();
-        stats.get_current_chunk_size()
+        self.stats.load().get_current_chunk_size()
     }
 }
 
@@ -428,7 +473,9 @@ impl<C: HttpClient> DownloadWorkerHandle<C> {
 /// 封装通用 WorkerPool，提供下载特定的便捷方法
 pub(crate) struct DownloadWorkerPool<C: HttpClient> {
     /// 底层通用协程池
-    pool: WorkerPool<DownloadWorkerExecutor<C>>,
+    pool: WorkerPool<DownloadWorkerFactory<C>>,
+    /// 结果发送器（用于创建新 worker 时克隆）
+    result_tx: Sender<RangeResult>,
     /// 全局统计管理器（聚合所有 worker 的数据）
     global_stats: TaskStats,
     /// 下载配置（用于创建新 worker 的分块策略）
@@ -459,50 +506,89 @@ where
         global_stats: TaskStats,
     ) -> (
         Self,
-        Vec<DownloadWorkerHandle<C>>,
-        tokio::sync::mpsc::Receiver<RangeResult>,
+        Vec<DownloadWorkerHandle>,
+        Receiver<RangeResult>,
     ) {
-        // 创建执行器（直接 move writer，避免 Arc 克隆）
-        let executor = DownloadWorkerExecutor::new(client, writer, config.speed().size_standard());
+        // 创建工厂
+        let factory = DownloadWorkerFactory::new(
+            client,
+            writer,
+            config.speed().size_standard(),
+        );
 
-        // 为每个 worker 创建独立的上下文和统计
-        let contexts_with_stats: Vec<(DownloadWorkerContext, crate::utils::stats::WorkerStats)> =
-            (0..initial_worker_count)
-                .map(|_| {
-                    // 通过 parent 创建 child stats
-                    let mut worker_stats = global_stats.create_child();
-                    // 设置初始分块大小
-                    worker_stats.set_current_chunk_size(config.chunk().initial_size());
-                    // 创建独立的分块策略（每个 worker 独立一份，策略是无状态的）
-                    let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
-                        as Box<dyn ChunkStrategy + Send + Sync>;
+        // 创建结果通道（所有 worker 共享）
+        let (result_tx, result_rx) = mpsc::channel::<RangeResult>(100);
 
-                    let context = DownloadWorkerContext { chunk_strategy };
-                    (context, worker_stats)
-                })
-                .collect();
+        // 为每个 worker 创建输入参数和句柄
+        let mut inputs = Vec::with_capacity(initial_worker_count as usize);
+        let mut handles = Vec::with_capacity(initial_worker_count as usize);
 
-        // 创建通用协程池并获取 worker 句柄和 result_receiver
-        let (pool, worker_handles, result_receiver) =
-            WorkerPool::new(executor, contexts_with_stats);
+        for _ in 0..initial_worker_count {
+            let (input, handle) = Self::create_worker_input_and_handle(
+                &global_stats,
+                &config,
+                result_tx.clone(),
+            );
+            inputs.push(input);
+            handles.push(handle);
+        }
+
+        // 创建通用协程池
+        let (pool, worker_ids) = WorkerPool::new(factory, inputs);
+
+        // 更新句柄的 worker_id
+        for (handle, worker_id) in handles.iter_mut().zip(worker_ids.iter()) {
+            handle.worker_id = *worker_id;
+        }
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
-
-        // 将通用句柄转换为下载特定句柄
-        let download_handles = worker_handles
-            .into_iter()
-            .map(DownloadWorkerHandle::new)
-            .collect();
 
         (
             Self {
                 pool,
+                result_tx,
                 global_stats,
                 config,
             },
-            download_handles,
-            result_receiver,
+            handles,
+            result_rx,
         )
+    }
+
+    /// 创建单个 worker 的输入参数和句柄
+    fn create_worker_input_and_handle(
+        global_stats: &TaskStats,
+        config: &crate::config::DownloadConfig,
+        result_tx: Sender<RangeResult>,
+    ) -> (DownloadWorkerInput, DownloadWorkerHandle) {
+        // 创建任务通道
+        let (task_tx, task_rx) = mpsc::channel::<RangeTask>(100);
+
+        // 创建统计数据
+        let mut worker_stats = global_stats.create_child();
+        worker_stats.set_current_chunk_size(config.chunk().initial_size());
+        let stats = SmrSwap::new(worker_stats);
+        let stats_reader = stats.local();
+
+        // 创建上下文
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(config))
+            as Box<dyn ChunkStrategy + Send + Sync>;
+        let context = DownloadWorkerContext { chunk_strategy };
+
+        let input = DownloadWorkerInput {
+            context,
+            stats,
+            task_rx,
+            result_tx,
+        };
+
+        let handle = DownloadWorkerHandle::new(
+            0, // worker_id 稍后由 WorkerPool::new 返回的 ID 更新
+            Arc::new(task_tx),
+            stats_reader,
+        );
+
+        (input, handle)
     }
 
     /// 动态添加新的 worker
@@ -513,35 +599,29 @@ where
     ///
     /// # Returns
     ///
-    /// 成功时返回新添加的所有 worker 的句柄，失败时返回错误信息
-    pub(crate) async fn add_workers(&mut self, count: u64) -> Vec<DownloadWorkerHandle<C>> {
-        // 创建新的 worker 上下文和统计
-        let contexts_with_stats: Vec<(DownloadWorkerContext, crate::utils::stats::WorkerStats)> =
-            (0..count)
-                .map(|_| {
-                    let mut worker_stats = self.global_stats.create_child();
-                    // 设置初始分块大小
-                    worker_stats.set_current_chunk_size(self.config.chunk().initial_size());
-                    // 创建独立的分块策略（策略内部使用原子操作，无需外部锁）
-                    let chunk_strategy =
-                        Box::new(SpeedBasedChunkStrategy::from_config(&self.config))
-                            as Box<dyn ChunkStrategy + Send + Sync>;
+    /// 成功时返回新添加的所有 worker 的句柄
+    pub(crate) fn add_workers(&mut self, count: u64) -> Vec<DownloadWorkerHandle> {
+        let mut inputs = Vec::with_capacity(count as usize);
+        let mut handles = Vec::with_capacity(count as usize);
 
-                    let context = DownloadWorkerContext { chunk_strategy };
-                    (context, worker_stats)
-                })
-                .collect();
+        for _ in 0..count {
+            let (input, handle) = Self::create_worker_input_and_handle(
+                &self.global_stats,
+                &self.config,
+                self.result_tx.clone(),
+            );
+            inputs.push(input);
+            handles.push(handle);
+        }
 
-        // 添加新 workers（使用现有的执行器）并获取句柄
-        let worker_handles = self.pool.add_workers(contexts_with_stats).await;
+        let worker_ids = self.pool.add_workers(inputs);
 
-        // 将通用句柄转换为下载特定句柄
-        let download_handles = worker_handles
-            .into_iter()
-            .map(DownloadWorkerHandle::new)
-            .collect();
+        // 更新句柄的 worker_id
+        for (handle, worker_id) in handles.iter_mut().zip(worker_ids.iter()) {
+            handle.worker_id = *worker_id;
+        }
 
-        download_handles
+        handles
     }
 
     /// 获取当前活跃 worker 总数
@@ -676,12 +756,12 @@ mod tests {
             Bytes::from_static(test_data),
         );
 
-        // 创建执行器（直接 move writer）
-        let mut executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
+        // 创建工厂
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let mut executor = DownloadWorkerFactory::new(client, writer, SizeStandard::SI);
 
         // 创建上下文和统计
         let mut stats = SmrSwap::new(crate::utils::stats::WorkerStats::default());
-        let config = crate::config::DownloadConfig::default();
         let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
             as Box<dyn ChunkStrategy + Send + Sync>;
         let mut context = DownloadWorkerContext { chunk_strategy };
@@ -695,7 +775,7 @@ mod tests {
             cancel_rx,
         };
 
-        let result = executor.execute(0, task, &mut context, &mut stats).await;
+        let result = executor.execute_task(0, task, &mut context, &mut stats).await;
 
         // 验证结果
         match result {
@@ -737,11 +817,11 @@ mod tests {
             Bytes::new(),
         );
 
-        // 创建执行器（直接 move writer）
-        let mut executor = DownloadWorkerExecutor::new(client, writer, SizeStandard::SI);
+        // 创建工厂
+        let config = Arc::new(crate::config::DownloadConfig::default());
+        let mut executor = DownloadWorkerFactory::new(client, writer, SizeStandard::SI);
 
         let mut stats = SmrSwap::new(crate::utils::stats::WorkerStats::default());
-        let config = crate::config::DownloadConfig::default();
         let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
             as Box<dyn ChunkStrategy + Send + Sync>;
         let mut context = DownloadWorkerContext { chunk_strategy };
@@ -754,7 +834,7 @@ mod tests {
             cancel_rx,
         };
 
-        let result = executor.execute(0, task, &mut context, &mut stats).await;
+        let result = executor.execute_task(0, task, &mut context, &mut stats).await;
 
         // 验证结果
         match result {

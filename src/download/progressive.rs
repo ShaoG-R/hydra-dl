@@ -117,9 +117,9 @@ impl ProgressiveLauncherLogic {
     }
 
     /// 检查所有已启动 Worker 的速度是否达到阈值
-    fn check_worker_speeds<C: crate::utils::io_traits::HttpClient>(
+    fn check_worker_speeds(
         &self,
-        worker_handles: &FxHashMap<u64, DownloadWorkerHandle<C>>,
+        worker_handles: &FxHashMap<u64, DownloadWorkerHandle>,
         config: &DownloadConfig,
     ) -> Result<Vec<Option<DownloadSpeed>>, WaitReason> {
         let mut speeds = Vec::with_capacity(worker_handles.len());
@@ -186,9 +186,9 @@ impl ProgressiveLauncherLogic {
     /// 2. 所有 worker 速度是否达标
     /// 3. 剩余时间是否足够
     /// 4. 是否有需要启动的 worker
-    fn decide_next_launch<C: crate::utils::io_traits::HttpClient>(
+    fn decide_next_launch(
         &self,
-        worker_handles: &FxHashMap<u64, DownloadWorkerHandle<C>>,
+        worker_handles: &FxHashMap<u64, DownloadWorkerHandle>,
         written_bytes: u64,
         total_bytes: u64,
         global_stats: &crate::utils::stats::TaskStats,
@@ -259,11 +259,11 @@ impl ProgressiveLauncherLogic {
 }
 
 /// 渐进式启动 Actor 参数
-pub(super) struct ProgressiveLauncherParams<C: crate::utils::io_traits::HttpClient> {
+pub(super) struct ProgressiveLauncherParams {
     /// 配置
     pub config: Arc<DownloadConfig>,
     /// 共享的 worker handles
-    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 文件总大小
     pub total_size: u64,
     /// 已写入字节数（共享引用）
@@ -287,19 +287,19 @@ struct ActorChannels {
 /// 渐进式启动 Actor
 ///
 /// 独立运行的 actor，负责定期检测并自动启动新 worker
-struct ProgressiveLauncherActor<C: crate::utils::io_traits::HttpClient> {
+struct ProgressiveLauncherActor {
     /// 内部逻辑管理器
     logic: ProgressiveLauncherLogic,
     /// 下载状态参数
-    params: ProgressiveLauncherParams<C>,
+    params: ProgressiveLauncherParams,
     /// 通信通道
     channels: ActorChannels,
 }
 
-impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
+impl ProgressiveLauncherActor {
     /// 创建新的 actor
     fn new(
-        params: ProgressiveLauncherParams<C>,
+        params: ProgressiveLauncherParams,
         shutdown_rx: lite::Receiver<()>,
         launch_request_tx: mpsc::Sender<WorkerLaunchRequest>,
     ) -> Self {
@@ -467,23 +467,21 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncherActor<C> {
 /// 渐进式启动管理器 Handle
 ///
 /// 提供与 ProgressiveLauncherActor 通信的接口
-pub(super) struct ProgressiveLauncher<C: crate::utils::io_traits::HttpClient> {
+pub(super) struct ProgressiveLauncher {
     /// 初始 worker 数量
     initial_worker_count: u64,
     /// Actor 任务句柄
     actor_handle: Option<tokio::task::JoinHandle<()>>,
     /// 关闭发送器
     shutdown_tx: lite::Sender<()>,
-    /// PhantomData 用于持有泛型参数
-    _phantom: std::marker::PhantomData<C>,
 }
 
-impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
+impl ProgressiveLauncher {
     /// 创建新的渐进式启动管理器（启动 actor）
     ///
     /// 返回 `(Self, mpsc::Receiver<WorkerLaunchRequest>)`，调用者需持有接收器
     pub(super) fn new(
-        params: ProgressiveLauncherParams<C>,
+        params: ProgressiveLauncherParams,
     ) -> (Self, mpsc::Receiver<WorkerLaunchRequest>) {
         // 先创建临时逻辑对象获取初始 worker 数量
         let temp_logic = ProgressiveLauncherLogic::new(&params.config);
@@ -504,7 +502,6 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressiveLauncher<C> {
             shutdown_tx,
             initial_worker_count,
             actor_handle: Some(actor_handle),
-            _phantom: std::marker::PhantomData,
         };
 
         (launcher, launch_request_rx)

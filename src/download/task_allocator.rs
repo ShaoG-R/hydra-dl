@@ -25,7 +25,6 @@ use worker_dispatcher::WorkerDispatcher;
 use crate::download::worker_health_checker::WorkerCancelRequest;
 use crate::pool::download::DownloadWorkerHandle;
 use crate::task::RangeResult;
-use crate::utils::io_traits::HttpClient;
 use kestrel_timer::{TaskNotification, TimerService, spsc};
 use log::{debug, error, info, warn};
 use ranged_mmap::{AllocatedRange, allocator::sequential::Allocator as RangeAllocator};
@@ -46,7 +45,7 @@ pub(super) enum AllocatorMessage {
 }
 
 /// TaskAllocator Actor 参数
-pub(super) struct TaskAllocatorParams<C: HttpClient> {
+pub(super) struct TaskAllocatorParams {
     /// Range 分配器
     pub allocator: RangeAllocator,
     /// 下载 URL
@@ -60,20 +59,20 @@ pub(super) struct TaskAllocatorParams<C: HttpClient> {
     /// 配置
     pub config: Arc<crate::config::DownloadConfig>,
     /// Worker 句柄映射
-    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
 }
 
 /// TaskAllocator Actor 实体
 ///
 /// 使用组合模式管理任务分配、重试调度、任务派发和完成跟踪
-pub(super) struct TaskAllocatorActor<C: HttpClient> {
+pub(super) struct TaskAllocatorActor {
     // === 组件 ===
     /// 任务队列（新任务 + 重试任务 + 空闲 worker）
     task_queue: TaskQueue,
     /// 重试调度器（定时器管理）
     retry_scheduler: RetryScheduler,
     /// Worker 派发器（任务发送 + 取消信号）
-    dispatcher: WorkerDispatcher<C>,
+    dispatcher: WorkerDispatcher,
     /// 完成跟踪器（永久失败 + 完成通知）
     completion_tracker: CompletionTracker,
 
@@ -88,10 +87,10 @@ pub(super) struct TaskAllocatorActor<C: HttpClient> {
     message_rx: mpsc::Receiver<AllocatorMessage>,
 }
 
-impl<C: HttpClient + Clone> TaskAllocatorActor<C> {
+impl TaskAllocatorActor {
     /// 创建新的 TaskAllocator Actor 并启动
     pub(super) fn new(
-        params: TaskAllocatorParams<C>,
+        params: TaskAllocatorParams,
     ) -> (TaskAllocatorHandle, oneshot::Receiver<CompletionResult>) {
         let TaskAllocatorParams {
             allocator,

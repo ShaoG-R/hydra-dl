@@ -95,13 +95,13 @@ enum ActorMessage {
 }
 
 /// 进度报告器参数
-pub(super) struct ProgressReporterParams<C: crate::utils::io_traits::HttpClient> {
+pub(super) struct ProgressReporterParams {
     /// 进度发送器
     pub progress_sender: Option<mpsc::Sender<DownloadProgress>>,
     /// 文件总大小
     pub total_size: NonZeroU64,
     /// 共享的 worker handles
-    pub worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+    pub worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle>>,
     /// 全局统计管理器
     pub global_stats: crate::utils::stats::TaskStats,
     /// 更新间隔
@@ -113,7 +113,7 @@ pub(super) struct ProgressReporterParams<C: crate::utils::io_traits::HttpClient>
 /// 进度报告器 Actor
 ///
 /// 独立运行的 actor，负责管理进度报告和统计信息收集
-struct ProgressReporterActor<C: crate::utils::io_traits::HttpClient> {
+struct ProgressReporterActor {
     /// 进度发送器
     progress_sender: Option<mpsc::Sender<DownloadProgress>>,
     /// 文件总大小
@@ -121,16 +121,16 @@ struct ProgressReporterActor<C: crate::utils::io_traits::HttpClient> {
     /// 消息接收器（async channel）
     message_rx: mpsc::Receiver<ActorMessage>,
     /// 共享的 worker handles（用于直接获取统计信息）
-    worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>>,
+    worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle>>,
     /// 全局统计管理器（用于获取总体统计数据）
     global_stats: crate::utils::stats::TaskStats,
     /// 进度更新定时器（内部管理）
     progress_timer: tokio::time::Interval,
 }
 
-impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
+impl ProgressReporterActor {
     /// 创建新的 actor
-    fn new(params: ProgressReporterParams<C>, message_rx: mpsc::Receiver<ActorMessage>) -> Self {
+    fn new(params: ProgressReporterParams, message_rx: mpsc::Receiver<ActorMessage>) -> Self {
         let ProgressReporterParams {
             progress_sender,
             total_size,
@@ -306,16 +306,14 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporterActor<C> {
 ///
 /// 提供与 ProgressReporterActor 通信的接口
 #[derive(Clone)]
-pub(super) struct ProgressReporter<C: crate::utils::io_traits::HttpClient> {
+pub(super) struct ProgressReporter {
     /// 消息发送器（async channel）
     message_tx: mpsc::Sender<ActorMessage>,
-    /// PhantomData 用于持有泛型参数
-    _phantom: std::marker::PhantomData<C>,
 }
 
-impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
+impl ProgressReporter {
     /// 创建新的进度报告器（启动 actor）
-    pub(super) fn new(params: ProgressReporterParams<C>) -> Self {
+    pub(super) fn new(params: ProgressReporterParams) -> Self {
         // 使用有界 channel，容量 100
         let (message_tx, message_rx) = mpsc::channel(100);
 
@@ -326,7 +324,6 @@ impl<C: crate::utils::io_traits::HttpClient> ProgressReporter<C> {
 
         Self {
             message_tx,
-            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -368,8 +365,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     // 辅助函数：创建空的 worker_handles
-    fn create_empty_worker_handles<C: crate::utils::io_traits::HttpClient>()
-    -> LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle<C>>> {
+    fn create_empty_worker_handles()
+    -> LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle>> {
         let smr = smr_swap::SmrSwap::new(FxHashMap::default());
         smr.local()
     }
@@ -384,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_progress_reporter_creation() {
         let (tx, _rx) = mpsc::channel(10);
-        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let worker_handles = create_empty_worker_handles();
         let global_stats = create_mock_global_stats();
         let _reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: Some(tx),
@@ -399,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_progress_reporter_without_sender() {
-        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let worker_handles = create_empty_worker_handles();
         let global_stats = create_mock_global_stats();
         let _reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: None,
@@ -415,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_started_event() {
         let (tx, mut rx) = mpsc::channel(10);
-        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let worker_handles = create_empty_worker_handles();
         let global_stats = create_mock_global_stats();
         let reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: Some(tx),
@@ -450,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_error() {
         let (tx, mut rx) = mpsc::channel(10);
-        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let worker_handles = create_empty_worker_handles();
         let global_stats = create_mock_global_stats();
         let reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: Some(tx),
@@ -478,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_events_without_sender() {
-        let worker_handles = create_empty_worker_handles::<reqwest::Client>();
+        let worker_handles = create_empty_worker_handles();
         let global_stats = create_mock_global_stats();
         let reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: None,

@@ -4,7 +4,6 @@
 
 use crate::pool::download::DownloadWorkerHandle;
 use crate::task::WorkerTask;
-use crate::utils::io_traits::HttpClient;
 use lite_sync::oneshot::lite;
 use log::{debug, error, info};
 use rustc_hash::FxHashMap;
@@ -13,19 +12,19 @@ use smr_swap::LocalReader;
 /// Worker 派发器
 ///
 /// 负责向 Worker 发送任务并管理取消信号
-pub struct WorkerDispatcher<C: HttpClient> {
+pub struct WorkerDispatcher {
     /// Worker 句柄映射（只读访问）
-    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 任务取消 sender 映射
     cancel_senders: FxHashMap<u64, lite::Sender<()>>,
     /// 默认 chunk 大小（当无法获取 worker 配置时使用）
     default_chunk_size: u64,
 }
 
-impl<C: HttpClient + Clone> WorkerDispatcher<C> {
+impl WorkerDispatcher {
     /// 创建新的 Worker 派发器
     pub fn new(
-        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+        worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
         default_chunk_size: u64,
     ) -> Self {
         Self {

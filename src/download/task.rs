@@ -33,19 +33,19 @@ pub struct DownloadTask<C: HttpClient> {
     /// 任务分配器句柄
     task_allocator: TaskAllocatorHandle,
     /// 进度报告器
-    progress_reporter: ProgressReporter<C>,
+    progress_reporter: ProgressReporter,
     /// 下载配置
     config: Arc<crate::config::DownloadConfig>,
     /// 渐进式启动管理器
-    progressive_launcher: ProgressiveLauncher<C>,
+    progressive_launcher: ProgressiveLauncher,
     /// Worker 启动请求接收器（由 progressive_launcher 发送）
     launch_request_rx: mpsc::Receiver<WorkerLaunchRequest>,
     /// 任务完成通知接收器（由 task_allocator 发送）
     completion_rx: tokio::sync::oneshot::Receiver<CompletionResult>,
     /// Worker 句柄缓存（worker_id -> handle）
-    worker_handles: SmrSwap<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: SmrSwap<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 健康检查器（actor 模式）
-    health_checker: WorkerHealthChecker<C>,
+    health_checker: WorkerHealthChecker,
 }
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
@@ -298,7 +298,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     fn get_worker_handle(
         &self,
         worker_id: u64,
-    ) -> Option<crate::pool::download::DownloadWorkerHandle<C>> {
+    ) -> Option<crate::pool::download::DownloadWorkerHandle> {
         let guard = self.worker_handles.load();
         guard.get(&worker_id).cloned()
     }
@@ -313,7 +313,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 获取进度报告器
     #[inline]
-    pub(super) fn progress_reporter(&self) -> &ProgressReporter<C> {
+    pub(super) fn progress_reporter(&self) -> &ProgressReporter {
         &self.progress_reporter
     }
 
@@ -337,7 +337,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         // 动态添加新 worker，收集实际的 worker_id
         let new_worker_ids: Vec<u64> = {
-            let new_handles = self.pool.add_workers(count).await;
+            let new_handles = self.pool.add_workers(count);
             let mut ids = Vec::new();
             self.worker_handles.update(|handles| {
                 let mut handles = handles.clone();

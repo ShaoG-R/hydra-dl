@@ -70,11 +70,11 @@ pub(super) struct WorkerCancelRequest {
 }
 
 /// 健康检查器参数
-pub(super) struct WorkerHealthCheckerParams<C: crate::utils::io_traits::HttpClient> {
+pub(super) struct WorkerHealthCheckerParams {
     /// 配置
     pub config: Arc<DownloadConfig>,
     /// 共享的 worker handles
-    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 检查间隔
     pub check_interval: std::time::Duration,
     /// 启动偏移时间
@@ -275,7 +275,7 @@ impl WorkerHealthCheckerLogic {
 /// 健康检查 Actor
 ///
 /// 独立运行的 actor，负责定期检测并自动识别不健康的 worker
-struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
+struct WorkerHealthCheckerActor {
     /// 内部逻辑管理器
     logic: WorkerHealthCheckerLogic,
     /// 配置
@@ -283,17 +283,17 @@ struct WorkerHealthCheckerActor<C: crate::utils::io_traits::HttpClient> {
     /// 关闭信号接收器
     shutdown_rx: lite::Receiver<()>,
     /// 单一写入者的 worker handles 持有者
-    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle<C>>>,
+    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
     /// Worker 取消请求发送器
     cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
     /// 检查定时器（内部管理）
     check_timer: tokio::time::Interval,
 }
 
-impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
+impl WorkerHealthCheckerActor {
     /// 创建新的 actor
     fn new(
-        params: WorkerHealthCheckerParams<C>,
+        params: WorkerHealthCheckerParams,
         shutdown_rx: lite::Receiver<()>,
         cancel_request_tx: mpsc::Sender<WorkerCancelRequest>,
     ) -> Self {
@@ -433,21 +433,19 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthCheckerActor<C> {
 /// Worker 健康检查器 Handle
 ///
 /// 提供与 WorkerHealthCheckerActor 通信的接口
-pub(super) struct WorkerHealthChecker<C: crate::utils::io_traits::HttpClient> {
+pub(super) struct WorkerHealthChecker {
     /// 关闭信号发送器
     shutdown_tx: lite::Sender<()>,
     /// Actor 任务句柄
     actor_handle: Option<tokio::task::JoinHandle<()>>,
-    /// PhantomData 用于持有泛型参数
-    _phantom: std::marker::PhantomData<C>,
 }
 
-impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
+impl WorkerHealthChecker {
     /// 创建新的健康检查器（启动 actor）
     ///
     /// 返回 `(Self, mpsc::Receiver<WorkerCancelRequest>)`，调用者需持有接收器
     pub(super) fn new(
-        params: WorkerHealthCheckerParams<C>,
+        params: WorkerHealthCheckerParams,
     ) -> (Self, mpsc::Receiver<WorkerCancelRequest>) {
         let (shutdown_tx, shutdown_rx) = lite::channel();
         let (cancel_request_tx, cancel_request_rx) = mpsc::channel(10);
@@ -462,7 +460,6 @@ impl<C: crate::utils::io_traits::HttpClient> WorkerHealthChecker<C> {
         let checker = Self {
             shutdown_tx,
             actor_handle: Some(actor_handle),
-            _phantom: std::marker::PhantomData,
         };
 
         (checker, cancel_request_rx)
