@@ -5,43 +5,39 @@
 //! # 核心组件
 //!
 //! - **DownloadWorkerContext**: 下载 worker 的上下文，包含分块策略
+//! - **DownloadTaskExecutor**: 下载任务执行器，封装核心下载逻辑
 //! - **DownloadWorkerFactory**: 下载任务工厂，处理 Range 下载和文件写入
 //! - **DownloadWorkerPool**: 下载协程池，封装通用 WorkerPool 并提供下载特定方法
+//!
+//! # 模块结构
+//!
+//! - `executor`: 核心下载协程逻辑，独立封装方便测试
 //!
 //! # 设计说明
 //!
 //! 此模块包含所有下载特定的类型（Task、Result、Context、Stats）。
 //! 通用协程池 (common.rs) 仅负责协程生命周期管理。
 
+mod executor;
+
 use super::common::{WorkerFactory, WorkerPool};
 use crate::Result;
-use crate::{DownloadError, task::{RangeResult, WorkerTask as RangeTask}};
+pub(crate) use executor::{DownloadTaskExecutor, DownloadWorkerContext};
+use crate::task::{RangeResult, WorkerTask as RangeTask};
 use crate::utils::{
     chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy},
-    fetch::{FetchRangeResult, RangeFetcher},
     io_traits::HttpClient,
     stats::{TaskStats, WorkerStats},
     writer::MmapWriter,
 };
-use lite_sync::oneshot::lite;
+use crate::DownloadError;
 use log::{debug, error, info};
-use net_bytes::{DownloadSpeed, FormattedValue, SizeStandard};
+use net_bytes::{DownloadSpeed, SizeStandard};
 use smr_swap::{LocalReader, ReadGuard, SmrSwap};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use std::sync::Arc;
-
-// ==================== 下载 Worker 上下文 ====================
-
-/// 下载 Worker 的上下文
-///
-/// 包含每个 worker 独立的分块策略。
-/// 只由主下载协程持有，其他辅助协程不需要访问。
-pub(crate) struct DownloadWorkerContext {
-    /// 该 worker 的独立分块策略
-    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send + Sync>,
-}
 
 // ==================== Worker 输入参数 ====================
 
@@ -72,15 +68,11 @@ pub(crate) struct DownloadWorkerInput {
 /// - `C`: HTTP 客户端类型
 #[derive(Clone)]
 pub(crate) struct DownloadWorkerFactory<C> {
-    /// HTTP 客户端
-    client: C,
-    /// 共享的文件写入器
-    writer: MmapWriter,
-    /// 文件大小标准
-    size_standard: SizeStandard,
+    /// 下载任务执行器
+    executor: DownloadTaskExecutor<C>,
 }
 
-impl<C> DownloadWorkerFactory<C> {
+impl<C: Clone> DownloadWorkerFactory<C> {
     /// 创建新的下载任务工厂
     pub(crate) fn new(
         client: C,
@@ -88,9 +80,7 @@ impl<C> DownloadWorkerFactory<C> {
         size_standard: SizeStandard,
     ) -> Self {
         Self {
-            client,
-            writer,
-            size_standard,
+            executor: DownloadTaskExecutor::new(client, writer, size_standard),
         }
     }
 }
@@ -111,7 +101,7 @@ where
         let mut handles = Vec::new();
 
         // --- 协程 0: 主下载循环 ---
-        let mut executor = self.clone();
+        let mut executor = self.executor.clone();
 
         let DownloadWorkerInput {
             context,
@@ -152,246 +142,6 @@ where
         // --- 协程 1+: 辅助协程 (暂未实现，预留位置) ---
 
         handles
-    }
-}
-
-// ==================== 辅助方法 ====================
-
-impl<C: HttpClient> DownloadWorkerFactory<C> {
-    /// 核心业务逻辑：执行单个 Range 下载任务
-    ///
-    /// 这个方法对应原本的 `execute`，现在被主循环调用
-    async fn execute_task(
-        &mut self,
-        worker_id: u64,
-        task: RangeTask,
-        context: &mut DownloadWorkerContext,
-        stats: &mut SmrSwap<crate::utils::stats::WorkerStats>,
-    ) -> RangeResult {
-        stats.update(|s| {
-            let mut s = s.clone();
-            s.set_active(true);
-            s.clear_samples();
-            s
-        });
-
-        let RangeTask::Range {
-            url,
-            range,
-            retry_count,
-            cancel_rx,
-        } = task;
-
-        let (start, end) = range.as_range_tuple();
-        debug!(
-            "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
-            worker_id, url, start, end, retry_count
-        );
-
-        let fetch_result = self.fetch_range(&url, &range, stats, cancel_rx).await;
-
-        let result = match fetch_result {
-            Ok(FetchRangeResult::Complete(data)) => {
-                self.handle_download_complete(worker_id, range, data, context, stats)
-            }
-            Ok(FetchRangeResult::Cancelled {
-                data,
-                bytes_downloaded,
-            }) => self.handle_download_cancelled(
-                worker_id,
-                range,
-                data,
-                bytes_downloaded,
-                retry_count,
-            ),
-            Err(e) => self.handle_download_failed(worker_id, range, retry_count, e),
-        };
-
-        stats.update(|s| {
-            let mut s = s.clone();
-            s.set_active(false);
-            s
-        });
-
-        result
-    }
-
-    /// 执行 Range 下载
-    async fn fetch_range(
-        &self,
-        url: &str,
-        range: &ranged_mmap::AllocatedRange,
-        stats: &mut SmrSwap<WorkerStats>,
-        cancel_rx: lite::Receiver<()>,
-    ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
-        use crate::utils::fetch::FetchRange;
-
-        let fetch_range =
-            FetchRange::from_allocated_range(range).expect("AllocatedRange 应该总是有效的");
-        RangeFetcher::new(&self.client, url, fetch_range, stats)
-            .fetch_with_cancel(cancel_rx)
-            .await
-    }
-
-    /// 处理下载完成的情况
-    fn handle_download_complete(
-        &self,
-        worker_id: u64,
-        range: ranged_mmap::AllocatedRange,
-        data: bytes::Bytes,
-        context: &DownloadWorkerContext,
-        stats: &mut SmrSwap<WorkerStats>,
-    ) -> RangeResult {
-        // 写入文件
-        if let Err(e) = self.writer.write_range(range, data.as_ref()) {
-            let error_msg = format!("写入失败: {:?}", e);
-            error!("Worker #{} {}", worker_id, error_msg);
-            return RangeResult::WriteFailed {
-                worker_id,
-                range,
-                error: error_msg,
-            };
-        }
-
-        // 记录 range 完成
-        stats.update(|stats| {
-            let mut stats = stats.clone();
-            stats.record_range_complete();
-            stats
-        });
-
-        // 根据当前速度更新分块大小
-        self.update_chunk_size(context, stats);
-
-        RangeResult::Complete { worker_id }
-    }
-
-    /// 处理下载被取消的情况
-    fn handle_download_cancelled(
-        &self,
-        worker_id: u64,
-        range: ranged_mmap::AllocatedRange,
-        data: bytes::Bytes,
-        bytes_downloaded: u64,
-        retry_count: usize,
-    ) -> RangeResult {
-        let (start, end) = range.as_range_tuple();
-
-        // 没有下载任何数据，返回原始 range 重试
-        if bytes_downloaded == 0 {
-            let error_msg = format!("下载被取消，重试整个 range: {}..{}", start, end);
-            debug!("Worker #{} {}", worker_id, error_msg);
-            return RangeResult::DownloadFailed {
-                worker_id,
-                range,
-                error: error_msg,
-                retry_count,
-            };
-        }
-
-        // 有部分数据下载，尝试保存并返回剩余部分
-        use std::num::NonZeroU64;
-        let bytes_downloaded = NonZeroU64::new(bytes_downloaded).unwrap();
-
-        match range.split_at(bytes_downloaded) {
-            Ok((downloaded_range, remaining_range)) => {
-                // 尝试写入已下载的部分（忽略写入错误，继续重试剩余部分）
-                if let Err(e) = self.writer.write_range(downloaded_range, data.as_ref()) {
-                    error!("Worker #{} 写入已下载的部分数据失败: {:?}", worker_id, e);
-                } else {
-                    debug!(
-                        "Worker #{} 成功写入已下载的 {} bytes",
-                        worker_id, bytes_downloaded
-                    );
-                }
-
-                // 返回剩余的 range 用于重试
-                let error_msg = format!(
-                    "下载被取消，剩余 range: {}..{}",
-                    remaining_range.start(),
-                    remaining_range.end()
-                );
-                debug!("Worker #{} {}", worker_id, error_msg);
-                RangeResult::DownloadFailed {
-                    worker_id,
-                    range: remaining_range,
-                    error: error_msg,
-                    retry_count,
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Worker #{} 无法拆分 range: bytes_downloaded={}, range={}..{}",
-                    worker_id, bytes_downloaded, start, end
-                );
-                RangeResult::DownloadFailed {
-                    worker_id,
-                    range,
-                    error: e.to_string(),
-                    retry_count,
-                }
-            }
-        }
-    }
-
-    /// 处理下载失败的情况
-    fn handle_download_failed(
-        &self,
-        worker_id: u64,
-        range: ranged_mmap::AllocatedRange,
-        retry_count: usize,
-        error: crate::utils::fetch::FetchError,
-    ) -> RangeResult {
-        let (start, end) = range.as_range_tuple();
-        let error_msg = format!("下载失败: {:?}", error);
-        error!(
-            "Worker #{} Range {}..{} {}",
-            worker_id, start, end, error_msg
-        );
-
-        RangeResult::DownloadFailed {
-            worker_id,
-            range,
-            error: error_msg,
-            retry_count,
-        }
-    }
-
-    /// 根据当前速度更新分块大小
-    fn update_chunk_size(
-        &self,
-        context: &DownloadWorkerContext,
-        stats: &mut SmrSwap<WorkerStats>,
-    ) {
-        let stats_guard = stats.load();
-        let instant_speed = stats_guard.get_instant_speed();
-        let window_avg_speed = stats_guard.get_window_avg_speed();
-
-        if let (Some(instant_speed), Some(window_avg_speed)) = (instant_speed, window_avg_speed) {
-            let current_chunk_size = stats_guard.get_current_chunk_size();
-            // Context 现在是 Arc<Inner>，通过解引用访问 chunk_strategy
-            let new_chunk_size = context.chunk_strategy.calculate_chunk_size(
-                current_chunk_size,
-                instant_speed,
-                window_avg_speed,
-            );
-
-            drop(stats_guard);
-
-            stats.update(|stats| {
-                let mut stats = stats.clone();
-                stats.set_current_chunk_size(new_chunk_size);
-                stats
-            });
-
-            debug!(
-                "Updated chunk size: {} -> {} (speed: {}, avg: {})",
-                current_chunk_size,
-                new_chunk_size,
-                FormattedValue::new(instant_speed, self.size_standard),
-                FormattedValue::new(window_avg_speed, self.size_standard)
-            );
-        }
     }
 }
 
@@ -656,6 +406,7 @@ mod tests {
     use super::*;
     use crate::utils::io_traits::mock::MockHttpClient;
     use bytes::Bytes;
+    use lite_sync::oneshot::lite;
     use reqwest::{StatusCode, header::HeaderMap};
 
     #[tokio::test]
@@ -756,9 +507,9 @@ mod tests {
             Bytes::from_static(test_data),
         );
 
-        // 创建工厂
+        // 创建执行器
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let mut executor = DownloadWorkerFactory::new(client, writer, SizeStandard::SI);
+        let mut executor = DownloadTaskExecutor::new(client, writer, SizeStandard::SI);
 
         // 创建上下文和统计
         let mut stats = SmrSwap::new(crate::utils::stats::WorkerStats::default());
@@ -817,9 +568,9 @@ mod tests {
             Bytes::new(),
         );
 
-        // 创建工厂
+        // 创建执行器
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let mut executor = DownloadWorkerFactory::new(client, writer, SizeStandard::SI);
+        let mut executor = DownloadTaskExecutor::new(client, writer, SizeStandard::SI);
 
         let mut stats = SmrSwap::new(crate::utils::stats::WorkerStats::default());
         let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
