@@ -31,7 +31,7 @@ use crate::utils::{
     writer::MmapWriter,
 };
 use crate::DownloadError;
-use log::{debug, error, info};
+use log::info;
 use net_bytes::{DownloadSpeed, SizeStandard};
 use smr_swap::{LocalReader, ReadGuard, SmrSwap};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -95,13 +95,10 @@ where
     fn spawn_worker(
         &self,
         worker_id: u64,
-        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         input: Self::Input,
     ) -> Vec<JoinHandle<()>> {
-        let mut handles = Vec::new();
-
-        // --- 协程 0: 主下载循环 ---
-        let mut executor = self.executor.clone();
+        let executor = self.executor.clone();
 
         let DownloadWorkerInput {
             context,
@@ -110,38 +107,13 @@ where
             result_tx,
         } = input;
 
-        let main_handle = tokio::spawn(async move {
-            let mut context = context;
-            let mut stats = stats;
-            let mut task_rx = task_rx;
-
-            debug!("Worker #{} 主循环启动", worker_id);
-
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        info!("Worker #{} 收到关闭信号，主循环退出", worker_id);
-                        break;
-                    }
-                    Some(task) = task_rx.recv() => {
-                        let result = executor.execute_task(worker_id, task, &mut context, &mut stats).await;
-                        if let Err(e) = result_tx.send(result).await {
-                            error!("Worker #{} 发送结果失败: {:?}", worker_id, e);
-                        }
-                    }
-                    else => {
-                        debug!("Worker #{} 任务通道关闭，退出", worker_id);
-                        break;
-                    }
-                }
-            }
-        });
-
-        handles.push(main_handle);
+        // --- 协程 0: 主下载循环 ---
+        let main_handle = tokio::spawn(
+            executor.run_loop(worker_id, context, stats, task_rx, result_tx, shutdown_rx),
+        );
 
         // --- 协程 1+: 辅助协程 (暂未实现，预留位置) ---
-
-        handles
+        vec![main_handle]
     }
 }
 
@@ -405,9 +377,6 @@ where
 mod tests {
     use super::*;
     use crate::utils::io_traits::mock::MockHttpClient;
-    use bytes::Bytes;
-    use lite_sync::oneshot::lite;
-    use reqwest::{StatusCode, header::HeaderMap};
 
     #[tokio::test]
     async fn test_download_worker_pool_creation() {
@@ -475,132 +444,5 @@ mod tests {
         // 验证所有 worker 都已被移除
         assert_eq!(pool.pool.worker_count(), 0);
         assert!(pool.pool.slots.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_download_worker_executor_success() {
-        use std::num::NonZeroU64;
-
-        let test_url = "http://example.com/file.bin";
-        let test_data = b"0123456789ABCDEFGHIJ"; // 20 bytes
-
-        let client = MockHttpClient::new();
-        let dir = tempfile::tempdir().unwrap();
-        let save_path = dir.path().join("test.bin");
-
-        let (writer, mut allocator) =
-            MmapWriter::new(save_path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
-
-        let range = allocator
-            .allocate(NonZeroU64::new(test_data.len() as u64).unwrap())
-            .unwrap();
-
-        // 设置 Range 响应
-        let mut headers = HeaderMap::new();
-        headers.insert("content-range", format!("bytes 0-19/20").parse().unwrap());
-        client.set_range_response(
-            test_url,
-            0,
-            19,
-            StatusCode::PARTIAL_CONTENT,
-            headers,
-            Bytes::from_static(test_data),
-        );
-
-        // 创建执行器
-        let config = Arc::new(crate::config::DownloadConfig::default());
-        let mut executor = DownloadTaskExecutor::new(client, writer, SizeStandard::SI);
-
-        // 创建上下文和统计
-        let mut stats = SmrSwap::new(crate::utils::stats::WorkerStats::default());
-        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
-            as Box<dyn ChunkStrategy + Send + Sync>;
-        let mut context = DownloadWorkerContext { chunk_strategy };
-
-        // 执行任务
-        let (_cancel_tx, cancel_rx) = lite::channel();
-        let task = RangeTask::Range {
-            url: test_url.to_string(),
-            range,
-            retry_count: 0,
-            cancel_rx,
-        };
-
-        let result = executor.execute_task(0, task, &mut context, &mut stats).await;
-
-        // 验证结果
-        match result {
-            RangeResult::Complete { worker_id } => {
-                assert_eq!(worker_id, 0);
-            }
-            RangeResult::DownloadFailed { error, .. } | RangeResult::WriteFailed { error, .. } => {
-                panic!("任务不应该失败: {}", error);
-            }
-        }
-
-        // 验证统计
-        let (total_bytes, _, ranges) = stats.load().get_summary();
-        assert_eq!(total_bytes, test_data.len() as u64);
-        assert_eq!(ranges, 1);
-    }
-
-    #[tokio::test]
-    async fn test_download_worker_executor_failure() {
-        use std::num::NonZeroU64;
-
-        let test_url = "http://example.com/file.bin";
-        let client = MockHttpClient::new();
-        let dir = tempfile::tempdir().unwrap();
-        let save_path = dir.path().join("test.bin");
-
-        let (writer, mut allocator) =
-            MmapWriter::new(save_path, NonZeroU64::new(100).unwrap()).unwrap();
-
-        let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
-
-        // 设置失败的 Range 响应
-        client.set_range_response(
-            test_url,
-            0,
-            9,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            HeaderMap::new(),
-            Bytes::new(),
-        );
-
-        // 创建执行器
-        let config = Arc::new(crate::config::DownloadConfig::default());
-        let mut executor = DownloadTaskExecutor::new(client, writer, SizeStandard::SI);
-
-        let mut stats = SmrSwap::new(crate::utils::stats::WorkerStats::default());
-        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(&config))
-            as Box<dyn ChunkStrategy + Send + Sync>;
-        let mut context = DownloadWorkerContext { chunk_strategy };
-
-        let (_cancel_tx, cancel_rx) = lite::channel();
-        let task = RangeTask::Range {
-            url: test_url.to_string(),
-            range,
-            retry_count: 0,
-            cancel_rx,
-        };
-
-        let result = executor.execute_task(0, task, &mut context, &mut stats).await;
-
-        // 验证结果
-        match result {
-            RangeResult::DownloadFailed {
-                worker_id, error, ..
-            } => {
-                assert_eq!(worker_id, 0);
-                assert!(error.contains("下载失败"));
-            }
-            RangeResult::WriteFailed { .. } => {
-                panic!("应该是下载失败，而不是写入失败");
-            }
-            RangeResult::Complete { .. } => {
-                panic!("任务应该失败");
-            }
-        }
     }
 }

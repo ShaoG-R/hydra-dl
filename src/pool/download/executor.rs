@@ -1,6 +1,7 @@
 //! 下载任务执行器
 //!
 //! 封装核心的下载协程逻辑，包括：
+//! - Worker 主循环（接收任务、处理关闭信号）
 //! - Range 下载执行
 //! - 下载结果处理（完成、取消、失败）
 //! - 分块大小动态调整
@@ -16,9 +17,10 @@ use crate::utils::{
     writer::MmapWriter,
 };
 use lite_sync::oneshot::lite;
-use log::{debug, error};
+use log::{debug, error, info};
 use net_bytes::{FormattedValue, SizeStandard};
 use smr_swap::SmrSwap;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// 下载 Worker 的上下文
 ///
@@ -58,19 +60,51 @@ impl<C> DownloadTaskExecutor<C> {
 }
 
 impl<C: HttpClient> DownloadTaskExecutor<C> {
-    /// 核心业务逻辑：执行单个 Range 下载任务
+    /// Worker 主循环
+    ///
+    /// 运行下载 Worker 的主事件循环，处理任务接收、执行和结果发送。
     ///
     /// # Arguments
     ///
-    /// - `worker_id`: Worker 的 ID，用于日志和结果标识
-    /// - `task`: 要执行的下载任务
-    /// - `context`: Worker 上下文，包含分块策略
+    /// - `worker_id`: Worker 的 ID
+    /// - `context`: Worker 上下文
     /// - `stats`: Worker 统计数据
-    ///
-    /// # Returns
-    ///
-    /// 返回下载结果，包括成功、失败或取消的情况
-    pub(crate) async fn execute_task(
+    /// - `task_rx`: 任务接收通道
+    /// - `result_tx`: 结果发送通道
+    /// - `shutdown_rx`: 关闭信号接收器
+    pub(crate) async fn run_loop(
+        mut self,
+        worker_id: u64,
+        mut context: DownloadWorkerContext,
+        mut stats: SmrSwap<WorkerStats>,
+        mut task_rx: Receiver<RangeTask>,
+        result_tx: Sender<RangeResult>,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        debug!("Worker #{} 主循环启动", worker_id);
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("Worker #{} 收到关闭信号，主循环退出", worker_id);
+                    break;
+                }
+                Some(task) = task_rx.recv() => {
+                    let result = self.execute_task(worker_id, task, &mut context, &mut stats).await;
+                    if let Err(e) = result_tx.send(result).await {
+                        error!("Worker #{} 发送结果失败: {:?}", worker_id, e);
+                    }
+                }
+                else => {
+                    debug!("Worker #{} 任务通道关闭，退出", worker_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 核心业务逻辑：执行单个 Range 下载任务
+    async fn execute_task(
         &mut self,
         worker_id: u64,
         task: RangeTask,
