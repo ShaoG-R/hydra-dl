@@ -16,10 +16,10 @@ async fn test_concurrent_writes_simulation() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("concurrent_test.dat");
 
-    // 模拟 1MB 文件，分成 10 个 Range
-    let total_size = 1024 * 1024u64;
+    // 使用 40KB 文件，分成 10 个 4K 对齐的 Range
+    let range_size = 4096u64;
     let range_count = 10;
-    let range_size = total_size / range_count as u64;
+    let total_size = range_size * range_count as u64;
 
     let (writer, mut allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
@@ -27,15 +27,8 @@ async fn test_concurrent_writes_simulation() {
     // 预先分配所有 Range
     let mut ranges = Vec::new();
     for i in 0..range_count {
-        let size = if i == range_count - 1 {
-            allocator.remaining()
-        } else {
-            range_size
-        };
-        ranges.push((
-            i,
-            allocator.allocate(NonZeroU64::new(size).unwrap()).unwrap(),
-        ));
+        let range = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
+        ranges.push((i, range));
     }
 
     // 模拟并发写入（实际按顺序执行，但模拟乱序接收）
@@ -60,11 +53,7 @@ async fn test_concurrent_writes_simulation() {
     // 验证每个 Range 的内容
     for i in 0..range_count {
         let start = (i as u64 * range_size) as usize;
-        let end = if i == range_count - 1 {
-            total_size as usize
-        } else {
-            start + range_size as usize
-        };
+        let end = start + range_size as usize;
         let expected_value = (i + 1) as u8;
         assert!(content[start..end].iter().all(|&b| b == expected_value));
     }
@@ -76,13 +65,14 @@ async fn test_partial_completion() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("partial_test.dat");
 
-    let total_size = 500u64;
-    let range_size = 100u64;
+    // 使用 4K 对齐的大小
+    let range_size = 4096u64;
+    let total_size = range_size * 5; // 20KB
 
     let (writer, mut allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
-    // 分配 5 个 Range
+    // 分配 5 个 4K Range
     let range0 = allocator
         .allocate(NonZeroU64::new(range_size).unwrap())
         .unwrap();
@@ -113,8 +103,8 @@ async fn test_partial_completion() {
     assert!(!writer.is_complete());
 
     let (written, total_bytes) = writer.progress();
-    assert_eq!(written, 300);
-    assert_eq!(total_bytes, 500);
+    assert_eq!(written, range_size * 3);
+    assert_eq!(total_bytes, total_size);
 
     // 完成剩余的 Range
     writer
@@ -159,20 +149,21 @@ async fn test_uneven_ranges() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("uneven_ranges.dat");
 
-    // 总大小不能被 Range 数量整除
-    let total_size = 1000u64;
+    // 使用 12KB 文件，分成 3 个 4K 对齐的 Range
+    let range_size = 4096u64;
+    let total_size = range_size * 3; // 12KB
 
     let (writer, mut allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
-    // 分配不均匀的 Range
-    let range0 = allocator.allocate(NonZeroU64::new(333).unwrap()).unwrap(); // 0-332 (333 bytes)
-    let range1 = allocator.allocate(NonZeroU64::new(333).unwrap()).unwrap(); // 333-665 (333 bytes)
-    let range2 = allocator.allocate(NonZeroU64::new(334).unwrap()).unwrap(); // 666-999 (334 bytes)
+    // 分配 3 个 4K Range
+    let range0 = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
+    let range1 = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
+    let range2 = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
 
-    writer.write_range(range0, vec![1u8; 333].as_ref()).unwrap();
-    writer.write_range(range1, vec![2u8; 333].as_ref()).unwrap();
-    writer.write_range(range2, vec![3u8; 334].as_ref()).unwrap();
+    writer.write_range(range0, vec![1u8; range_size as usize].as_ref()).unwrap();
+    writer.write_range(range1, vec![2u8; range_size as usize].as_ref()).unwrap();
+    writer.write_range(range2, vec![3u8; range_size as usize].as_ref()).unwrap();
 
     assert!(writer.is_complete());
     writer.finalize().unwrap();
@@ -180,19 +171,20 @@ async fn test_uneven_ranges() {
     // 验证文件内容
     let content = fs::read(&file_path).await.unwrap();
     assert_eq!(content.len(), total_size as usize);
-    assert_eq!(&content[0..333], &vec![1u8; 333][..]);
-    assert_eq!(&content[333..666], &vec![2u8; 333][..]);
-    assert_eq!(&content[666..1000], &vec![3u8; 334][..]);
+    assert_eq!(&content[0..range_size as usize], &vec![1u8; range_size as usize][..]);
+    assert_eq!(&content[range_size as usize..range_size as usize * 2], &vec![2u8; range_size as usize][..]);
+    assert_eq!(&content[range_size as usize * 2..total_size as usize], &vec![3u8; range_size as usize][..]);
 }
 
-/// 测试大量小 Range
+/// 测试大量 4K 对齐的 Range
 #[tokio::test]
 async fn test_many_small_ranges() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("many_ranges.dat");
 
-    let range_count = 1000;
-    let range_size = 100u64;
+    // 使用 100 个 4K Range
+    let range_count = 100;
+    let range_size = 4096u64;
     let total_size = range_count as u64 * range_size;
 
     let (writer, mut allocator) =
@@ -229,9 +221,10 @@ async fn test_progress_tracking() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("progress.dat");
 
-    let total_size = 1000u64;
+    // 使用 4K 对齐的 Range
+    let range_size = 4096u64;
     let range_count = 10;
-    let range_size = total_size / range_count as u64;
+    let total_size = range_size * range_count as u64;
 
     let (writer, mut allocator) =
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();

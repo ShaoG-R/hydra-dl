@@ -3,7 +3,7 @@ use crate::utils::writer::MmapWriter;
 use crate::{DownloadError, Result};
 use kestrel_timer::TimerService;
 use log::{info, warn};
-use ranged_mmap::RangeAllocator;
+use ranged_mmap::allocator::sequential::Allocator as RangeAllocator;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -399,7 +399,8 @@ mod tests {
         let (_timer, timer_service) = create_timer_service();
 
         let test_url = "http://example.com/file.bin";
-        let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
+        // 使用 12KB 文件以适应 4K 对齐的分配器
+        let test_data: Vec<u8> = (0..12288u32).map(|i| (i % 256) as u8).collect();
         let temp_dir = tempfile::tempdir().unwrap();
         let save_path = temp_dir.path().join("test_download.bin");
 
@@ -415,17 +416,13 @@ mod tests {
         client.set_head_response(test_url, StatusCode::OK, head_headers);
 
         // 设置 Range 请求响应
-        // 假设分成 3 个 range：0-11, 12-23, 24-35
+        // 分成 3 个 4K range：0-4095, 4096-8191, 8192-12287
         let range_count = 3;
-        let chunk_size = test_data.len() / range_count;
+        let chunk_size = 4096;
 
         for i in 0..range_count {
             let start = i * chunk_size;
-            let end = if i == range_count - 1 {
-                test_data.len()
-            } else {
-                (i + 1) * chunk_size
-            };
+            let end = (i + 1) * chunk_size;
 
             let chunk = &test_data[start..end];
             let mut headers = HeaderMap::new();
@@ -547,7 +544,8 @@ mod tests {
     async fn test_download_ranged_multiple_workers() {
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
-        let test_data: Vec<u8> = (0..100).collect(); // 100 bytes
+        // 使用 16KB 文件以适应 4K 对齐
+        let test_data: Vec<u8> = (0..16384u32).map(|i| (i % 256) as u8).collect();
         let temp_dir = tempfile::tempdir().unwrap();
         let save_path = temp_dir.path().join("test_multi_workers.bin");
 
@@ -562,17 +560,13 @@ mod tests {
         );
         client.set_head_response(test_url, StatusCode::OK, head_headers);
 
-        // 设置 Range 请求响应（4 个 range）
+        // 设置 Range 请求响应（4 个 4K range）
         let range_count = 4;
-        let chunk_size = test_data.len() / range_count;
+        let chunk_size = 4096;
 
         for i in 0..range_count {
             let start = i * chunk_size;
-            let end = if i == range_count - 1 {
-                test_data.len()
-            } else {
-                (i + 1) * chunk_size
-            };
+            let end = (i + 1) * chunk_size;
 
             let chunk = &test_data[start..end];
             let mut headers = HeaderMap::new();
@@ -819,7 +813,8 @@ mod tests {
         // 测试渐进式启动配置
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
-        let test_data: Vec<u8> = (0..100).collect(); // 100 bytes
+        // 使用 16KB 文件以适应 4K 对齐
+        let test_data: Vec<u8> = (0..16384u32).map(|i| (i % 256) as u8).collect();
         let temp_dir = tempfile::tempdir().unwrap();
         let save_path = temp_dir.path().join("test_progressive.bin");
 
@@ -834,17 +829,13 @@ mod tests {
         );
         client.set_head_response(test_url, StatusCode::OK, head_headers);
 
-        // 设置足够多的 Range 请求响应
-        let chunk_size = 10;
-        let range_count = (test_data.len() + chunk_size - 1) / chunk_size;
+        // 设置 4 个 4K range 响应
+        let chunk_size = 4096;
+        let range_count = 4;
 
         for i in 0..range_count {
             let start = i * chunk_size;
-            let end = if i == range_count - 1 {
-                test_data.len()
-            } else {
-                (i + 1) * chunk_size
-            };
+            let end = (i + 1) * chunk_size;
 
             let chunk = &test_data[start..end];
             let mut headers = HeaderMap::new();
@@ -980,7 +971,8 @@ mod tests {
         // 测试失败任务重试成功
         let (_timer, timer_service) = create_timer_service();
         let test_url = "http://example.com/file.bin";
-        let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
+        // 使用 8KB 文件以适应 4K 对齐
+        let test_data: Vec<u8> = (0..8192u32).map(|i| (i % 256) as u8).collect();
         let temp_dir = tempfile::tempdir().unwrap();
         let save_path = temp_dir.path().join("test_retry_success.bin");
 
@@ -995,17 +987,13 @@ mod tests {
         );
         client.set_head_response(test_url, StatusCode::OK, head_headers);
 
-        // 设置 Range 请求响应
-        let chunk_size = 12;
-        let range_count = (test_data.len() + chunk_size - 1) / chunk_size;
+        // 设置 2 个 4K range 响应
+        let chunk_size = 4096;
+        let range_count = 2;
 
         for i in 0..range_count {
             let start = i * chunk_size;
-            let end = if i == range_count - 1 {
-                test_data.len()
-            } else {
-                (i + 1) * chunk_size
-            };
+            let end = (i + 1) * chunk_size;
 
             let chunk = &test_data[start..end];
             let mut headers = HeaderMap::new();
@@ -1053,7 +1041,7 @@ mod tests {
             .concurrency(|c| c.worker_count(1))
             .chunk(|c| {
                 c.initial_size(chunk_size as u64)
-                    .min_size(1)
+                    .min_size(chunk_size as u64)
                     .max_size(chunk_size as u64)
             })
             .retry(|r| {

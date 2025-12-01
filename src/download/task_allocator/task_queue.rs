@@ -5,7 +5,7 @@
 use crate::task::WorkerTask;
 use lite_sync::oneshot::lite;
 use log::debug;
-use ranged_mmap::{AllocatedRange, RangeAllocator};
+use ranged_mmap::{AllocatedRange, allocator::sequential::Allocator as RangeAllocator};
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
@@ -105,14 +105,10 @@ impl TaskQueue {
             return None;
         }
 
-        // 计算实际分配大小（不超过剩余空间）
-        let alloc_size = chunk_size.min(remaining);
-
         // 分配 range
         let range = self
             .allocator
-            .allocate(NonZeroU64::new(alloc_size).unwrap())
-            .ok()?;
+            .allocate(NonZeroU64::new(chunk_size).unwrap())?;
 
         // 创建取消通道
         let (cancel_tx, cancel_rx) = lite::channel();
@@ -196,7 +192,7 @@ mod tests {
     fn create_test_queue(size: u64) -> TaskQueue {
         let temp_file = NamedTempFile::new().unwrap();
         let (_file, allocator) =
-            MmapFile::create(temp_file.path(), NonZeroU64::new(size).unwrap()).unwrap();
+            MmapFile::create_default(temp_file.path(), NonZeroU64::new(size).unwrap()).unwrap();
         TaskQueue::new(allocator, "http://example.com/file.bin".to_string())
     }
 
@@ -211,7 +207,8 @@ mod tests {
 
     #[test]
     fn test_idle_worker_fifo() {
-        let mut queue = create_test_queue(1000);
+        // 使用 16K 大小以确保多次 4K 对齐分配后仍有剩余空间
+        let mut queue = create_test_queue(16384);
 
         queue.mark_worker_idle(0);
         queue.mark_worker_idle(1);
@@ -221,10 +218,10 @@ mod tests {
         assert!(queue.has_idle_workers());
 
         // 分配时应按 FIFO 顺序
-        let task = queue.try_allocate(100).unwrap();
+        let task = queue.try_allocate(4096).unwrap();
         assert_eq!(task.worker_id, 0);
 
-        let task = queue.try_allocate(100).unwrap();
+        let task = queue.try_allocate(4096).unwrap();
         assert_eq!(task.worker_id, 1);
     }
 

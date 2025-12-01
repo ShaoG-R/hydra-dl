@@ -191,7 +191,7 @@ mod tests {
     fn allocate_test_range(size: u64) -> AllocatedRange {
         let temp_file = NamedTempFile::new().unwrap();
         let (_file, mut allocator) =
-            MmapFile::create(temp_file.path(), NonZeroU64::new(size).unwrap()).unwrap();
+            MmapFile::create_default(temp_file.path(), NonZeroU64::new(size).unwrap()).unwrap();
         allocator.allocate(NonZeroU64::new(size).unwrap()).unwrap()
     }
 

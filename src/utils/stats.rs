@@ -148,6 +148,9 @@ pub(crate) struct WorkerStats {
     /// worker 是否正在执行任务
     /// 由 worker 内部在 execute 开始和结束时更新
     is_active: bool,
+    /// Worker 生命周期开始时间（用于计算整体平均速度）
+    /// 不随 clear_samples() 重置，在第一次记录数据时初始化
+    worker_start_time: Option<std::time::Instant>,
 }
 
 impl Default for WorkerStats {
@@ -169,6 +172,7 @@ impl WorkerStats {
             parent_aggregator: None,
             current_chunk_size: 0,
             is_active: false,
+            worker_start_time: None,
         }
     }
 
@@ -184,6 +188,7 @@ impl WorkerStats {
             parent_aggregator: Some(parent_aggregator),
             current_chunk_size: 0,
             is_active: false,
+            worker_start_time: None,
         }
     }
 
@@ -197,6 +202,11 @@ impl WorkerStats {
     /// * `bytes` - 本次下载的字节数
     #[inline]
     pub(crate) fn record_chunk(&mut self, bytes: u64) {
+        // 第一次记录时初始化 worker 开始时间（用于计算整体平均速度）
+        if self.worker_start_time.is_none() {
+            self.worker_start_time = Some(std::time::Instant::now());
+        }
+
         // 原子增加字节数（使用 Relaxed 顺序，性能最佳）
         self.total_bytes += bytes;
         let current_total = self.total_bytes;
@@ -223,14 +233,16 @@ impl WorkerStats {
 
     /// 获取当前平均下载速度
     ///
-    /// 从开始到现在的总体平均速度
+    /// 从 Worker 开始工作到现在的总体平均速度
+    /// 使用 worker_start_time 而不是 speed_calculator 的 start_time，
+    /// 因为后者会在每次任务开始时重置
     ///
     /// # Returns
     ///
     /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
     #[inline]
     pub(crate) fn get_speed(&self) -> Option<DownloadSpeed> {
-        let start_time = self.speed_calculator.get_start_time()?;
+        let start_time = self.worker_start_time?;
         let elapsed = start_time.elapsed();
         if elapsed.as_secs_f64() > 0.0 {
             let bytes = self.total_bytes;
@@ -284,8 +296,7 @@ impl WorkerStats {
         let bytes = self.total_bytes;
         let ranges = self.completed_ranges;
         let elapsed_secs = self
-            .speed_calculator
-            .get_start_time()
+            .worker_start_time
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0);
         (bytes, elapsed_secs, ranges)
@@ -349,8 +360,7 @@ impl WorkerStats {
         let total_bytes = self.total_bytes;
         let completed_ranges = self.completed_ranges;
         let elapsed_secs = self
-            .speed_calculator
-            .get_start_time()
+            .worker_start_time
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0);
 

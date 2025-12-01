@@ -77,7 +77,7 @@ pub type Result<T> = std::result::Result<T, FetchError>;
 /// # use std::num::NonZeroU64;
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// // 从 AllocatedRange 创建
-/// let (file, mut allocator) = MmapFile::create("test.bin", NonZeroU64::new(1000).unwrap())?;
+/// let (file, mut allocator) = MmapFile::create_default("test.bin", NonZeroU64::new(1000).unwrap())?;
 /// let allocated = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
 /// let fetch_range = FetchRange::from_allocated_range(&allocated)?;
 ///
@@ -129,7 +129,7 @@ impl FetchRange {
     /// # use ranged_mmap::{MmapFile, AllocatedRange};
     /// # use std::num::NonZeroU64;
     /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let (file, mut allocator) = MmapFile::create("test.bin", NonZeroU64::new(1000).unwrap())?;
+    /// let (file, mut allocator) = MmapFile::create_default("test.bin", NonZeroU64::new(1000).unwrap())?;
     /// let allocated = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
     /// let range = FetchRange::from_allocated_range(&allocated)?;
     /// let (http_start, http_end) = range.as_http_range();
@@ -159,7 +159,7 @@ impl FetchRange {
     /// # use ranged_mmap::{MmapFile, AllocatedRange};
     /// # use std::num::NonZeroU64;
     /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let (file, mut allocator) = MmapFile::create("test.bin", NonZeroU64::new(1000).unwrap())?;
+    /// let (file, mut allocator) = MmapFile::create_default("test.bin", NonZeroU64::new(1000).unwrap())?;
     /// let allocated = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
     /// let range = FetchRange::from_allocated_range(&allocated)?;
     /// let (file_start, file_end) = range.as_file_range();
@@ -908,7 +908,8 @@ mod tests {
 
         // 测试完整下载（不触发取消）
         let test_url = "http://example.com/file.bin";
-        let full_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        // 使用 4K 对齐的数据大小
+        let full_data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
 
         let client = MockHttpClient::new();
         let mut stats = SmrSwap::new(WorkerStats::default());
@@ -917,21 +918,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
         let (_file, mut allocator) =
-            MmapFile::create(path, NonZeroU64::new(full_data.len() as u64).unwrap()).unwrap();
-        let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap(); // 分配 10 bytes，范围是 0-9
+            MmapFile::create_default(path, NonZeroU64::new(full_data.len() as u64).unwrap()).unwrap();
+        let range = allocator.allocate(NonZeroU64::new(4096).unwrap()).unwrap(); // 分配整个 4K
 
-        let expected_data = &full_data[0..10]; // "0123456789"
+        let expected_data = &full_data[0..4096];
 
         // 设置 Range 响应
         let mut headers = HeaderMap::new();
         headers.insert(
             "content-range",
-            format!("bytes 0-9/{}", full_data.len()).parse().unwrap(),
+            format!("bytes 0-4095/{}", full_data.len()).parse().unwrap(),
         );
         client.set_range_response(
             test_url,
             0,
-            9,
+            4095,
             reqwest::StatusCode::PARTIAL_CONTENT,
             headers,
             Bytes::copy_from_slice(expected_data),
@@ -979,7 +980,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
-        let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(100).unwrap()).unwrap();
+        let (_file, mut allocator) = MmapFile::create_default(path, NonZeroU64::new(100).unwrap()).unwrap();
         let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
 
         // 设置错误响应
@@ -1089,7 +1090,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
-        let (_file, mut allocator) = MmapFile::create(path, NonZeroU64::new(end).unwrap()).unwrap();
+        let (_file, mut allocator) = MmapFile::create_default(path, NonZeroU64::new(end).unwrap()).unwrap();
         let range = allocator.allocate(NonZeroU64::new(end).unwrap()).unwrap();
 
         // 设置 Range 响应
@@ -1151,7 +1152,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
         let (_file, mut allocator) =
-            MmapFile::create(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+            MmapFile::create_default(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
         let range = allocator
             .allocate(NonZeroU64::new(test_data.len() as u64).unwrap())
             .unwrap();
@@ -1227,7 +1228,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
         let (_file, mut allocator) =
-            MmapFile::create(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+            MmapFile::create_default(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
         let range = allocator
             .allocate(NonZeroU64::new(test_data.len() as u64).unwrap())
             .unwrap();

@@ -28,7 +28,7 @@ use crate::task::RangeResult;
 use crate::utils::io_traits::HttpClient;
 use kestrel_timer::{TaskNotification, TimerService, spsc};
 use log::{debug, error, info, warn};
-use ranged_mmap::{AllocatedRange, RangeAllocator};
+use ranged_mmap::{AllocatedRange, allocator::sequential::Allocator as RangeAllocator};
 use rustc_hash::FxHashMap;
 use smr_swap::LocalReader;
 use std::sync::Arc;
