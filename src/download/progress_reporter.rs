@@ -3,31 +3,12 @@
 //! 负责管理进度报告和统计信息收集
 //! 采用 Actor 模式，完全独立于主下载循环
 
+use crate::download::download_stats::AggregatedStats;
 use log::debug;
 use net_bytes::{DownloadAcceleration, DownloadSpeed};
-use rustc_hash::FxHashMap;
 use smr_swap::LocalReader;
 use std::num::NonZeroU64;
 use tokio::sync::mpsc;
-
-/// Worker 统计信息
-#[derive(Debug, Clone)]
-pub struct WorkerStatSnapshot {
-    /// Worker ID
-    pub worker_id: u64,
-    /// 该 worker 下载的字节数
-    pub bytes: u64,
-    /// 该 worker 完成的 range 数量
-    pub ranges: usize,
-    /// 该 worker 平均速度 (bytes/s)
-    pub avg_speed: Option<DownloadSpeed>,
-    /// 该 worker 实时速度 (bytes/s)，如果无效则为 None
-    pub instant_speed: Option<DownloadSpeed>,
-    /// 该 worker 当前的分块大小 (bytes)
-    pub current_chunk_size: u64,
-    /// 该 worker 实时加速度 (bytes/s²)，如果无效则为 None
-    pub instant_acceleration: Option<DownloadAcceleration>,
-}
 
 /// 下载进度更新信息
 #[derive(Debug, Clone)]
@@ -41,7 +22,7 @@ pub enum DownloadProgress {
         /// 初始分块大小（bytes）
         initial_chunk_size: u64,
     },
-    /// 下载进度更新（包含总体统计和所有 worker 的统计）
+    /// 下载进度更新（包含总体统计和所有 Executor 的聚合统计）
     Progress {
         /// 已下载字节数
         bytes_downloaded: u64,
@@ -57,10 +38,10 @@ pub enum DownloadProgress {
         window_avg_speed: Option<DownloadSpeed>,
         /// 实时加速度 (bytes/s²)，如果无效则为 None
         instant_acceleration: Option<DownloadAcceleration>,
-        /// 所有 worker 的统计信息（包含各自的分块大小）
-        worker_stats: Vec<WorkerStatSnapshot>,
+        /// 所有 Executor 的聚合统计信息
+        executor_stats: AggregatedStats,
     },
-    /// 下载已完成（包含最终的 worker 统计）
+    /// 下载已完成（包含最终的 Executor 聚合统计）
     Completed {
         /// 总下载字节数
         total_bytes: u64,
@@ -68,8 +49,8 @@ pub enum DownloadProgress {
         total_time: f64,
         /// 平均速度 (bytes/s)
         avg_speed: Option<DownloadSpeed>,
-        /// 所有 worker 的最终统计信息
-        worker_stats: Vec<WorkerStatSnapshot>,
+        /// 所有 Executor 的最终聚合统计信息
+        executor_stats: AggregatedStats,
     },
     /// 下载出错
     Error {
@@ -100,10 +81,8 @@ pub(super) struct ProgressReporterParams {
     pub progress_sender: Option<mpsc::Sender<DownloadProgress>>,
     /// 文件总大小
     pub total_size: NonZeroU64,
-    /// 共享的 worker handles
-    pub worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle>>,
-    /// 全局统计管理器
-    pub global_stats: crate::utils::stats::TaskStats,
+    /// 聚合统计数据读取器（从 DownloadStats 获取）
+    pub aggregated_stats: LocalReader<AggregatedStats>,
     /// 更新间隔
     pub update_interval: std::time::Duration,
     /// 启动偏移时间
@@ -120,12 +99,12 @@ struct ProgressReporterActor {
     total_size: NonZeroU64,
     /// 消息接收器（async channel）
     message_rx: mpsc::Receiver<ActorMessage>,
-    /// 共享的 worker handles（用于直接获取统计信息）
-    worker_handles: LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle>>,
-    /// 全局统计管理器（用于获取总体统计数据）
-    global_stats: crate::utils::stats::TaskStats,
+    /// 聚合统计数据读取器（从 DownloadStats 获取）
+    aggregated_stats: LocalReader<AggregatedStats>,
     /// 进度更新定时器（内部管理）
     progress_timer: tokio::time::Interval,
+    /// 启动时间（用于计算总耗时）
+    start_time: std::time::Instant,
 }
 
 impl ProgressReporterActor {
@@ -134,23 +113,22 @@ impl ProgressReporterActor {
         let ProgressReporterParams {
             progress_sender,
             total_size,
-            worker_handles,
-            global_stats,
+            aggregated_stats,
             update_interval,
             start_offset,
         } = params;
 
         debug!("ProgressReporter 启动偏移: {:?}", start_offset);
-        let start_time = tokio::time::Instant::now() + start_offset;
-        let progress_timer = tokio::time::interval_at(start_time, update_interval);
+        let timer_start = tokio::time::Instant::now() + start_offset;
+        let progress_timer = tokio::time::interval_at(timer_start, update_interval);
 
         Self {
             progress_sender,
             total_size,
             message_rx,
-            worker_handles,
-            global_stats,
+            aggregated_stats,
             progress_timer,
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -222,75 +200,56 @@ impl ProgressReporterActor {
         }
     }
 
-    /// 计算 worker 统计快照（直接从 worker_handles 中获取）
-    fn compute_worker_snapshots(&self) -> Vec<WorkerStatSnapshot> {
-        let handles = self.worker_handles.load();
-        handles
-            .iter()
-            .map(|(worker_id, handle)| {
-                let stats = handle.stats();
-                let summary = stats.get_full_summary();
-                let current_chunk_size = stats.get_current_chunk_size();
-                let instant_acceleration = stats.get_instant_acceleration();
-
-                WorkerStatSnapshot {
-                    worker_id: *worker_id,
-                    bytes: summary.total_bytes,
-                    ranges: summary.completed_ranges,
-                    avg_speed: summary.avg_speed,
-                    instant_speed: summary.instant_speed,
-                    current_chunk_size,
-                    instant_acceleration,
-                }
-            })
-            .collect()
+    /// 获取聚合统计数据快照
+    fn get_aggregated_stats(&self) -> AggregatedStats {
+        self.aggregated_stats.load().cloned()
     }
 
-    /// 生成进度更新消息（从 global_stats 获取所有数据）
+    /// 生成进度更新消息（从 aggregated_stats 获取所有数据）
     fn generate_progress_update(&self) -> Option<DownloadProgress> {
         // 只有当有 sender 时才生成消息（虽然调用方也会检查，但双重检查无害）
         if self.progress_sender.is_none() {
             return None;
         }
 
-        // 从 global_stats 获取总体统计
-        let summary = self.global_stats.get_full_summary();
+        // 从 aggregated_stats 获取所有 Executor 的统计
+        let executor_stats = self.get_aggregated_stats();
+
+        // 从聚合统计获取总体数据
+        let total_bytes = executor_stats.get_total_bytes();
 
         // 计算百分比
         let percentage = if self.total_size.get() > 0 {
-            (summary.total_bytes as f64 / self.total_size.get() as f64) * 100.0
+            (total_bytes as f64 / self.total_size.get() as f64) * 100.0
         } else {
             0.0
         };
 
-        // 在 actor 内部从 worker_handles 计算 worker 快照
-        let workers_snapshots = self.compute_worker_snapshots();
-
         Some(DownloadProgress::Progress {
-            bytes_downloaded: summary.total_bytes,
+            bytes_downloaded: total_bytes,
             total_size: self.total_size,
             percentage,
-            avg_speed: summary.avg_speed,
-            instant_speed: summary.instant_speed,
-            window_avg_speed: summary.window_avg_speed,
-            instant_acceleration: summary.instant_acceleration,
-            worker_stats: workers_snapshots,
+            avg_speed: executor_stats.get_total_avg_speed(),
+            instant_speed: executor_stats.get_total_instant_speed(),
+            window_avg_speed: executor_stats.get_total_window_avg_speed(),
+            instant_acceleration: executor_stats.get_total_instant_acceleration(),
+            executor_stats,
         })
     }
 
-    /// 生成完成统计消息（从 global_stats 获取所有数据）
+    /// 生成完成统计消息（从 aggregated_stats 获取所有数据）
     fn generate_completion_stats(&self) -> DownloadProgress {
-        // 从 global_stats 获取总体统计
-        let summary = self.global_stats.get_full_summary();
+        // 从 aggregated_stats 获取所有 Executor 的统计
+        let executor_stats = self.get_aggregated_stats();
 
-        // 在 actor 内部从 worker_handles 计算 worker 快照
-        let workers_snapshots = self.compute_worker_snapshots();
+        // 计算总耗时
+        let elapsed_secs = self.start_time.elapsed().as_secs_f64();
 
         DownloadProgress::Completed {
-            total_bytes: summary.total_bytes,
-            total_time: summary.elapsed_secs,
-            avg_speed: summary.avg_speed,
-            worker_stats: workers_snapshots,
+            total_bytes: executor_stats.get_total_bytes(),
+            total_time: elapsed_secs,
+            avg_speed: executor_stats.get_total_avg_speed(),
+            executor_stats,
         }
     }
 
@@ -364,30 +323,20 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    // 辅助函数：创建空的 worker_handles
-    fn create_empty_worker_handles()
-    -> LocalReader<FxHashMap<u64, crate::pool::download::DownloadWorkerHandle>> {
-        let smr = smr_swap::SmrSwap::new(FxHashMap::default());
+    // 辅助函数：创建空的 aggregated_stats
+    fn create_empty_aggregated_stats() -> LocalReader<AggregatedStats> {
+        let smr = smr_swap::SmrSwap::new(AggregatedStats::default());
         smr.local()
-    }
-
-    // 辅助函数：创建模拟的 global_stats
-    fn create_mock_global_stats() -> crate::utils::stats::TaskStats {
-        // 使用默认的配置来创建 TaskStats
-        let config = crate::config::DownloadConfig::default();
-        crate::utils::stats::TaskStats::from_config(config.into())
     }
 
     #[tokio::test]
     async fn test_progress_reporter_creation() {
         let (tx, _rx) = mpsc::channel(10);
-        let worker_handles = create_empty_worker_handles();
-        let global_stats = create_mock_global_stats();
+        let aggregated_stats = create_empty_aggregated_stats();
         let _reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: Some(tx),
             total_size: NonZeroU64::new(1000).unwrap(),
-            worker_handles,
-            global_stats,
+            aggregated_stats,
             update_interval: std::time::Duration::from_secs(1),
             start_offset: std::time::Duration::ZERO,
         });
@@ -396,13 +345,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_progress_reporter_without_sender() {
-        let worker_handles = create_empty_worker_handles();
-        let global_stats = create_mock_global_stats();
+        let aggregated_stats = create_empty_aggregated_stats();
         let _reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: None,
             total_size: NonZeroU64::new(1000).unwrap(),
-            worker_handles,
-            global_stats,
+            aggregated_stats,
             update_interval: std::time::Duration::from_secs(1),
             start_offset: std::time::Duration::ZERO,
         });
@@ -412,13 +359,11 @@ mod tests {
     #[tokio::test]
     async fn test_send_started_event() {
         let (tx, mut rx) = mpsc::channel(10);
-        let worker_handles = create_empty_worker_handles();
-        let global_stats = create_mock_global_stats();
+        let aggregated_stats = create_empty_aggregated_stats();
         let reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: Some(tx),
             total_size: NonZeroU64::new(1000).unwrap(),
-            worker_handles,
-            global_stats,
+            aggregated_stats,
             update_interval: std::time::Duration::from_secs(1),
             start_offset: std::time::Duration::ZERO,
         });
@@ -447,13 +392,11 @@ mod tests {
     #[tokio::test]
     async fn test_send_error() {
         let (tx, mut rx) = mpsc::channel(10);
-        let worker_handles = create_empty_worker_handles();
-        let global_stats = create_mock_global_stats();
+        let aggregated_stats = create_empty_aggregated_stats();
         let reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: Some(tx),
             total_size: NonZeroU64::new(1000).unwrap(),
-            worker_handles,
-            global_stats,
+            aggregated_stats,
             update_interval: std::time::Duration::from_secs(1),
             start_offset: std::time::Duration::ZERO,
         });
@@ -475,13 +418,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_events_without_sender() {
-        let worker_handles = create_empty_worker_handles();
-        let global_stats = create_mock_global_stats();
+        let aggregated_stats = create_empty_aggregated_stats();
         let reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender: None,
             total_size: NonZeroU64::new(1000).unwrap(),
-            worker_handles,
-            global_stats,
+            aggregated_stats,
             update_interval: std::time::Duration::from_secs(1),
             start_offset: std::time::Duration::ZERO,
         });

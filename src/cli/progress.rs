@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::utils::{format_bytes, format_duration};
 use crate::download::DownloadProgress;
+use crate::pool::download::ExecutorCurrentStats;
 
 /// 进度条管理器
 pub struct ProgressManager {
@@ -95,7 +96,7 @@ impl ProgressManager {
                 percentage: _,
                 instant_speed,
                 instant_acceleration,
-                worker_stats,
+                executor_stats,
                 ..
             } => {
                 // 更新主进度条
@@ -122,18 +123,17 @@ impl ProgressManager {
                     (String::new(), String::new())
                 };
 
-                // 计算分块大小范围（显示最小和最大值）
-                let chunk_info = if !worker_stats.is_empty() {
-                    let min_chunk = worker_stats
-                        .iter()
-                        .map(|s| s.current_chunk_size)
-                        .min()
-                        .unwrap_or(0);
-                    let max_chunk = worker_stats
-                        .iter()
-                        .map(|s| s.current_chunk_size)
-                        .max()
-                        .unwrap_or(0);
+                // 计算分块大小范围（只统计运行中的 Executor）
+                let chunk_sizes: Vec<u64> = executor_stats
+                    .iter()
+                    .filter_map(|(_, s)| match &s.current_stats {
+                        ExecutorCurrentStats::Running { current_chunk_size, .. } => Some(*current_chunk_size),
+                        ExecutorCurrentStats::Stopped => None,
+                    })
+                    .collect();
+                let chunk_info = if !chunk_sizes.is_empty() {
+                    let min_chunk = chunk_sizes.iter().min().copied().unwrap_or(0);
+                    let max_chunk = chunk_sizes.iter().max().copied().unwrap_or(0);
                     if min_chunk == max_chunk {
                         format!(", 分块: {}", format_bytes(min_chunk))
                     } else {
@@ -159,7 +159,7 @@ impl ProgressManager {
                 if self.verbose {
                     // 动态添加新的 worker 进度条（处理渐进式启动）
                     if let Some(ref multi) = self.multi {
-                        while self.worker_bars.len() < worker_stats.len() {
+                        while self.worker_bars.len() < executor_stats.len() {
                             let worker_id = self.worker_bars.len();
                             let worker_bar = multi.add(ProgressBar::new(0));
                             worker_bar.set_style(
@@ -173,35 +173,42 @@ impl ProgressManager {
                     }
 
                     // 更新所有 worker 的进度条
-                    for (idx, stats) in worker_stats.iter().enumerate() {
+                    for (idx, (_, stats)) in executor_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
-                            let instant_str = if let Some(instant) = stats.instant_speed {
-                                instant.to_formatted(self.size_standard).to_string()
-                            } else {
-                                String::new()
-                            };
-
-                            let accel_str = if let Some(accel) = stats.instant_acceleration {
-                                let accel_i64 = accel.as_i64();
-                                if accel_i64 > 0 {
-                                    format!(" ↑{}", accel.to_formatted(self.size_standard))
-                                } else if accel_i64 < 0 {
-                                    format!(" ↓{}", accel.to_formatted(self.size_standard))
-                                } else {
-                                    String::new()
+                            // 根据 current_stats 状态显示不同信息
+                            let msg = match &stats.current_stats {
+                                ExecutorCurrentStats::Running { instant_speed, instant_acceleration, current_chunk_size, .. } => {
+                                    let speed = instant_speed
+                                        .map(|s| s.to_formatted(self.size_standard).to_string())
+                                        .unwrap_or_default();
+                                    let accel = instant_acceleration
+                                        .map(|a| {
+                                            let v = a.as_i64();
+                                            if v > 0 {
+                                                format!(" ↑{}", a.to_formatted(self.size_standard))
+                                            } else if v < 0 {
+                                                format!(" ↓{}", a.to_formatted(self.size_standard))
+                                            } else {
+                                                String::new()
+                                            }
+                                        })
+                                        .unwrap_or_default();
+                                    format!(
+                                        "{}, 分块: {} {} {}",
+                                        format_bytes(stats.total_bytes),
+                                        format_bytes(*current_chunk_size),
+                                        speed,
+                                        accel
+                                    )
                                 }
-                            } else {
-                                String::new()
+                                ExecutorCurrentStats::Stopped => {
+                                    format!(
+                                        "{} [已停止]",
+                                        format_bytes(stats.total_bytes),
+                                    )
+                                }
                             };
-
-                            worker_bar.set_message(format!(
-                                "{}, {} ranges, 分块: {} {} {}",
-                                format_bytes(stats.bytes),
-                                stats.ranges,
-                                format_bytes(stats.current_chunk_size),
-                                instant_str,
-                                accel_str
-                            ));
+                            worker_bar.set_message(msg);
                         }
                     }
                 }
@@ -211,7 +218,7 @@ impl ProgressManager {
                 total_bytes,
                 total_time,
                 avg_speed,
-                worker_stats,
+                executor_stats,
             } => {
                 // 完成主进度条
                 self.main_bar.finish_with_message(format!(
@@ -227,7 +234,7 @@ impl ProgressManager {
                 if self.verbose {
                     // 确保所有 worker 都有进度条（处理渐进式启动的情况）
                     if let Some(ref multi) = self.multi {
-                        while self.worker_bars.len() < worker_stats.len() {
+                        while self.worker_bars.len() < executor_stats.len() {
                             let worker_id = self.worker_bars.len();
                             let worker_bar = multi.add(ProgressBar::new(0));
                             worker_bar.set_style(
@@ -240,16 +247,21 @@ impl ProgressManager {
                     }
 
                     // 显示所有 worker 的最终统计
-                    for (idx, stats) in worker_stats.iter().enumerate() {
+                    for (idx, (_, stats)) in executor_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
+                            // 从 current_stats 提取平均速度
+                            let avg_speed_str = match &stats.current_stats {
+                                ExecutorCurrentStats::Running { avg_speed, .. } => {
+                                    avg_speed
+                                        .map(|s| s.to_formatted(self.size_standard).to_string())
+                                        .unwrap_or("N/A".to_string())
+                                }
+                                ExecutorCurrentStats::Stopped => "N/A".to_string(),
+                            };
                             worker_bar.finish_with_message(format!(
-                                "完成：{}, {} ranges, 平均: {}",
-                                format_bytes(stats.bytes),
-                                stats.ranges,
-                                stats
-                                    .avg_speed
-                                    .map(|s| s.to_formatted(self.size_standard).to_string())
-                                    .unwrap_or("N/A".to_string())
+                                "完成：{}, 平均: {}",
+                                format_bytes(stats.total_bytes),
+                                avg_speed_str
                             ));
                         }
                     }

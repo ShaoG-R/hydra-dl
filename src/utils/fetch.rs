@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use log::{debug, info};
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use ranged_mmap::AllocatedRange;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -440,7 +440,7 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
     /// 下载指定范围的数据（可取消）
     ///
     /// # Arguments
-    /// * `cancel_rx` - 取消信号接收器，收到信号时中途停止下载
+    /// * `cancel_rx` - 取消信号接收器（oneshot），收到信号时中途停止下载
     ///
     /// # Returns
     ///
@@ -449,7 +449,7 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
     /// - `Cancelled { data, bytes_downloaded }`: 下载被取消，包含已下载的部分数据和已下载的字节数
     pub async fn fetch_with_cancel(
         mut self,
-        cancel_rx: &mut mpsc::Receiver<()>,
+        cancel_rx: oneshot::Receiver<()>,
     ) -> Result<FetchRangeResult> {
         let (http_start, http_end) = self.range.as_http_range();
         debug!(
@@ -492,7 +492,7 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
     async fn download_stream_with_cancel<S>(
         &mut self,
         mut stream: S,
-        cancel_rx: &mut mpsc::Receiver<()>,
+        mut cancel_rx: oneshot::Receiver<()>,
     ) -> Result<FetchRangeResult>
     where
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
@@ -535,7 +535,7 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
                         }
                     }
                 }
-                _ = cancel_rx.recv() => {
+                _ = &mut cancel_rx => {
                     // 收到取消信号，返回已下载的字节数和数据
                     let data = self.merge_chunks(chunks);
                     return Ok(FetchRangeResult::Cancelled {
@@ -964,12 +964,12 @@ mod tests {
         );
 
         // 创建一个永远不会发送的取消信号
-        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(&mut cancel_rx)
+            .fetch_with_cancel(cancel_rx)
             .await;
 
         assert!(result.is_ok(), "下载应该成功: {:?}", result);
@@ -1018,12 +1018,12 @@ mod tests {
         );
 
         // 创建取消通道（虽然不会用到）
-        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(&mut cancel_rx)
+            .fetch_with_cancel(cancel_rx)
             .await;
 
         assert!(result.is_err(), "应该返回错误");
@@ -1135,12 +1135,12 @@ mod tests {
         );
 
         // 创建取消通道（不发送取消信号）
-        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(&mut cancel_rx)
+            .fetch_with_cancel(cancel_rx)
             .await;
 
         assert!(result.is_ok(), "大数据下载应该成功");
@@ -1196,7 +1196,7 @@ mod tests {
         );
 
         // 创建取消通道，在稍后发送取消信号
-        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
 
         tokio::spawn(async move {
             // 给予一点时间让下载开始
@@ -1207,7 +1207,7 @@ mod tests {
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(&mut cancel_rx)
+            .fetch_with_cancel(cancel_rx)
             .await;
 
         assert!(result.is_ok(), "调用应该成功");
@@ -1272,13 +1272,13 @@ mod tests {
         );
 
         // 立即发送取消信号
-        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
         let _ = cancel_tx.send(()); // 立即取消
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(&mut cancel_rx)
+            .fetch_with_cancel(cancel_rx)
             .await;
 
         // 应该成功（可能完成也可能取消，取决于执行时机）

@@ -54,17 +54,17 @@
 //!                     total_size.get() as f64 / 1024.0 / 1024.0,
 //!                     initial_chunk_size as f64 / 1024.0 / 1024.0);
 //!             }
-//!             DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
-//!                 // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+//!             DownloadProgress::Progress { percentage, avg_speed, executor_stats, .. } => {
+//!                 // 每个 executor 有各自的统计信息
 //!                 let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
-//!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, {} 个 workers",
+//!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, {} 个 executors",
 //!                     percentage,
 //!                     speed_mbps,
-//!                     worker_stats.len());
+//!                     executor_stats.stats_map.len());
 //!             }
-//!             DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {
-//!                 println!("下载完成！{:.2} MB in {:.2}s, {} 个 workers 完成",
-//!                     total_bytes as f64 / 1024.0 / 1024.0, total_time, worker_stats.len());
+//!             DownloadProgress::Completed { total_bytes, total_time, executor_stats, .. } => {
+//!                 println!("下载完成！{:.2} MB in {:.2}s, {} 个 executors 完成",
+//!                     total_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.stats_map.len());
 //!             }
 //!             DownloadProgress::Error { message } => {
 //!                 eprintln!("下载出错: {}", message);
@@ -134,6 +134,7 @@ pub mod utils {
     pub(crate) mod speed_calculator;
     pub(crate) mod stats;
     pub mod writer;
+    pub mod cancel_channel;
 }
 
 /// 常用单位常量
@@ -169,7 +170,7 @@ pub use config::{
     ProgressiveDefaults, RetryConfig, RetryConfigBuilder, RetryDefaults, SpeedConfig,
     SpeedConfigBuilder, SpeedDefaults,
 };
-pub use download::{DownloadHandle, DownloadProgress, WorkerStatSnapshot, download_ranged};
+pub use download::{DownloadHandle, DownloadProgress, download_ranged};
 pub use task::FileTask;
 pub use utils::fetch::{FileMetadata, fetch_file_metadata};
 

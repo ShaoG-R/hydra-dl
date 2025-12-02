@@ -20,10 +20,11 @@ use crate::utils::{
     stats::WorkerStats,
     writer::MmapWriter,
 };
+use crate::utils::cancel_channel::CancelReceiver;
 use log::{debug, error, info, warn};
 use net_bytes::{FormattedValue, SizeStandard};
 use ranged_mmap::{AllocatedRange, SplitDownResult};
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 
 /// 下载 Chunk 记录器
@@ -163,83 +164,98 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         stats_handle: StatsUpdaterHandle,
         result_tx: tokio::sync::oneshot::Sender<ExecutorResult>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-        mut cancel_rx: mpsc::Receiver<()>,
+        mut cancel_rx: CancelReceiver,
     ) {
         debug!("Worker #{} 主循环启动", worker_id);
 
         loop {
-            tokio::select! {
-                biased;
-                
-                _ = &mut shutdown_rx => {
-                    info!("Worker #{} 收到关闭信号，主循环退出", worker_id);
-                    break;
-                }
-                _ = std::future::ready(()) => {
-                    // 通过 TaskAllocator 统一获取下一个任务
-                    let chunk_size = stats.get_current_chunk_size();
-                    
-                    match context.task_allocator.next_task(chunk_size) {
-                        AllocationResult::Task(task) => {
-                            let range = task.range().clone();
-                            let retry_count = task.retry_count();
-                            
-                            debug!(
-                                "Worker #{} 执行任务 (range {}..{}, retry={})",
-                                worker_id, range.start(), range.end(), retry_count
-                            );
-                            
-                            match self.execute_single_task(
+            // 通过 TaskAllocator 统一获取下一个任务
+            let chunk_size = stats.get_current_chunk_size();
+
+            match context.task_allocator.next_task(chunk_size) {
+                AllocationResult::Task(task) => {
+                    let range = task.range().clone();
+                    let retry_count = task.retry_count();
+
+                    debug!(
+                        "Worker #{} 执行任务 (range {}..{}, retry={})",
+                        worker_id, range.start(), range.end(), retry_count
+                    );
+
+                    // 为当前任务创建新的 cancel oneshot channel
+                    let task_id = context.task_allocator.current_task_id();
+                    let task_cancel_rx = cancel_rx.reset(task_id);
+
+                    // 使用 select 同时监听 shutdown 信号和任务执行
+                    let task_result = tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => {
+                            info!("Worker #{} 任务执行中收到关闭信号，中断任务", worker_id);
+                            break;
+                        }
+                        result = self.execute_single_task(
+                            worker_id,
+                            range,
+                            retry_count,
+                            &mut context,
+                            &mut stats,
+                            &stats_handle,
+                            task_cancel_rx,
+                        ) => result
+                    };
+
+                    match task_result {
+                        TaskResult::Success => {
+                            context.task_allocator.advance_task_id();
+                        }
+                        TaskResult::NeedRetry { range, retry_count } => {
+                            context.task_allocator.schedule_retry(range, retry_count);
+                            context.task_allocator.advance_task_id();
+                        }
+                        TaskResult::PermanentFailure => {
+                            context.task_allocator.advance_task_id();
+                        }
+                        TaskResult::WriteFailed { range, error } => {
+                            // 写入失败是致命错误，立即终止 worker
+                            let _ = result_tx.send(ExecutorResult::WriteFailed {
                                 worker_id,
                                 range,
-                                retry_count,
-                                &mut context,
-                                &mut stats,
-                                &stats_handle,
-                                &mut cancel_rx,
-                            ).await {
-                                TaskResult::Success => {
-                                    context.task_allocator.advance_task_id();
-                                }
-                                TaskResult::NeedRetry { range, retry_count } => {
-                                    context.task_allocator.schedule_retry(range, retry_count);
-                                    context.task_allocator.advance_task_id();
-                                }
-                                TaskResult::PermanentFailure => {
-                                    context.task_allocator.advance_task_id();
-                                }
-                                TaskResult::WriteFailed { range, error } => {
-                                    // 写入失败是致命错误，立即终止 worker
-                                    let _ = result_tx.send(ExecutorResult::WriteFailed {
-                                        worker_id,
-                                        range,
-                                        error,
-                                    });
-                                    debug!("Worker #{} 写入失败，主循环退出", worker_id);
-                                    return;
-                                }
-                            }
-                        }
-                        AllocationResult::WaitForRetry { delay, pending_count } => {
-                            // 没有新任务，但有待重试任务
-                            debug!(
-                                "Worker #{} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
-                                worker_id, delay, pending_count
-                            );
-                            tokio::time::sleep(delay).await;
-                            
-                            // 等待后，将所有待重试任务提前到当前 task_id
-                            context.task_allocator.advance_all_retries();
-                        }
-                        AllocationResult::Done => {
-                            // 没有更多任务
-                            debug!("Worker #{} 没有更多任务，退出", worker_id);
-                            break;
+                                error,
+                            });
+                            debug!("Worker #{} 写入失败，主循环退出", worker_id);
+                            return;
                         }
                     }
                 }
+                AllocationResult::WaitForRetry { delay, pending_count } => {
+                    // 没有新任务，但有待重试任务，等待时也监听 shutdown
+                    debug!(
+                        "Worker #{} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
+                        worker_id, delay, pending_count
+                    );
+
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => {
+                            info!("Worker #{} 等待重试期间收到关闭信号，退出", worker_id);
+                            break;
+                        }
+                        _ = tokio::time::sleep(delay) => {
+                            // 等待后，将所有待重试任务提前到当前 task_id
+                            context.task_allocator.advance_all_retries();
+                        }
+                    }
+                }
+                AllocationResult::Done => {
+                    // 没有更多任务
+                    debug!("Worker #{} 没有更多任务，退出", worker_id);
+                    break;
+                }
             }
         }
+
+        // Executor 关闭，通知聚合器移除统计
+        stats_handle.send_executor_shutdown();
 
         // 主循环结束后发送最终结果
         let result = if self.failed_ranges.is_empty() {
@@ -265,7 +281,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         context: &mut DownloadWorkerContext,
         stats: &mut WorkerStats,
         stats_handle: &StatsUpdaterHandle,
-        cancel_rx: &mut mpsc::Receiver<()>,
+        cancel_rx: oneshot::Receiver<()>,
     ) -> TaskResult {
         let (start, end) = range.as_range_tuple();
         debug!(
@@ -274,16 +290,14 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         );
 
         // 任务开始，发送信号到辅助协程
-        stats.set_active(true);
         stats.clear_samples();
-        stats_handle.send_task_started();
+        stats_handle.send_task_started(range.len());
 
         // 创建 Chunk 记录器
         let mut recorder = DownloadChunkRecorder::new(stats, stats_handle);
         let fetch_result = self.fetch_range(&context.url, &range, &mut recorder, cancel_rx).await;
 
         // 任务结束，发送信号到辅助协程
-        stats.set_active(false);
         stats_handle.send_task_ended();
 
         match fetch_result {
@@ -294,9 +308,6 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     error!("Worker #{} {}", worker_id, error_msg);
                     return TaskResult::WriteFailed { range, error: error_msg };
                 }
-
-                // 记录 range 完成
-                stats.record_range_complete();
 
                 // 根据当前速度更新分块大小
                 self.update_chunk_size(context, stats, stats_handle);
@@ -410,7 +421,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         url: &str,
         range: &AllocatedRange,
         recorder: &mut DownloadChunkRecorder<'_>,
-        cancel_rx: &mut mpsc::Receiver<()>,
+        cancel_rx: oneshot::Receiver<()>,
     ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
         use crate::utils::fetch::FetchRange;
 

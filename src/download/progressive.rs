@@ -4,11 +4,10 @@
 //! 采用 Actor 模式，完全独立于主下载循环
 
 use crate::config::DownloadConfig;
-use crate::pool::download::DownloadWorkerHandle;
+use crate::download::download_stats::AggregatedStats;
 use lite_sync::oneshot::lite;
 use log::{debug, error, info};
 use net_bytes::{DownloadSpeed, FileSizeFormat};
-use rustc_hash::FxHashMap;
 use smr_swap::LocalReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,14 +118,14 @@ impl ProgressiveLauncherLogic {
     /// 检查所有已启动 Worker 的速度是否达到阈值
     fn check_worker_speeds(
         &self,
-        worker_handles: &FxHashMap<u64, DownloadWorkerHandle>,
+        aggregated_stats: &AggregatedStats,
         config: &DownloadConfig,
     ) -> Result<Vec<Option<DownloadSpeed>>, WaitReason> {
-        let mut speeds = Vec::with_capacity(worker_handles.len());
+        let mut speeds = Vec::with_capacity(aggregated_stats.len());
         let threshold = config.progressive().min_speed_threshold();
 
-        for (_, handle) in worker_handles.iter() {
-            let instant_speed = handle.instant_speed();
+        for (_, executor_stats) in aggregated_stats.iter() {
+            let instant_speed = executor_stats.get_instant_speed();
 
             // 检查速度是否达标
             if let Some(threshold) = threshold {
@@ -150,10 +149,10 @@ impl ProgressiveLauncherLogic {
         &self,
         written_bytes: u64,
         total_bytes: u64,
-        global_stats: &crate::utils::stats::TaskStats,
+        aggregated_stats: &AggregatedStats,
         config: &DownloadConfig,
     ) -> Result<(), WaitReason> {
-        let window_avg_speed = global_stats.get_window_avg_speed();
+        let window_avg_speed = aggregated_stats.get_total_window_avg_speed();
 
         if let Some(window_avg_speed) = window_avg_speed {
             let remaining_bytes = total_bytes.saturating_sub(written_bytes);
@@ -188,10 +187,9 @@ impl ProgressiveLauncherLogic {
     /// 4. 是否有需要启动的 worker
     fn decide_next_launch(
         &self,
-        worker_handles: &FxHashMap<u64, DownloadWorkerHandle>,
+        aggregated_stats: &AggregatedStats,
         written_bytes: u64,
         total_bytes: u64,
-        global_stats: &crate::utils::stats::TaskStats,
         config: &DownloadConfig,
     ) -> LaunchDecision {
         // 检查是否所有阶段已完成
@@ -199,15 +197,15 @@ impl ProgressiveLauncherLogic {
             return LaunchDecision::Skip;
         }
 
-        let current_worker_count = worker_handles.len() as u64;
+        let current_worker_count = aggregated_stats.len() as u64;
 
         // 检查 worker 速度
-        match self.check_worker_speeds(worker_handles, config) {
+        match self.check_worker_speeds(aggregated_stats, config) {
             Err(reason) => return LaunchDecision::Wait(reason),
             Ok(speeds) => {
                 // 检查剩余时间
                 if let Err(reason) =
-                    self.check_remaining_time(written_bytes, total_bytes, global_stats, config)
+                    self.check_remaining_time(written_bytes, total_bytes, aggregated_stats, config)
                 {
                     return LaunchDecision::Wait(reason);
                 }
@@ -262,14 +260,12 @@ impl ProgressiveLauncherLogic {
 pub(super) struct ProgressiveLauncherParams {
     /// 配置
     pub config: Arc<DownloadConfig>,
-    /// 共享的 worker handles
-    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
+    /// 聚合统计数据读取器（从 DownloadStats 获取）
+    pub aggregated_stats: LocalReader<AggregatedStats>,
     /// 文件总大小
     pub total_size: u64,
     /// 已写入字节数（共享引用）
     pub written_bytes: Arc<AtomicU64>,
-    /// 全局统计管理器
-    pub global_stats: crate::utils::stats::TaskStats,
     /// 启动偏移时间
     pub start_offset: std::time::Duration,
 }
@@ -367,20 +363,19 @@ impl ProgressiveLauncherActor {
         }
 
         let decision = {
-            let worker_handles = self.params.worker_handles.load();
+            let aggregated_stats = self.params.aggregated_stats.load();
 
             // 检测并调整启动阶段（应对 worker 数量变化）
-            let current_worker_count = worker_handles.len() as u64;
+            let current_worker_count = aggregated_stats.len() as u64;
             self.logic
                 .adjust_stage_for_worker_count(current_worker_count);
 
             // 从共享数据获取信息并决策
             let written = self.params.written_bytes.load(Ordering::SeqCst);
             self.logic.decide_next_launch(
-                &*worker_handles,
+                &*aggregated_stats,
                 written,
                 self.params.total_size,
-                &self.params.global_stats,
                 &self.params.config,
             )
         };

@@ -1,17 +1,32 @@
 //! Worker 健康检查模块（Actor 模式）
 //!
-//! 使用"最大间隙检测"算法来识别速度异常的 worker
-//! 采用 Actor 模式，完全独立于主下载循环，定期自动检查 worker 健康状态
+//! 监听 broadcast channel 接收 Executor 统计更新，通过相对速度比较（max gap 算法）
+//! 来检测相对于其他 Worker 显著过慢的 Worker。
+//!
+//! # 设计说明
+//!
+//! 与 LocalHealthChecker 的分工：
+//! - LocalHealthChecker：超时检测、绝对速度检测（每个 Worker 独立）
+//! - WorkerHealthChecker：相对速度检测（max gap 算法，需要所有 Workers 数据）
+//!
+//! # 工作流程
+//!
+//! - 订阅 broadcast channel 接收 `TaggedBroadcast` 消息
+//! - 为每个 Executor 维护健康历史记录（过去 n 次更新的相对速度异常状态）
+//! - 异常判定：速度相对于其他 Executor 显著过慢
+//! - 取消条件：相对速度异常次数超过阈值
 
 use crate::config::DownloadConfig;
-use crate::pool::download::DownloadWorkerHandle;
+use crate::pool::download::{DownloadWorkerHandle, ExecutorBroadcast, ExecutorStats, TaggedBroadcast};
 use lite_sync::oneshot::lite;
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use rustc_hash::FxHashMap;
 use smr_swap::LocalReader;
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 /// 速度类型（字节/秒）
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
@@ -59,16 +74,71 @@ pub struct HealthCheckResult {
     pub max_gap: Speed,
 }
 
+/// 单个 Executor 的健康追踪器
+///
+/// 记录 Executor 过去 n 次更新的相对速度异常状态，用于判断是否需要取消下载
+#[derive(Debug)]
+struct ExecutorHealthTracker {
+    /// 最近 n 次更新的异常状态（true = 异常）
+    anomaly_history: VecDeque<bool>,
+    /// 历史窗口大小
+    history_size: usize,
+    /// 当前异常计数（增量维护，避免每次遍历）
+    anomaly_count: usize,
+}
+
+impl ExecutorHealthTracker {
+    /// 创建新的健康追踪器
+    fn new(history_size: usize) -> Self {
+        Self {
+            anomaly_history: VecDeque::with_capacity(history_size),
+            history_size,
+            anomaly_count: 0,
+        }
+    }
+
+    /// 记录一次更新的异常状态（O(1) 增量更新）
+    fn record(&mut self, is_anomaly: bool) {
+        // 移除最旧记录时更新计数
+        if self.anomaly_history.len() >= self.history_size {
+            if self.anomaly_history.pop_front() == Some(true) {
+                self.anomaly_count -= 1;
+            }
+        }
+        // 添加新记录时更新计数
+        if is_anomaly {
+            self.anomaly_count += 1;
+        }
+        self.anomaly_history.push_back(is_anomaly);
+    }
+
+    /// 获取异常次数（O(1)）
+    #[inline]
+    fn anomaly_count(&self) -> usize {
+        self.anomaly_count
+    }
+
+    /// 检查是否超过异常阈值
+    #[inline]
+    fn exceeds_anomaly_threshold(&self, threshold: usize) -> bool {
+        self.anomaly_count >= threshold
+    }
+
+    /// 重置追踪器
+    fn reset(&mut self) {
+        self.anomaly_history.clear();
+        self.anomaly_count = 0;
+    }
+}
+
 /// 健康检查器参数
 pub(super) struct WorkerHealthCheckerParams {
     /// 配置
     pub config: Arc<DownloadConfig>,
-    /// 共享的 worker handles
+    /// 共享的 worker handles（用于发送取消信号）
     pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
-    /// 检查间隔
-    pub check_interval: std::time::Duration,
-    /// 启动偏移时间
-    pub start_offset: std::time::Duration,
+    /// 广播接收器
+    pub broadcast_rx: broadcast::Receiver<TaggedBroadcast>,
 }
 
 /// Worker 健康检查器（内部逻辑）
@@ -126,12 +196,11 @@ impl WorkerHealthCheckerLogic {
             return None;
         }
 
-        // 性能优化：使用索引数组排序，避免克隆整个 WorkerSpeed 数据
+        // 使用索引数组排序，避免克隆整个 WorkerSpeed 数据
         let mut indices: Vec<usize> = (0..worker_speeds.len()).collect();
         indices.sort_unstable_by_key(|&i| worker_speeds[i].speed);
 
-        // 性能优化：一次遍历同时计算间隙并找到最大间隙
-        let (max_gap_idx, gap_value) = self.find_max_gap_optimized(&indices, worker_speeds)?;
+        let (max_gap_idx, gap_value) = self.find_max_gap(&indices, worker_speeds)?;
 
         // 分界点：最大间隙之后的第一个元素
         let split_idx = max_gap_idx + 1;
@@ -145,29 +214,19 @@ impl WorkerHealthCheckerLogic {
         let health_baseline = worker_speeds[indices[split_idx]].speed;
 
         debug!(
-            "健康检查: 检测到最大间隙 {} (在索引 {} 和 {} 之间)",
+            "健康检查: 最大间隙={} (索引 {}-{}), 基准={}{}",
             gap_value.to_formatted(self.size_standard),
             max_gap_idx,
-            split_idx
+            split_idx,
+            health_baseline.to_formatted(self.size_standard),
+            self.absolute_threshold
+                .map(|t| format!(", 阈值={}", t.to_formatted(self.size_standard)))
+                .unwrap_or_default()
         );
-        match self.absolute_threshold {
-            Some(threshold) => debug!(
-                "健康基准: {}, 绝对阈值: {}",
-                health_baseline.to_formatted(self.size_standard),
-                threshold.to_formatted(self.size_standard)
-            ),
-            None => debug!(
-                "健康基准: {}",
-                health_baseline.to_formatted(self.size_standard)
-            ),
-        }
 
         // 收集需要终止的 worker（慢速簇）
-        let unhealthy_workers = self.identify_unhealthy_workers_optimized(
-            &indices[..split_idx],
-            worker_speeds,
-            health_baseline,
-        )?;
+        let unhealthy_workers =
+            self.identify_unhealthy_workers(&indices[..split_idx], worker_speeds, health_baseline);
 
         if unhealthy_workers.is_empty() {
             return None;
@@ -180,14 +239,9 @@ impl WorkerHealthCheckerLogic {
         })
     }
 
-    /// 优化的间隙查找：一次遍历同时计算间隙并找到最大值
-    ///
-    /// # 性能优化
-    ///
-    /// 相比原来的两次遍历（calculate_gaps + find_max_gap），
-    /// 这个方法只需要一次遍历，减少了内存分配和迭代开销
+    /// 查找最大间隙（一次遍历 O(n)）
     #[inline]
-    fn find_max_gap_optimized(
+    fn find_max_gap(
         &self,
         indices: &[usize],
         worker_speeds: &[WorkerSpeed],
@@ -196,86 +250,70 @@ impl WorkerHealthCheckerLogic {
             return None;
         }
 
-        let mut max_gap_idx = 0;
-        let mut max_gap_value = 0;
-        let mut has_non_zero_gap = false;
+        let (max_idx, max_gap) = (0..indices.len() - 1)
+            .map(|i| {
+                let gap = worker_speeds[indices[i + 1]]
+                    .speed
+                    .saturating_sub(*worker_speeds[indices[i]].speed);
+                (i, gap)
+            })
+            .max_by_key(|&(_, gap)| gap)?;
 
-        for i in 0..indices.len() - 1 {
-            let gap = worker_speeds[indices[i + 1]]
-                .speed
-                .saturating_sub(*worker_speeds[indices[i]].speed);
-            if gap > max_gap_value {
-                max_gap_value = gap;
-                max_gap_idx = i;
-                has_non_zero_gap = true;
-            }
-        }
-
-        // 如果最大间隙为 0，说明所有速度相同
-        if !has_non_zero_gap {
-            None
-        } else {
-            Some((max_gap_idx, Speed(max_gap_value)))
-        }
+        // 间隙为 0 表示所有速度相同
+        (max_gap > 0).then(|| (max_idx, Speed(max_gap)))
     }
 
-    /// 优化的不健康 worker 识别
+    /// 识别不健康的 worker
     ///
     /// worker 同时满足以下条件才被标记为不健康：
-    /// 1. 速度低于绝对阈值
+    /// 1. 速度低于绝对阈值（如果设置）
     /// 2. 速度明显低于健康基准（例如：低于 50%）
-    ///
-    /// # 性能优化
-    ///
-    /// 使用索引访问避免不必要的数据复制
     #[inline]
-    fn identify_unhealthy_workers_optimized(
+    fn identify_unhealthy_workers(
         &self,
         slow_indices: &[usize],
         worker_speeds: &[WorkerSpeed],
         health_baseline: Speed,
-    ) -> Option<Vec<(u64, Speed)>> {
-        // 使用 u64 计算以避免浮点运算
-        // 将 relative_threshold 转换为 u64 的百分比 (e.g., 0.5 -> 50)
+    ) -> Vec<(u64, Speed)> {
+        // 使用整数计算避免浮点运算: 0.5 -> 50/100
         let threshold_percent = (self.relative_threshold * 100.0) as u64;
-
         let threshold_speed = health_baseline.saturating_mul(threshold_percent) / 100;
+        let abs_threshold = self.absolute_threshold;
 
-        let unhealthy_workers: Vec<_> = slow_indices
+        slow_indices
             .iter()
             .map(|&idx| &worker_speeds[idx])
-            .filter(|worker| {
-                *worker.speed < threshold_speed
-                    && match self.absolute_threshold {
-                        Some(threshold) => worker.speed < threshold,
-                        None => true,
-                    }
+            .filter(|w| {
+                *w.speed < threshold_speed && abs_threshold.map_or(true, |t| w.speed < t)
             })
-            .map(|worker| (worker.worker_id, worker.speed))
-            .collect();
-
-        if unhealthy_workers.is_empty() {
-            None
-        } else {
-            Some(unhealthy_workers)
-        }
+            .map(|w| (w.worker_id, w.speed))
+            .collect()
     }
 }
 
 /// 健康检查 Actor
 ///
-/// 独立运行的 actor，负责定期检测并自动识别不健康的 worker
+/// 独立运行的 actor，监听 broadcast channel 接收 Executor 统计更新，
+/// 通过相对速度比较（max gap 算法）检测显著过慢的 Worker。
 struct WorkerHealthCheckerActor {
-    /// 内部逻辑管理器
+    /// 内部逻辑管理器（用于判断相对速度是否异常）
     logic: WorkerHealthCheckerLogic,
     /// 配置
     config: Arc<DownloadConfig>,
     /// 关闭信号接收器
     shutdown_rx: lite::Receiver<()>,
-    /// 单一写入者的 worker handles 持有者
+    /// 共享的 worker handles（用于发送取消信号）
     worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
-    /// 检查定时器（内部管理）
-    check_timer: tokio::time::Interval,
+    /// 广播接收器
+    broadcast_rx: broadcast::Receiver<TaggedBroadcast>,
+    /// 每个 Executor 的健康追踪器（相对速度异常）
+    health_trackers: FxHashMap<u64, ExecutorHealthTracker>,
+    /// 当前所有 Executor 的最新统计（用于计算相对速度）
+    current_stats: FxHashMap<u64, ExecutorStats>,
+    /// 异常历史窗口大小
+    history_size: usize,
+    /// 异常阈值（超过此次数则取消）
+    anomaly_threshold: usize,
 }
 
 impl WorkerHealthCheckerActor {
@@ -284,10 +322,11 @@ impl WorkerHealthCheckerActor {
         let WorkerHealthCheckerParams {
             config,
             worker_handles,
-            check_interval,
-            start_offset,
+            broadcast_rx,
         } = params;
 
+        // 绝对速度阈值仍然用于相对速度检测的安全过滤
+        // (不会取消绝对速度达标但相对较慢的 worker)
         let absolute_threshold = config
             .health_check()
             .absolute_speed_threshold()
@@ -295,30 +334,54 @@ impl WorkerHealthCheckerActor {
         let logic =
             WorkerHealthCheckerLogic::new(absolute_threshold, 0.5, config.speed().size_standard());
 
-        debug!("WorkerHealthChecker 启动偏移: {:?}", start_offset);
-        let start_time = tokio::time::Instant::now() + start_offset;
-        let check_timer = tokio::time::interval_at(start_time, check_interval);
+        // 从配置获取健康检查参数
+        // 历史窗口大小：默认 10 次
+        let history_size = 10;
+        // 异常阈值：历史窗口的 70%（即 10 次中有 7 次异常）
+        let anomaly_threshold = (history_size as f64 * 0.7).ceil() as usize;
+
+        debug!(
+            "WorkerHealthChecker 启动: history_size={}, anomaly_threshold={}",
+            history_size, anomaly_threshold
+        );
 
         Self {
             logic,
             config,
             shutdown_rx,
             worker_handles,
-            check_timer,
+            broadcast_rx,
+            health_trackers: FxHashMap::default(),
+            current_stats: FxHashMap::default(),
+            history_size,
+            anomaly_threshold,
         }
     }
 
-    /// 运行 actor 事件循环（使用 tokio::select!）
+    /// 运行 actor 事件循环
+    ///
+    /// 监听 broadcast channel 接收统计更新
     async fn run(mut self) {
         debug!("WorkerHealthCheckerActor started");
 
         loop {
             tokio::select! {
-                // 内部定时器：自主触发健康检查
-                _ = self.check_timer.tick() => {
-                    self.check_and_handle().await;
+                // 监听广播消息
+                result = self.broadcast_rx.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            self.handle_broadcast(msg);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            debug!("WorkerHealthChecker 落后 {} 条消息", count);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            debug!("WorkerHealthChecker 广播通道已关闭");
+                            break;
+                        }
+                    }
                 }
-                // 外部消息
+                // 外部关闭信号
                 _ = &mut self.shutdown_rx => {
                     debug!("WorkerHealthCheckerActor shutting down");
                     break;
@@ -329,88 +392,110 @@ impl WorkerHealthCheckerActor {
         debug!("WorkerHealthCheckerActor stopped");
     }
 
-    /// 检查并处理不健康的 worker
-    async fn check_and_handle(&mut self) {
+    /// 处理广播消息
+    fn handle_broadcast(&mut self, msg: TaggedBroadcast) {
         // 检查是否启用健康检查
         if !self.config.health_check().enabled() {
             return;
         }
 
-        // 收集正在执行任务的 worker 的速度信息
-        let mut worker_speeds: Vec<WorkerSpeed> = Vec::new();
-
-        // 使用内部作用域确保锁在 await 之前释放
-        {
-            let handles = self.worker_handles.load();
-            let current_worker_count = handles.len() as u64;
-            let min_workers = self.config.health_check().min_workers_for_check();
-
-            // worker 数量不足，跳过检查
-            if current_worker_count < min_workers {
-                return;
+        let (worker_id, broadcast) = msg;
+        match broadcast {
+            ExecutorBroadcast::Stats(stats) => {
+                self.handle_stats_update(worker_id, stats);
             }
-
-            // 遍历所有 worker，检查其 stats 中的活跃状态
-            for &worker_id in handles.keys() {
-                if let Some(handle) = handles.get(&worker_id) {
-                    let stats = handle.stats();
-
-                    // 只检查正在执行任务的 worker
-                    if !stats.is_active() {
-                        continue;
-                    }
-
-                    let speed = stats.get_window_avg_speed();
-                    // 只考虑有效的速度数据
-                    if let Some(speed) = speed {
-                        worker_speeds.push(WorkerSpeed {
-                            worker_id,
-                            speed: Speed(speed.as_u64()),
-                        });
-                    }
-                }
+            ExecutorBroadcast::Shutdown => {
+                self.handle_executor_shutdown(worker_id);
             }
-            // handles 的读锁在这里自动释放
         }
+    }
 
-        // 至少需要 min_workers 个有效速度数据才能进行比较
-        if (worker_speeds.len() as u64) < self.config.health_check().min_workers_for_check() {
-            return;
+    /// 处理统计更新
+    fn handle_stats_update(&mut self, worker_id: u64, stats: ExecutorStats) {
+        // 更新当前统计
+        self.current_stats.insert(worker_id, stats);
+
+        // 判断当前 Executor 是否相对速度异常（基于 max gap 算法）
+        let is_anomaly = self.check_if_anomaly(worker_id);
+
+        // 确保有健康追踪器并记录异常状态
+        let history_size = self.history_size;
+        let tracker = self
+            .health_trackers
+            .entry(worker_id)
+            .or_insert_with(|| ExecutorHealthTracker::new(history_size));
+        tracker.record(is_anomaly);
+
+        // 检查是否需要取消（相对速度异常次数过多）
+        if let Some(tracker) = self.health_trackers.get(&worker_id) {
+            if tracker.exceeds_anomaly_threshold(self.anomaly_threshold) {
+                let anomaly_count = tracker.anomaly_count();
+                warn!(
+                    "Worker #{} 相对速度异常次数过多 ({}/{}), 取消当前下载",
+                    worker_id, anomaly_count, self.history_size
+                );
+                self.cancel_worker(worker_id, format!(
+                    "相对速度异常 ({}/{})",
+                    anomaly_count, self.history_size
+                ));
+                
+                // 重置该 worker 的健康追踪器
+                self.reset_worker_tracking(worker_id);
+            }
         }
+    }
 
-        // 执行健康检查
-        let Some(result) = self.logic.check(&worker_speeds) else {
-            return;
-        };
+    /// 重置 worker 的追踪器
+    fn reset_worker_tracking(&mut self, worker_id: u64) {
+        if let Some(tracker) = self.health_trackers.get_mut(&worker_id) {
+            tracker.reset();
+        }
+    }
 
-        // 直接取消不健康的 worker 的当前下载
+    /// 处理 Executor 关闭
+    fn handle_executor_shutdown(&mut self, worker_id: u64) {
+        // 清理追踪数据
+        self.health_trackers.remove(&worker_id);
+        self.current_stats.remove(&worker_id);
+        debug!("Worker #{} 已关闭，移除健康追踪", worker_id);
+    }
+
+    /// 判断指定 Executor 是否异常
+    ///
+    /// 使用最大间隙检测算法，判断该 Executor 是否在慢速簇中
+    fn check_if_anomaly(&self, target_worker_id: u64) -> bool {
+        // 收集所有活跃 Executor 的速度
+        let worker_speeds: Vec<WorkerSpeed> = self
+            .current_stats
+            .iter()
+            .filter_map(|(&worker_id, stats)| {
+                stats.get_instant_speed().map(|speed| WorkerSpeed {
+                    worker_id,
+                    speed: Speed(speed.as_u64()),
+                })
+            })
+            .collect();
+
+        // 使用现有逻辑检查
+        if let Some(result) = self.logic.check(&worker_speeds) {
+            // 检查目标 worker 是否在不健康列表中
+            result
+                .unhealthy_workers
+                .iter()
+                .any(|(id, _)| *id == target_worker_id)
+        } else {
+            false
+        }
+    }
+
+    /// 取消指定 worker 的当前下载
+    fn cancel_worker(&self, worker_id: u64, reason: String) {
         let handles = self.worker_handles.load();
-        for (worker_id, speed) in result.unhealthy_workers {
-            let reason = match self.logic.absolute_threshold {
-                Some(threshold) => format!(
-                    "速度过慢 {} (基准: {}, 阈值: {})",
-                    speed.to_formatted(self.config.speed().size_standard()),
-                    result
-                        .health_baseline
-                        .to_formatted(self.config.speed().size_standard()),
-                    threshold.to_formatted(self.config.speed().size_standard()),
-                ),
-                None => format!(
-                    "速度过慢 {} (基准: {})",
-                    speed.to_formatted(self.config.speed().size_standard()),
-                    result
-                        .health_baseline
-                        .to_formatted(self.config.speed().size_standard()),
-                ),
-            };
-
-            warn!("检测到不健康的 Worker #{}: {}", worker_id, reason);
-
-            // 直接发送取消信号给 worker
-            if let Some(handle) = handles.get(&worker_id) {
-                if let Err(e) = handle.cancel_current_download() {
-                    warn!("Worker #{} 发送取消信号失败: {:?}", worker_id, e);
-                }
+        if let Some(handle) = handles.get(&worker_id) {
+            if handle.cancel_handle().cancel() {
+                debug!("Worker #{} 已取消: {}", worker_id, reason);
+            } else {
+                warn!("Worker #{} 发送取消信号失败 (task_id 不匹配或 channel 已关闭)", worker_id);
             }
         }
     }
@@ -852,25 +937,24 @@ mod tests {
     #[test]
     fn test_edge_case_threshold() {
         // 测试边界情况：worker 速度恰好等于健康基准 * relative_threshold
+        // health_baseline = max speed = 100000
+        // threshold_speed = 100000 * 0.5 = 50000
+        // worker 0: 50000 < 50000? No (等于，不满足 < 条件)
         let checker =
             WorkerHealthCheckerLogic::new(Some(create_speed(100000)), 0.5, SizeStandard::IEC);
         let speeds = vec![
             WorkerSpeed {
                 worker_id: 0,
                 speed: create_speed(50000),
-            }, // 恰好等于 100KB * 0.5
+            }, // 恰好等于 100000 * 0.5 = 50000
             WorkerSpeed {
                 worker_id: 1,
                 speed: create_speed(100000),
-            }, // 基准
-            WorkerSpeed {
-                worker_id: 2,
-                speed: create_speed(150000),
-            },
+            }, // 基准 (max speed)
         ];
 
         let result = checker.check(&speeds);
-        // worker 0: 50000 < 100000 (绝对阈值) ✓, 50000 < 100000 * 0.5 = 50000 ✗
+        // worker 0: 50000 < 100000 (绝对阈值) ✓, 但 50000 < 50000 ✗ (等于不算)
         // 不应该被检测到
         assert!(result.is_none());
     }

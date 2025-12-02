@@ -9,12 +9,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
+pub(crate) mod download_stats;
 mod progress_reporter;
 mod progressive;
 pub mod task;
 mod worker_health_checker;
 
-pub use progress_reporter::{DownloadProgress, WorkerStatSnapshot};
+pub use progress_reporter::DownloadProgress;
 use task::DownloadTask;
 pub use worker_health_checker::WorkerSpeed;
 
@@ -58,11 +59,11 @@ impl DownloadHandle {
     ///
     /// while let Some(progress) = handle.progress_receiver().recv().await {
     ///     match progress {
-    ///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
-    ///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+    ///         DownloadProgress::Progress { percentage, avg_speed, executor_stats, .. } => {
+    ///             // 每个 executor 有各自的统计信息
     ///             let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
-    ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers",
-    ///                 percentage, speed_mbps, worker_stats.len());
+    ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} executors",
+    ///                 percentage, speed_mbps, executor_stats.stats_map.len());
     ///         }
     ///         DownloadProgress::Completed { .. } => {
     ///             println!("下载完成！");
@@ -216,9 +217,9 @@ where
     })
     .await;
 
-    // 发送开始事件（使用第一个 worker 的初始分块大小）
+    // 发送开始事件
     let current_worker_count = task.worker_count();
-    let initial_chunk_size = task.get_worker_chunk_size(0);
+    let initial_chunk_size = config.chunk().initial_size;
     task.progress_reporter()
         .send_started_event(current_worker_count, initial_chunk_size)
         .await;
@@ -288,17 +289,17 @@ where
 /// // 监听进度
 /// while let Some(progress) = handle.progress_receiver().recv().await {
 ///     match progress {
-///         DownloadProgress::Progress { percentage, avg_speed, worker_stats, .. } => {
-///             // 每个 worker 有各自的分块大小，可从 worker_stats 中获取
+///         DownloadProgress::Progress { percentage, avg_speed, executor_stats, .. } => {
+///             // 每个 executor 有各自的统计信息
 ///             let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
-///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} workers",
+///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} executors",
 ///                 percentage,
 ///                 speed_mbps,
-///                 worker_stats.len());
+///                 executor_stats.stats_map.len());
 ///         }
-///         DownloadProgress::Completed { total_bytes, total_time, worker_stats, .. } => {
-///             println!("下载完成！{:.2} MB in {:.2}s, {} workers",
-///                 total_bytes as f64 / 1024.0 / 1024.0, total_time, worker_stats.len());
+///         DownloadProgress::Completed { total_bytes, total_time, executor_stats, .. } => {
+///             println!("下载完成！{:.2} MB in {:.2}s, {} executors",
+///                 total_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.stats_map.len());
 ///         }
 ///         _ => {}
 ///     }

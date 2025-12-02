@@ -10,21 +10,231 @@
 //! - 任务结束时发送 `TaskEnded`
 //!
 //! 这样可以将统计更新的开销从热路径中移除，提高下载性能。
+//!
+//! 统计更新通过 broadcast channel 广播 `ExecutorBroadcast` 消息到所有订阅者。
 
 use crate::utils::stats::WorkerStats;
 use log::debug;
-use smr_swap::SmrSwap;
-use tokio::sync::mpsc;
+use net_bytes::{DownloadAcceleration, DownloadSpeed};
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc};
 
-/// Stats 更新消息
+/// Executor 当前运行状态统计
+///
+/// 表示 Executor 的两种状态：停止或运行中
+#[derive(Debug, Clone, Default)]
+pub enum ExecutorCurrentStats {
+    /// Executor 已停止
+    #[default]
+    Stopped,
+    /// Executor 运行中，包含实时统计数据
+    Running {
+        /// 当前分块大小 (bytes)
+        current_chunk_size: u64,
+        /// 平均速度（从开始到现在）
+        avg_speed: Option<DownloadSpeed>,
+        /// 实时速度（基于短时间窗口）
+        instant_speed: Option<DownloadSpeed>,
+        /// 窗口平均速度（基于较长时间窗口）
+        window_avg_speed: Option<DownloadSpeed>,
+        /// 实时加速度
+        instant_acceleration: Option<DownloadAcceleration>,
+    },
+}
+
+/// Executor 统计信息
+///
+/// 记录 Executor 的总运行时长、总下载字节数，以及当前运行状态的详细统计
+#[derive(Debug, Clone)]
+pub struct ExecutorStats {
+    /// 总运行时长
+    pub total_duration: Duration,
+    /// 总下载字节数
+    pub total_bytes: u64,
+    /// 当前运行状态统计
+    pub current_stats: ExecutorCurrentStats,
+    /// 内部：运行开始时间（用于计算总运行时长）
+    pub run_start_time: Option<Instant>,
+}
+
+impl Default for ExecutorStats {
+    fn default() -> Self {
+        Self {
+            total_duration: Duration::ZERO,
+            total_bytes: 0,
+            current_stats: ExecutorCurrentStats::Stopped,
+            run_start_time: None,
+        }
+    }
+}
+
+impl ExecutorStats {
+    /// 创建新的 ExecutorStats
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 标记 Executor 开始运行
+    pub(crate) fn start_running(&mut self, current_chunk_size: u64) {
+        if self.run_start_time.is_none() {
+            self.run_start_time = Some(Instant::now());
+        }
+        // 初始化为运行状态，但还没有速度数据
+        self.current_stats = ExecutorCurrentStats::Running {
+            current_chunk_size,
+            avg_speed: None,
+            instant_speed: None,
+            window_avg_speed: None,
+            instant_acceleration: None,
+        };
+    }
+
+    /// 标记 Executor 停止运行
+    pub(crate) fn stop_running(&mut self) {
+        // 累加运行时长
+        if let Some(start) = self.run_start_time.take() {
+            self.total_duration += start.elapsed();
+        }
+        self.current_stats = ExecutorCurrentStats::Stopped;
+    }
+
+    /// 更新统计数据（从 WorkerStats 同步）
+    pub(crate) fn update_from_worker_stats(&mut self, worker_stats: &WorkerStats) {
+        let (total_bytes, _) = worker_stats.get_summary();
+        self.total_bytes = total_bytes;
+        
+        if matches!(self.current_stats, ExecutorCurrentStats::Running{..}) {
+            self.current_stats = ExecutorCurrentStats::Running {
+                current_chunk_size: worker_stats.get_current_chunk_size(),
+                avg_speed: worker_stats.get_speed(),
+                instant_speed: worker_stats.get_instant_speed(),
+                window_avg_speed: worker_stats.get_window_avg_speed(),
+                instant_acceleration: worker_stats.get_instant_acceleration(),
+            };
+        }
+    }
+
+    /// 获取实时速度
+    pub fn get_instant_speed(&self) -> Option<DownloadSpeed> {
+        match &self.current_stats {
+            ExecutorCurrentStats::Running { instant_speed, .. } => *instant_speed,
+            ExecutorCurrentStats::Stopped => None,
+        }
+    }
+
+    /// 获取窗口平均速度
+    pub fn get_window_avg_speed(&self) -> Option<DownloadSpeed> {
+        match &self.current_stats {
+            ExecutorCurrentStats::Running { window_avg_speed, .. } => *window_avg_speed,
+            ExecutorCurrentStats::Stopped => None,
+        }
+    }
+
+    /// 获取平均速度
+    pub fn get_avg_speed(&self) -> Option<DownloadSpeed> {
+        match &self.current_stats {
+            ExecutorCurrentStats::Running { avg_speed, .. } => *avg_speed,
+            ExecutorCurrentStats::Stopped => None,
+        }
+    }
+
+    /// 获取实时加速度
+    pub fn get_instant_acceleration(&self) -> Option<DownloadAcceleration> {
+        match &self.current_stats {
+            ExecutorCurrentStats::Running { instant_acceleration, .. } => *instant_acceleration,
+            ExecutorCurrentStats::Stopped => None,
+        }
+    }
+}
+
+/// Stats 更新消息（内部使用）
 #[derive(Debug, Clone)]
 pub(crate) enum StatsMessage {
     /// 任务开始
-    TaskStarted,
+    TaskStarted{
+        initial_chunk_size: u64
+    },
     /// Chunk 采样成功，包含当前的 WorkerStats 快照
     ChunkSampled(WorkerStats),
     /// 任务结束
     TaskEnded,
+    /// Executor 关闭
+    ExecutorShutdown,
+}
+
+/// Executor 广播消息
+///
+/// 通过 broadcast channel 发送给所有订阅者
+/// 本地广播直接发送此消息，外部广播发送 `(worker_id, ExecutorBroadcast)`
+#[derive(Debug, Clone)]
+pub enum ExecutorBroadcast {
+    /// Executor 统计更新
+    Stats(ExecutorStats),
+    /// Executor 关闭信号
+    Shutdown,
+}
+
+/// 带标签的广播消息（外部广播用）
+///
+/// 包含 worker_id 和广播消息，用于外部订阅者区分不同 Worker
+pub type TaggedBroadcast = (u64, ExecutorBroadcast);
+
+/// Worker 本地广播发送器
+///
+/// 封装 Worker 内部的广播分发，包含：
+/// - 外部广播：发送 `(worker_id, ExecutorBroadcast)` 到 Executor 级别的订阅者
+/// - 本地广播：发送 `ExecutorBroadcast` 到 Worker 本地的协程（如健康检测）
+#[derive(Clone)]
+pub struct WorkerBroadcaster {
+    /// Worker ID
+    worker_id: u64,
+    /// 外部广播发送器（Executor 级别）
+    executor_tx: broadcast::Sender<TaggedBroadcast>,
+    /// 本地广播发送器（Worker 内部，不带 worker_id）
+    local_tx: broadcast::Sender<ExecutorBroadcast>,
+}
+
+impl WorkerBroadcaster {
+    /// 创建新的 Worker 广播器
+    ///
+    /// # Arguments
+    ///
+    /// - `worker_id`: Worker ID
+    /// - `executor_tx`: 外部广播发送器
+    /// - `local_capacity`: 本地广播通道容量
+    pub fn new(worker_id: u64, executor_tx: broadcast::Sender<TaggedBroadcast>, local_capacity: usize) -> Self {
+        let (local_tx, _) = broadcast::channel(local_capacity);
+        Self {
+            worker_id,
+            executor_tx,
+            local_tx,
+        }
+    }
+
+    /// 订阅本地广播（用于健康检测协程）
+    pub fn subscribe_local(&self) -> broadcast::Receiver<ExecutorBroadcast> {
+        self.local_tx.subscribe()
+    }
+
+    /// 发送统计更新
+    /// - 外部广播：`(worker_id, ExecutorBroadcast::Stats)`
+    /// - 本地广播：`ExecutorBroadcast::Stats`
+    #[inline]
+    pub fn send_stats(&self, stats: ExecutorStats) {
+        let msg = ExecutorBroadcast::Stats(stats);
+        let _ = self.executor_tx.send((self.worker_id, msg.clone()));
+        let _ = self.local_tx.send(msg);
+    }
+
+    /// 发送关闭信号
+    /// - 外部广播：`(worker_id, ExecutorBroadcast::Shutdown)`
+    /// - 本地广播：`ExecutorBroadcast::Shutdown`
+    #[inline]
+    pub fn send_shutdown(&self) {
+        let msg = ExecutorBroadcast::Shutdown;
+        let _ = self.executor_tx.send((self.worker_id, msg.clone()));
+        let _ = self.local_tx.send(msg);
+    }
 }
 
 /// Stats Updater 配置
@@ -53,9 +263,11 @@ pub(crate) struct StatsUpdaterHandle {
 impl StatsUpdaterHandle {
     /// 发送任务开始信号
     #[inline]
-    pub(crate) fn send_task_started(&self) {
+    pub(crate) fn send_task_started(&self, initial_chunk_size: u64) {
         // 使用 try_send 避免阻塞，如果通道满了就跳过
-        let _ = self.tx.try_send(StatsMessage::TaskStarted);
+        let _ = self.tx.try_send(StatsMessage::TaskStarted {
+            initial_chunk_size
+        });
     }
 
     /// 发送采样成功信号
@@ -71,18 +283,29 @@ impl StatsUpdaterHandle {
         // 使用 try_send 避免阻塞，如果通道满了就跳过
         let _ = self.tx.try_send(StatsMessage::TaskEnded);
     }
+
+    /// 发送 Executor 关闭信号
+    #[inline]
+    pub(crate) fn send_executor_shutdown(&self) {
+        // 使用 try_send 避免阻塞，如果通道满了就跳过
+        let _ = self.tx.try_send(StatsMessage::ExecutorShutdown);
+    }
 }
 
 /// Stats Updater 辅助协程
 ///
-/// 持有 `SmrSwap<WorkerStats>` 并根据接收到的消息更新统计数据
+/// 持有 `SmrSwap<WorkerStats>` 并根据接收到的消息实时更新统计数据。
+/// 内部维护 `ExecutorStats` 用于记录总运行时长和总下载字节数。
+/// 通过 broadcast channel 广播 `ExecutorStats` 更新和关闭信号。
 pub(crate) struct StatsUpdater {
     /// Worker ID（用于日志）
     worker_id: u64,
-    /// 统计数据
-    stats: SmrSwap<WorkerStats>,
+    /// Executor 统计数据（内部维护）
+    executor_stats: ExecutorStats,
     /// 消息接收通道
     rx: mpsc::Receiver<StatsMessage>,
+    /// Worker 广播器（封装外部和本地广播）
+    broadcaster: WorkerBroadcaster,
 }
 
 impl StatsUpdater {
@@ -91,7 +314,7 @@ impl StatsUpdater {
     /// # Arguments
     ///
     /// - `worker_id`: Worker ID
-    /// - `stats`: 统计数据的 SmrSwap 包装
+    /// - `broadcaster`: Worker 广播器，用于发送 ExecutorStats 更新和关闭信号
     /// - `config`: 配置（可选，使用默认配置）
     ///
     /// # Returns
@@ -99,7 +322,7 @@ impl StatsUpdater {
     /// 返回 `(StatsUpdater, StatsUpdaterHandle)`
     pub(crate) fn new(
         worker_id: u64,
-        stats: SmrSwap<WorkerStats>,
+        broadcaster: WorkerBroadcaster,
         config: Option<StatsUpdaterConfig>,
     ) -> (Self, StatsUpdaterHandle) {
         let config = config.unwrap_or_default();
@@ -107,8 +330,9 @@ impl StatsUpdater {
 
         let updater = Self {
             worker_id,
-            stats,
+            executor_stats: ExecutorStats::new(),
             rx,
+            broadcaster,
         };
 
         let handle = StatsUpdaterHandle { tx };
@@ -124,14 +348,17 @@ impl StatsUpdater {
 
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                StatsMessage::TaskStarted => {
-                    self.handle_task_started();
+                StatsMessage::TaskStarted{ initial_chunk_size } => {
+                    self.handle_task_started(initial_chunk_size);
                 }
                 StatsMessage::ChunkSampled(worker_stats) => {
                     self.handle_chunk_sampled(worker_stats);
                 }
                 StatsMessage::TaskEnded => {
                     self.handle_task_ended();
+                }
+                StatsMessage::ExecutorShutdown => {
+                    self.handle_executor_shutdown();
                 }
             }
         }
@@ -140,87 +367,46 @@ impl StatsUpdater {
     }
 
     /// 处理任务开始
-    fn handle_task_started(&mut self) {
+    fn handle_task_started(&mut self, initial_chunk_size: u64) {
         debug!("Worker #{} 任务开始", self.worker_id);
-        self.stats.update(|s| {
-            let mut s = s.clone();
-            s.set_active(true);
-            s.clear_samples();
-            s
-        });
+        
+        // 更新 ExecutorStats：标记开始运行
+        self.executor_stats.start_running(initial_chunk_size);
+        
+        // 广播到订阅者
+        self.broadcast_stats();
     }
 
     /// 处理采样成功
     fn handle_chunk_sampled(&mut self, worker_stats: WorkerStats) {
-        // 直接存储新的统计数据
-        self.stats.store(worker_stats);
+        // 更新 ExecutorStats：同步速度数据
+        self.executor_stats.update_from_worker_stats(&worker_stats);
+        
+        // 广播到订阅者
+        self.broadcast_stats();
     }
 
     /// 处理任务结束
     fn handle_task_ended(&mut self) {
         debug!("Worker #{} 任务结束", self.worker_id);
-        self.stats.update(|s| {
-            let mut s = s.clone();
-            s.set_active(false);
-            s
-        });
+        
+        // 更新 ExecutorStats：标记停止运行
+        self.executor_stats.stop_running();
+        
+        // 广播到订阅者
+        self.broadcast_stats();
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_stats_updater_task_lifecycle() {
-        let stats = SmrSwap::new(WorkerStats::default());
-        let local = stats.local();
-        let (updater, handle) = StatsUpdater::new(1, stats, None);
-
-        // 启动 updater
-        let updater_handle = tokio::spawn(updater.run());
-
-        // 发送任务开始
-        handle.send_task_started();
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // 验证 active 状态
-        assert!(local.load().is_active());
-
-        // 发送任务结束
-        handle.send_task_ended();
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // 验证 active 状态
-        assert!(!local.load().is_active());
-
-        // 关闭通道
-        drop(handle);
-        let _ = updater_handle.await;
+    
+    /// 广播 ExecutorStats
+    #[inline]
+    fn broadcast_stats(&self) {
+        self.broadcaster.send_stats(self.executor_stats.clone());
     }
 
-    #[tokio::test]
-    async fn test_stats_updater_chunk_sampled() {
-        let stats = SmrSwap::new(WorkerStats::default());
-        let local = stats.local();
-        let (updater, handle) = StatsUpdater::new(1, stats, None);
-
-        // 启动 updater
-        let updater_handle = tokio::spawn(updater.run());
-
-        // 创建一个带有数据的 WorkerStats
-        let mut worker_stats = WorkerStats::default();
-        worker_stats.set_current_chunk_size(1024 * 1024);
-
-        // 发送采样
-        handle.send_chunk_sampled(worker_stats);
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // 验证 chunk size 被更新
-        assert_eq!(local.load().get_current_chunk_size(), 1024 * 1024);
-
-        // 关闭通道
-        drop(handle);
-        let _ = updater_handle.await;
+    /// 处理 Executor 关闭
+    #[inline]
+    fn handle_executor_shutdown(&self) {
+        debug!("Worker #{} Executor 关闭", self.worker_id);
+        self.broadcaster.send_shutdown();
     }
 }

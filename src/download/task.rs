@@ -1,6 +1,7 @@
 use crate::DownloadError;
 use crate::download::DownloadTaskParams;
-use crate::pool::download::{DownloadWorkerPool, ExecutorResult};
+use crate::download::download_stats::{DownloadStats, DownloadStatsHandle};
+use crate::pool::download::{DownloadWorkerHandle, DownloadWorkerPool, ExecutorResult};
 use crate::utils::io_traits::HttpClient;
 use crate::utils::writer::MmapWriter;
 use crate::{
@@ -9,7 +10,6 @@ use crate::{
         progressive::{ProgressiveLauncher, ProgressiveLauncherParams, WorkerLaunchRequest},
         worker_health_checker::{WorkerHealthChecker, WorkerHealthCheckerParams},
     },
-    pool::download::DownloadWorkerHandle,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::{error, info, warn};
@@ -30,8 +30,6 @@ pub struct DownloadTask<C: HttpClient> {
     writer: MmapWriter,
     /// 进度报告器
     progress_reporter: ProgressReporter,
-    /// 下载配置
-    config: Arc<crate::config::DownloadConfig>,
     /// 渐进式启动管理器
     progressive_launcher: ProgressiveLauncher,
     /// Worker 启动请求接收器（由 progressive_launcher 发送）
@@ -42,6 +40,8 @@ pub struct DownloadTask<C: HttpClient> {
     worker_handles: SmrSwap<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 健康检查器（actor 模式）
     health_checker: WorkerHealthChecker,
+    /// 下载统计聚合器句柄（包含 actor 任务和关闭接口）
+    stats_handle: DownloadStatsHandle,
     /// 永久失败的 ranges
     failed_ranges: Vec<(AllocatedRange, String)>,
     /// 完成的 worker 数量
@@ -62,38 +62,39 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             config,
         } = params;
 
-        // 获取 global_stats
-        let global_stats = crate::utils::stats::TaskStats::from_config(config.clone());
-
         // worker_handles 占位，稍后填充
         let mut swap = SmrSwap::new(FxHashMap::default());
 
         // 基准时间间隔：50ms
         let base_offset = std::time::Duration::from_millis(50);
 
+        // 创建广播通道
+        let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
+
+        // 创建下载统计聚合器（订阅广播） - 必须在 ProgressiveLauncher 之前创建
+        let (stats_handle, aggregated_stats_reader) = DownloadStats::spawn(broadcast_rx);
+
         // 创建渐进式启动管理器（actor 模式） - 偏移 0ms
         let (progressive_launcher, launch_request_rx) =
             ProgressiveLauncher::new(ProgressiveLauncherParams {
                 config: Arc::clone(&config),
-                worker_handles: swap.local(),
+                aggregated_stats: aggregated_stats_reader.clone(),
                 total_size: writer.total_size(),
                 written_bytes: writer.written_bytes_ref(),
-                global_stats: global_stats.clone(),
                 start_offset: std::time::Duration::ZERO,
             });
-
-        // 创建健康检查器（actor 模式） - 偏移 50ms
-        let health_checker = WorkerHealthChecker::new(WorkerHealthCheckerParams {
-            config: Arc::clone(&config),
-            worker_handles: swap.local(),
-            check_interval: config.speed().instant_speed_window(),
-            start_offset: base_offset,
-        });
 
         // 第一批 worker 数量
         let initial_worker_count = progressive_launcher.initial_worker_count();
 
         info!("初始启动 {} 个 workers", initial_worker_count);
+
+        // 创建健康检查器（actor 模式，订阅广播）
+        let health_checker = WorkerHealthChecker::new(WorkerHealthCheckerParams {
+            config: Arc::clone(&config),
+            worker_handles: swap.local(),
+            broadcast_rx: broadcast_tx.subscribe(),
+        });
 
         // 创建 DownloadWorkerPool（只启动第一批 worker）
         let (pool, initial_handles, initial_result_rxs) = DownloadWorkerPool::new(
@@ -103,15 +104,14 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             allocator,
             url.clone(),
             Arc::clone(&config),
-            global_stats.clone(),
+            broadcast_tx,
         );
 
         // 创建进度报告器（使用配置的统计窗口作为更新间隔） - 偏移 100ms
         let progress_reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender,
             total_size,
-            worker_handles: swap.local(),
-            global_stats: global_stats.clone(),
+            aggregated_stats: aggregated_stats_reader,
             update_interval: config.speed().instant_speed_window(),
             start_offset: base_offset * 2,
         });
@@ -130,12 +130,12 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             pool,
             writer,
             progress_reporter,
-            config,
             progressive_launcher,
             launch_request_rx,
             result_futures,
             worker_handles: swap,
             health_checker,
+            stats_handle,
             failed_ranges: Vec::new(),
             completed_workers: 0,
         }
@@ -265,6 +265,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 关闭 health checker actor 并等待其完全停止
         self.health_checker.shutdown_and_wait().await;
 
+        // 关闭下载统计聚合器并等待其完全停止
+        self.stats_handle.shutdown_and_wait().await;
+
         if let Some(msg) = error_msg {
             return Err(DownloadError::Other(msg));
         }
@@ -295,6 +298,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 关闭 health checker actor 并等待其完全停止
         self.health_checker.shutdown_and_wait().await;
 
+        // 关闭下载统计聚合器并等待其完全停止
+        self.stats_handle.shutdown_and_wait().await;
+
         // 完成写入
         self.writer.finalize()?;
 
@@ -307,32 +313,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     #[inline]
     pub fn worker_count(&self) -> u64 {
         self.pool.worker_count()
-    }
-
-    /// 获取指定 worker 的句柄（从缓存中）
-    ///
-    /// # Arguments
-    ///
-    /// * `worker_id` - Worker ID
-    ///
-    /// # Returns
-    ///
-    /// Worker 句柄的克隆，如果 worker 不存在则返回 `None`
-    #[inline]
-    fn get_worker_handle(
-        &self,
-        worker_id: u64,
-    ) -> Option<crate::pool::download::DownloadWorkerHandle> {
-        let guard = self.worker_handles.load();
-        guard.get(&worker_id).cloned()
-    }
-
-    /// 获取指定 worker 的当前分块大小
-    #[inline]
-    pub fn get_worker_chunk_size(&self, worker_id: u64) -> u64 {
-        self.get_worker_handle(worker_id)
-            .map(|h| h.chunk_size())
-            .unwrap_or(self.config.chunk().initial_size())
     }
 
     /// 获取进度报告器

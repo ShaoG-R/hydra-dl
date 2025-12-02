@@ -21,25 +21,25 @@
 //! 通用协程池 (common.rs) 仅负责协程生命周期管理。
 
 mod executor;
+mod local_health_checker;
 mod stats_updater;
 
+pub use stats_updater::{ExecutorBroadcast, ExecutorCurrentStats, ExecutorStats, TaggedBroadcast, WorkerBroadcaster};
+use local_health_checker::{LocalHealthChecker, LocalHealthCheckerConfig};
 use stats_updater::StatsUpdater;
 
 use super::common::{WorkerFactory, WorkerPool};
 pub(crate) use executor::{DownloadTaskExecutor, DownloadWorkerContext, ExecutorResult};
 use executor::task_allocator::TaskAllocator;
 use crate::utils::{
-    chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy},
-    io_traits::HttpClient,
-    stats::{TaskStats, WorkerStats},
-    writer::MmapWriter,
+    cancel_channel::CancelHandle, chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy}, io_traits::HttpClient, stats::{WorkerStats}, writer::MmapWriter
 };
 use log::info;
-use net_bytes::{DownloadSpeed, SizeStandard};
+use net_bytes::{SizeStandard};
 use ranged_mmap::allocator::concurrent::Allocator as ConcurrentAllocator;
-use smr_swap::{LocalReader, ReadGuard, SmrSwap};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use crate::utils::cancel_channel::{cancel_channel, CancelReceiver, CancelSender};
 
 use std::sync::Arc;
 
@@ -51,12 +51,18 @@ use std::sync::Arc;
 pub(crate) struct DownloadWorkerInput {
     /// 上下文（包含 allocator、url、分块策略等）
     pub(crate) context: DownloadWorkerContext,
-    /// 统计数据（SmrSwap 包装）
-    pub(crate) stats: SmrSwap<WorkerStats>,
+    /// 统计数据
+    pub(crate) stats: WorkerStats,
     /// 结果发送通道（oneshot，仅在 worker 完成时发送一次）
     pub(crate) result_tx: tokio::sync::oneshot::Sender<ExecutorResult>,
     /// 取消信号接收器（用于健康检查触发的重试）
-    pub(crate) cancel_rx: mpsc::Receiver<()>,
+    pub(crate) cancel_rx: CancelReceiver,
+    /// 取消信号发送器（用于本地健康检查器）
+    pub(crate) cancel_tx: CancelSender,
+    /// 外部广播发送器（spawn_worker 中创建 WorkerBroadcaster）
+    pub(crate) broadcast_tx: broadcast::Sender<TaggedBroadcast>,
+    /// 本地健康检查器配置
+    pub(crate) local_health_config: LocalHealthCheckerConfig,
 }
 
 // ==================== 下载任务工厂 ====================
@@ -109,21 +115,34 @@ where
             stats,
             result_tx,
             cancel_rx,
+            cancel_tx,
+            broadcast_tx,
+            local_health_config,
         } = input;
 
-        // 获取 WorkerStats 的副本用于主下载循环
-        let worker_stats = stats.get().clone();
+        // --- 创建 WorkerBroadcaster ---
+        // 在此处创建，因为这里才知道真正的 worker_id
+        let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx, 16);
 
         // --- 协程 1: Stats Updater 辅助协程 ---
-        let (stats_updater, stats_handle) = StatsUpdater::new(worker_id, stats, None);
+        let (stats_updater, stats_handle) = StatsUpdater::new(worker_id, broadcaster.clone(), None);
         let stats_updater_handle = tokio::spawn(stats_updater.run());
+
+        // --- 协程 2: 本地健康检查协程 ---
+        let local_health_checker = LocalHealthChecker::new(
+            worker_id,
+            &broadcaster,
+            cancel_tx,
+            local_health_config,
+        );
+        let local_health_handle = tokio::spawn(local_health_checker.run());
 
         // --- 协程 0: 主下载循环（worker 自主从 allocator 分配任务） ---
         let main_handle = tokio::spawn(
-            executor.run_loop(worker_id, context, worker_stats, stats_handle, result_tx, shutdown_rx, cancel_rx),
+            executor.run_loop(worker_id, context, stats, stats_handle, result_tx, shutdown_rx, cancel_rx),
         );
 
-        vec![main_handle, stats_updater_handle]
+        vec![main_handle, stats_updater_handle, local_health_handle]
     }
 }
 
@@ -144,20 +163,17 @@ where
 pub(crate) struct DownloadWorkerHandle {
     /// Worker ID
     worker_id: u64,
-    /// 该 worker 的统计数据（SwapReader 包装以便外部访问）
-    stats: LocalReader<WorkerStats>,
     /// 取消信号发送器（用于健康检查触发的重试）
-    cancel_tx: mpsc::Sender<()>,
+    cancel_tx: CancelSender,
 }
 
 impl DownloadWorkerHandle {
     /// 创建新的下载 worker 句柄
     pub(crate) fn new(
         worker_id: u64,
-        stats: LocalReader<WorkerStats>,
-        cancel_tx: mpsc::Sender<()>,
+        cancel_tx: CancelSender,
     ) -> Self {
-        Self { worker_id, stats, cancel_tx }
+        Self { worker_id, cancel_tx }
     }
 
     /// 获取 worker ID
@@ -166,32 +182,9 @@ impl DownloadWorkerHandle {
         self.worker_id
     }
 
-    /// 获取该 worker 的统计数据
-    #[inline]
-    pub fn stats<'a>(&'a self) -> ReadGuard<'a, WorkerStats> {
-        self.stats.load()
-    }
-
-    /// 获取该 worker 的实时速度
-    pub fn instant_speed(&self) -> Option<DownloadSpeed> {
-        self.stats.load().get_instant_speed()
-    }
-
-    /// 获取该 worker 的当前分块大小
-    pub fn chunk_size(&self) -> u64 {
-        self.stats.load().get_current_chunk_size()
-    }
-
-    /// 发送取消信号，触发当前下载重试
-    ///
-    /// 健康检查器检测到 worker 不健康时调用此方法，
-    /// worker 会取消当前下载并自动重试剩余部分
-    ///
-    /// # Returns
-    ///
-    /// 成功时返回 `Ok(())`，如果通道已满或 worker 已退出返回 `Err`
-    pub fn cancel_current_download(&self) -> Result<(), mpsc::error::TrySendError<()>> {
-        self.cancel_tx.try_send(())
+    // 获取用于取消的句柄
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.cancel_tx.get_handle()
     }
 }
 
@@ -200,17 +193,21 @@ impl DownloadWorkerHandle {
 /// 下载 Worker 协程池
 ///
 /// 封装通用 WorkerPool，提供下载特定的便捷方法
+///
+/// # 泛型参数
+///
+/// - `C`: HTTP 客户端类型
 pub(crate) struct DownloadWorkerPool<C: HttpClient> {
     /// 底层通用协程池
     pool: WorkerPool<DownloadWorkerFactory<C>>,
-    /// 全局统计管理器（聚合所有 worker 的数据）
-    global_stats: TaskStats,
     /// 下载配置（用于创建新 worker 的分块策略）
     config: Arc<crate::config::DownloadConfig>,
     /// 并发范围分配器（所有 worker 共享）
     allocator: Arc<ConcurrentAllocator>,
     /// 下载 URL
     url: String,
+    /// 广播发送器
+    broadcast_tx: broadcast::Sender<TaggedBroadcast>,
 }
 
 impl<C> DownloadWorkerPool<C>
@@ -227,6 +224,7 @@ where
     /// - `allocator`: 并发范围分配器，所有 worker 共享
     /// - `url`: 下载 URL
     /// - `config`: 下载配置，用于创建分块策略和设置速度窗口
+    /// - `broadcast_tx`: 广播发送器，用于发送 ExecutorStats 更新和关闭信号
     ///
     /// # Returns
     ///
@@ -238,7 +236,7 @@ where
         allocator: ConcurrentAllocator,
         url: String,
         config: Arc<crate::config::DownloadConfig>,
-        global_stats: TaskStats,
+        broadcast_tx: broadcast::Sender<TaggedBroadcast>,
     ) -> (
         Self,
         Vec<DownloadWorkerHandle>,
@@ -260,10 +258,10 @@ where
 
         for _ in 0..initial_worker_count {
             let (input, handle, result_rx) = Self::create_worker_input_and_handle(
-                &global_stats,
                 &config,
                 allocator.clone(),
                 url.clone(),
+                broadcast_tx.clone(),
             );
             inputs.push(input);
             handles.push(handle);
@@ -283,10 +281,10 @@ where
         (
             Self {
                 pool,
-                global_stats,
                 config,
                 allocator,
                 url,
+                broadcast_tx,
             },
             handles,
             result_rxs,
@@ -295,16 +293,14 @@ where
 
     /// 创建单个 worker 的输入参数和句柄
     fn create_worker_input_and_handle(
-        global_stats: &TaskStats,
         config: &crate::config::DownloadConfig,
         allocator: Arc<ConcurrentAllocator>,
         url: String,
+        broadcast_tx: broadcast::Sender<TaggedBroadcast>,
     ) -> (DownloadWorkerInput, DownloadWorkerHandle, tokio::sync::oneshot::Receiver<ExecutorResult>) {
         // 创建统计数据
-        let mut worker_stats = global_stats.create_child();
-        worker_stats.set_current_chunk_size(config.chunk().initial_size());
-        let stats = SmrSwap::new(worker_stats);
-        let stats_reader = stats.local();
+        let mut stats = WorkerStats::from_config(config.speed());
+        stats.set_current_chunk_size(config.chunk().initial_size());
 
         // 创建任务分配器
         let task_allocator = TaskAllocator::new(allocator, config.retry().clone());
@@ -319,21 +315,26 @@ where
         };
 
         // 创建取消通道（用于健康检查触发重试）
-        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = cancel_channel();
 
         // 创建结果通道（oneshot）
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        // 创建本地健康检查器配置
+        let local_health_config = LocalHealthCheckerConfig::from_download_config(config);
 
         let input = DownloadWorkerInput {
             context,
             stats,
             result_tx,
             cancel_rx,
+            cancel_tx: cancel_tx.clone(),
+            broadcast_tx,
+            local_health_config,
         };
 
         let handle = DownloadWorkerHandle::new(
             0, // worker_id 稍后由 WorkerPool::new 返回的 ID 更新
-            stats_reader,
             cancel_tx,
         );
 
@@ -356,10 +357,10 @@ where
 
         for _ in 0..count {
             let (input, handle, result_rx) = Self::create_worker_input_and_handle(
-                &self.global_stats,
                 &self.config,
                 self.allocator.clone(),
                 self.url.clone(),
+                self.broadcast_tx.clone(),
             );
             inputs.push(input);
             handles.push(handle);
@@ -379,16 +380,6 @@ where
     /// 获取当前活跃 worker 总数
     pub(crate) fn worker_count(&self) -> u64 {
         self.pool.worker_count()
-    }
-
-    /// 获取所有 worker 的总体窗口平均速度（O(1)，无需遍历）
-    ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadSpeed)` 如果速度计算有效，否则返回 `None`
-    #[allow(dead_code)]
-    pub(crate) fn get_total_window_avg_speed(&self) -> Option<DownloadSpeed> {
-        self.global_stats.get_window_avg_speed()
     }
 
     /// 优雅关闭所有 workers
@@ -421,38 +412,11 @@ mod tests {
 
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let global_stats = TaskStats::from_config(config.clone());
+        let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
         let (pool, _handles, _result_receiver) =
-            DownloadWorkerPool::new(client, worker_count, writer, allocator, url, config, global_stats);
+            DownloadWorkerPool::new(client, worker_count, writer, allocator, url, config, broadcast_tx);
 
         assert_eq!(pool.worker_count(), 4);
-    }
-
-    #[tokio::test]
-    async fn test_download_worker_pool_stats() {
-        use std::num::NonZeroU64;
-
-        let client = MockHttpClient::new();
-        let dir = tempfile::tempdir().unwrap();
-        let save_path = dir.path().join("test.bin");
-
-        let (writer, allocator) = MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
-        let url = "http://example.com/file.bin".to_string();
-
-        let worker_count = 3;
-        let config = Arc::new(crate::config::DownloadConfig::default());
-        let global_stats = TaskStats::from_config(config.clone());
-        let (pool, _handles, _result_receiver) =
-            DownloadWorkerPool::new(client, worker_count, writer, allocator, url, config, global_stats);
-
-        // 初始统计应该都是 0
-        let (total_bytes, total_secs, ranges) = pool.global_stats.get_summary();
-        assert_eq!(total_bytes, 0);
-        assert!(total_secs >= 0.0);
-        assert_eq!(ranges, 0);
-
-        let speed = pool.global_stats.get_speed();
-        assert_eq!(speed, None);
     }
 
     #[tokio::test]
@@ -467,9 +431,9 @@ mod tests {
         let url = "http://example.com/file.bin".to_string();
 
         let config = Arc::new(crate::config::DownloadConfig::default());
-        let global_stats = TaskStats::from_config(config.clone());
+        let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
         let (mut pool, _handles, _result_receiver) =
-            DownloadWorkerPool::new(client.clone(), 2, writer, allocator, url, config, global_stats);
+            DownloadWorkerPool::new(client.clone(), 2, writer, allocator, url, config, broadcast_tx);
 
         // 关闭 workers
         pool.shutdown().await;
