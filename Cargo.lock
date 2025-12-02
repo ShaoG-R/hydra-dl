@@ -1087,9 +1087,9 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "ranged-mmap"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9849dd47d5a1fdc41cd656efab82e9d459295751067dbec43268fb173c4e3f92"
+checksum = "ad6043b86d710aa4fd03601b2139ca11a29c21fce8f0d38e2bf92b7d973958d7"
 dependencies = [
  "memmap2",
 ]

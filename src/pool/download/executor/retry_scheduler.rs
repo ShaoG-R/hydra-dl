@@ -137,19 +137,13 @@ mod tests {
         }
     }
 
-    fn create_mock_range(start: u64, end: u64) -> ranged_mmap::AllocatedRange {
+    /// 创建一个从 0 开始的模拟范围，size 应为 4K 对齐
+    fn create_mock_range(size: u64) -> ranged_mmap::AllocatedRange {
         use ranged_mmap::allocator::concurrent::Allocator;
         use std::num::NonZeroU64;
         
-        let allocator = Allocator::new(NonZeroU64::new(end).unwrap());
-        // 分配整个范围，然后拆分到需要的起始位置
-        if start == 0 {
-            allocator.allocate(NonZeroU64::new(end - start).unwrap()).unwrap()
-        } else {
-            let full = allocator.allocate(NonZeroU64::new(end).unwrap()).unwrap();
-            let (_, remaining) = full.split_at(NonZeroU64::new(start).unwrap()).unwrap();
-            remaining
-        }
+        let allocator = Allocator::new(NonZeroU64::new(size).unwrap());
+        allocator.allocate(NonZeroU64::new(size).unwrap()).unwrap()
     }
 
     #[test]
@@ -162,7 +156,7 @@ mod tests {
     #[test]
     fn test_schedule_and_get_due_task() {
         let mut scheduler = RetryScheduler::new(create_test_config());
-        let range = create_mock_range(0, 1024);
+        let range = create_mock_range(4096);
 
         // 调度重试，retry_count=0 时 wait_count=1
         scheduler.schedule(0, range, 0);
@@ -183,8 +177,8 @@ mod tests {
     fn test_advance_all() {
         let mut scheduler = RetryScheduler::new(create_test_config());
         
-        let range1 = create_mock_range(0, 512);
-        let range2 = create_mock_range(0, 512);
+        let range1 = create_mock_range(4096);
+        let range2 = create_mock_range(4096);
         
         scheduler.schedule(0, range1, 0); // target_task_id = 1
         scheduler.schedule(0, range2, 1); // target_task_id = 2

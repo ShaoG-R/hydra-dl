@@ -21,9 +21,8 @@ use crate::utils::{
 };
 use log::{debug, error, info, warn};
 use net_bytes::{FormattedValue, SizeStandard};
-use ranged_mmap::AllocatedRange;
+use ranged_mmap::{AllocatedRange, SplitDownResult};
 use smr_swap::SmrSwap;
-use std::num::NonZeroU64;
 use tokio::sync::mpsc;
 
 /// Worker 执行结果
@@ -288,12 +287,15 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     worker_id, start, end, bytes_downloaded
                 );
 
-                let remaining_range = self.handle_partial_download(
+                let remaining_range = match self.handle_partial_download(
                     worker_id,
                     range,
                     data,
                     bytes_downloaded,
-                );
+                ) {
+                    Some(r) => r,
+                    None => return TaskResult::Success, // remaining_range不存在，返回成功
+                };
 
                 let new_retry_count = retry_count + 1;
                 self.check_retry_or_fail(
@@ -328,27 +330,26 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         range: AllocatedRange,
         data: bytes::Bytes,
         bytes_downloaded: u64,
-    ) -> AllocatedRange {
-        if bytes_downloaded == 0 {
-            return range;
+    ) -> Option<AllocatedRange> {
+        let (low, remaining) = match range.split_at_align_down(bytes_downloaded) {
+            SplitDownResult::Split { low, high } => (Some(low), Some(high)),
+            SplitDownResult::High(high) => (None, Some(high)),
+            SplitDownResult::OutOfBounds(low) => {
+                error!("split_at_align_down 拆分失败");
+                (Some(low), None)
+            },
+        };
+
+        if let Some(low) = low {
+            let low_len = low.len() as usize;
+            if let Err(e) = self.writer.write_range(low, &data[0..low_len]) {
+                error!("Worker #{} 写入部分数据失败: {:?}", worker_id, e);
+                return Some(range);
+            }
+            debug!("Worker #{} 成功写入 {} bytes", worker_id, bytes_downloaded);
         }
 
-        if let Some(nz_bytes) = NonZeroU64::new(bytes_downloaded) {
-            match range.split_at(nz_bytes) {
-                Ok((downloaded_range, remaining_range)) => {
-                    if let Err(e) = self.writer.write_range(downloaded_range, data.as_ref()) {
-                        error!("Worker #{} 写入部分数据失败: {:?}", worker_id, e);
-                        return range;
-                    }
-                    debug!("Worker #{} 成功写入 {} bytes", worker_id, bytes_downloaded);
-                    return remaining_range;
-                }
-                Err(e) => {
-                    error!("Worker #{} 无法拆分 range: {}", worker_id, e);
-                }
-            }
-        }
-        range
+        remaining
     }
 
     /// 检查是否需要重试或标记为永久失败
