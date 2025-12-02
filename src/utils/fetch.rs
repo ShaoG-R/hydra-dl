@@ -9,7 +9,6 @@ use thiserror::Error;
 use crate::constants::KB;
 use crate::task::FileTask;
 use crate::utils::io_traits::{HttpClient, HttpResponse, IoError};
-use crate::utils::stats::WorkerStats;
 
 /// Fetch 操作错误类型
 #[derive(Error, Debug)]
@@ -395,35 +394,46 @@ where
     Ok(())
 }
 
+/// Chunk 记录器 trait
+///
+/// 用于解耦 RangeFetcher 和具体的统计实现
+pub trait ChunkRecorder {
+    /// 记录下载的 chunk
+    ///
+    /// # Arguments
+    /// * `bytes` - 本次下载的字节数
+    fn record_chunk(&mut self, bytes: u64);
+}
+
 /// Range 下载器
 ///
 /// 封装 Range 下载的参数和逻辑，提供可取消和不可取消两种下载方式
-pub struct RangeFetcher<'a, C: HttpClient> {
+pub struct RangeFetcher<'a, C: HttpClient, R: ChunkRecorder> {
     client: &'a C,
     url: &'a str,
     range: FetchRange,
-    stats: &'a mut WorkerStats,
+    recorder: &'a mut R,
 }
 
-impl<'a, C: HttpClient> RangeFetcher<'a, C> {
+impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
     /// 创建新的 Range 下载器
     ///
     /// # Arguments
     /// * `client` - HTTP 客户端
     /// * `url` - 下载 URL
     /// * `range` - 已分配的 Range，定义要下载的字节范围
-    /// * `stats` - 共享的下载统计，每个 chunk 到达时实时更新
+    /// * `recorder` - Chunk 记录器，用于记录下载进度
     pub(crate) fn new(
         client: &'a C,
         url: &'a str,
         range: FetchRange,
-        stats: &'a mut WorkerStats,
+        recorder: &'a mut R,
     ) -> Self {
         Self {
             client,
             url,
             range,
-            stats,
+            recorder,
         }
     }
 
@@ -507,7 +517,7 @@ impl<'a, C: HttpClient> RangeFetcher<'a, C> {
                             let chunk_size = chunk.len() as u64;
 
                             // 实时记录 chunk
-                            self.stats.record_chunk(chunk_size);
+                            self.recorder.record_chunk(chunk_size);
 
                             chunks.push(chunk);
                             downloaded_bytes += chunk_size;
@@ -828,6 +838,26 @@ mod tests {
     use reqwest::header::HeaderMap;
     use std::path::PathBuf;
 
+    /// 测试用 Mock ChunkRecorder
+    #[derive(Default)]
+    struct MockChunkRecorder {
+        total_bytes: u64,
+        chunk_count: usize,
+    }
+
+    impl MockChunkRecorder {
+        fn total_bytes(&self) -> u64 {
+            self.total_bytes
+        }
+    }
+
+    impl ChunkRecorder for MockChunkRecorder {
+        fn record_chunk(&mut self, bytes: u64) {
+            self.total_bytes += bytes;
+            self.chunk_count += 1;
+        }
+    }
+
     #[tokio::test]
     async fn test_fetch_file_success() {
         // 准备测试数据
@@ -907,7 +937,7 @@ mod tests {
         let full_data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
 
         let client = MockHttpClient::new();
-        let mut stats = WorkerStats::default();
+        let mut recorder = MockChunkRecorder::default();
 
         // 创建临时文件和 allocator
         let dir = tempdir().unwrap();
@@ -938,7 +968,7 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
             .fetch_with_cancel(&mut cancel_rx)
             .await;
 
@@ -955,9 +985,8 @@ mod tests {
         }
 
         // 验证统计信息
-        let (total_bytes, _, _) = stats.get_summary();
         assert_eq!(
-            total_bytes,
+            recorder.total_bytes(),
             expected_data.len() as u64,
             "统计的字节数应该匹配"
         );
@@ -971,7 +1000,7 @@ mod tests {
         // 测试 HTTP 错误
         let test_url = "http://example.com/file.bin";
         let client = MockHttpClient::new();
-        let mut stats = WorkerStats::default();
+        let mut recorder = MockChunkRecorder::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -993,7 +1022,7 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
             .fetch_with_cancel(&mut cancel_rx)
             .await;
 
@@ -1081,7 +1110,7 @@ mod tests {
         let end = large_data.len() as u64;
 
         let client = MockHttpClient::new();
-        let mut stats = WorkerStats::default();
+        let mut recorder = MockChunkRecorder::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -1110,7 +1139,7 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
             .fetch_with_cancel(&mut cancel_rx)
             .await;
 
@@ -1128,8 +1157,7 @@ mod tests {
         }
 
         // 验证统计信息（应该记录了多个 chunk）
-        let (total_bytes, _, _) = stats.get_summary();
-        assert_eq!(total_bytes, large_data.len() as u64, "统计的字节数应该匹配");
+        assert_eq!(recorder.total_bytes(), large_data.len() as u64, "统计的字节数应该匹配");
     }
 
     #[tokio::test]
@@ -1142,7 +1170,7 @@ mod tests {
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
 
         let client = MockHttpClient::new();
-        let mut stats = WorkerStats::default();
+        let mut recorder = MockChunkRecorder::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -1178,7 +1206,7 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
             .fetch_with_cancel(&mut cancel_rx)
             .await;
 
@@ -1218,7 +1246,7 @@ mod tests {
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
         let client = MockHttpClient::new();
-        let mut stats = WorkerStats::default();
+        let mut recorder = MockChunkRecorder::default();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -1249,7 +1277,7 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut stats)
+        let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
             .fetch_with_cancel(&mut cancel_rx)
             .await;
 

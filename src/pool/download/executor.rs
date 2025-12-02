@@ -12,9 +12,10 @@ mod retry_scheduler;
 pub(super) mod task_allocator;
 
 use task_allocator::{AllocationResult, TaskAllocator};
+use super::stats_updater::StatsUpdaterHandle;
 use crate::utils::{
     chunk_strategy::ChunkStrategy,
-    fetch::{FetchRangeResult, RangeFetcher},
+    fetch::{ChunkRecorder, FetchRangeResult, RangeFetcher},
     io_traits::HttpClient,
     stats::WorkerStats,
     writer::MmapWriter,
@@ -22,9 +23,34 @@ use crate::utils::{
 use log::{debug, error, info, warn};
 use net_bytes::{FormattedValue, SizeStandard};
 use ranged_mmap::{AllocatedRange, SplitDownResult};
-use smr_swap::SmrSwap;
 use tokio::sync::mpsc;
 
+
+/// 下载 Chunk 记录器
+///
+/// 实现 `ChunkRecorder` trait，封装 `WorkerStats` 和 `StatsUpdaterHandle`
+pub(crate) struct DownloadChunkRecorder<'a> {
+    stats: &'a mut WorkerStats,
+    stats_handle: &'a StatsUpdaterHandle,
+}
+
+impl<'a> DownloadChunkRecorder<'a> {
+    /// 创建新的下载 Chunk 记录器
+    pub(crate) fn new(stats: &'a mut WorkerStats, stats_handle: &'a StatsUpdaterHandle) -> Self {
+        Self { stats, stats_handle }
+    }
+}
+
+impl ChunkRecorder for DownloadChunkRecorder<'_> {
+    fn record_chunk(&mut self, bytes: u64) {
+        let sampled = self.stats.record_chunk(bytes);
+        
+        // 如果采样成功，发送统计数据到辅助协程
+        if sampled {
+            self.stats_handle.send_chunk_sampled(self.stats.clone());
+        }
+    }
+}
 /// Worker 执行结果
 ///
 /// 每个 worker 在完成所有任务后通过 oneshot 通道发送此结果
@@ -133,7 +159,8 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         mut self,
         worker_id: u64,
         mut context: DownloadWorkerContext,
-        mut stats: SmrSwap<WorkerStats>,
+        mut stats: WorkerStats,
+        stats_handle: StatsUpdaterHandle,
         result_tx: tokio::sync::oneshot::Sender<ExecutorResult>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         mut cancel_rx: mpsc::Receiver<()>,
@@ -150,7 +177,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 }
                 _ = std::future::ready(()) => {
                     // 通过 TaskAllocator 统一获取下一个任务
-                    let chunk_size = stats.load().get_current_chunk_size();
+                    let chunk_size = stats.get_current_chunk_size();
                     
                     match context.task_allocator.next_task(chunk_size) {
                         AllocationResult::Task(task) => {
@@ -168,6 +195,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                                 retry_count,
                                 &mut context,
                                 &mut stats,
+                                &stats_handle,
                                 &mut cancel_rx,
                             ).await {
                                 TaskResult::Success => {
@@ -235,7 +263,8 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         range: AllocatedRange,
         retry_count: usize,
         context: &mut DownloadWorkerContext,
-        stats: &mut SmrSwap<WorkerStats>,
+        stats: &mut WorkerStats,
+        stats_handle: &StatsUpdaterHandle,
         cancel_rx: &mut mpsc::Receiver<()>,
     ) -> TaskResult {
         let (start, end) = range.as_range_tuple();
@@ -244,20 +273,18 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             worker_id, context.url, start, end, retry_count
         );
 
-        stats.update(|s| {
-            let mut s = s.clone();
-            s.set_active(true);
-            s.clear_samples();
-            s
-        });
+        // 任务开始，发送信号到辅助协程
+        stats.set_active(true);
+        stats.clear_samples();
+        stats_handle.send_task_started();
 
-        let mut stats_new = stats.get().clone();
+        // 创建 Chunk 记录器
+        let mut recorder = DownloadChunkRecorder::new(stats, stats_handle);
+        let fetch_result = self.fetch_range(&context.url, &range, &mut recorder, cancel_rx).await;
 
-        let fetch_result = self.fetch_range(&context.url, &range, &mut stats_new, cancel_rx).await;
-
-        stats_new.set_active(false);
-        
-        stats.store(stats_new.clone());
+        // 任务结束，发送信号到辅助协程
+        stats.set_active(false);
+        stats_handle.send_task_ended();
 
         match fetch_result {
             Ok(FetchRangeResult::Complete(data)) => {
@@ -269,14 +296,10 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 }
 
                 // 记录 range 完成
-                stats.update(|stats| {
-                    let mut stats = stats.clone();
-                    stats.record_range_complete();
-                    stats
-                });
+                stats.record_range_complete();
 
                 // 根据当前速度更新分块大小
-                self.update_chunk_size(context, stats);
+                self.update_chunk_size(context, stats, stats_handle);
 
                 TaskResult::Success
             }
@@ -386,7 +409,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         &self,
         url: &str,
         range: &AllocatedRange,
-        stats: &mut WorkerStats,
+        recorder: &mut DownloadChunkRecorder<'_>,
         cancel_rx: &mut mpsc::Receiver<()>,
     ) -> std::result::Result<FetchRangeResult, crate::utils::fetch::FetchError> {
         use crate::utils::fetch::FetchRange;
@@ -394,33 +417,34 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         let fetch_range =
             FetchRange::from_allocated_range(range).expect("AllocatedRange 应该总是有效的");
         
-        RangeFetcher::new(&self.client, url, fetch_range, stats)
+        RangeFetcher::new(&self.client, url, fetch_range, recorder)
             .fetch_with_cancel(cancel_rx)
             .await
     }
 
 
     /// 根据当前速度更新分块大小
-    fn update_chunk_size(&self, context: &DownloadWorkerContext, stats: &mut SmrSwap<WorkerStats>) {
-        let stats_guard = stats.load();
-        let instant_speed = stats_guard.get_instant_speed();
-        let window_avg_speed = stats_guard.get_window_avg_speed();
+    fn update_chunk_size(
+        &self,
+        context: &DownloadWorkerContext,
+        stats: &mut WorkerStats,
+        stats_handle: &StatsUpdaterHandle,
+    ) {
+        let instant_speed = stats.get_instant_speed();
+        let window_avg_speed = stats.get_window_avg_speed();
 
         if let (Some(instant_speed), Some(window_avg_speed)) = (instant_speed, window_avg_speed) {
-            let current_chunk_size = stats_guard.get_current_chunk_size();
+            let current_chunk_size = stats.get_current_chunk_size();
             let new_chunk_size = context.chunk_strategy.calculate_chunk_size(
                 current_chunk_size,
                 instant_speed,
                 window_avg_speed,
             );
 
-            drop(stats_guard);
-
-            stats.update(|stats| {
-                let mut stats = stats.clone();
-                stats.set_current_chunk_size(new_chunk_size);
-                stats
-            });
+            stats.set_current_chunk_size(new_chunk_size);
+            
+            // 发送更新后的 stats 到辅助协程
+            stats_handle.send_chunk_sampled(stats.clone());
 
             debug!(
                 "Updated chunk size: {} -> {} (speed: {}, avg: {})",

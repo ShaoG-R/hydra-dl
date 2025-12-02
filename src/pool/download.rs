@@ -21,6 +21,9 @@
 //! 通用协程池 (common.rs) 仅负责协程生命周期管理。
 
 mod executor;
+mod stats_updater;
+
+use stats_updater::StatsUpdater;
 
 use super::common::{WorkerFactory, WorkerPool};
 pub(crate) use executor::{DownloadTaskExecutor, DownloadWorkerContext, ExecutorResult};
@@ -108,13 +111,19 @@ where
             cancel_rx,
         } = input;
 
+        // 获取 WorkerStats 的副本用于主下载循环
+        let worker_stats = stats.get().clone();
+
+        // --- 协程 1: Stats Updater 辅助协程 ---
+        let (stats_updater, stats_handle) = StatsUpdater::new(worker_id, stats, None);
+        let stats_updater_handle = tokio::spawn(stats_updater.run());
+
         // --- 协程 0: 主下载循环（worker 自主从 allocator 分配任务） ---
         let main_handle = tokio::spawn(
-            executor.run_loop(worker_id, context, stats, result_tx, shutdown_rx, cancel_rx),
+            executor.run_loop(worker_id, context, worker_stats, stats_handle, result_tx, shutdown_rx, cancel_rx),
         );
 
-        // --- 协程 1+: 辅助协程 (暂未实现，预留位置) ---
-        vec![main_handle]
+        vec![main_handle, stats_updater_handle]
     }
 }
 
