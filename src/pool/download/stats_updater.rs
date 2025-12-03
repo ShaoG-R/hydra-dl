@@ -22,6 +22,7 @@ use crate::utils::chunk_strategy::ChunkStrategy;
 use crate::utils::stats::{SpeedStats, WorkerStatsActive};
 use log::debug;
 use net_bytes::DownloadSpeed;
+use crate::pool::common::WorkerId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -168,7 +169,7 @@ pub enum ExecutorBroadcast {
 /// 带标签的广播消息（外部广播用）
 ///
 /// 包含 worker_id 和广播消息，用于外部订阅者区分不同 Worker
-pub type TaggedBroadcast = (u64, ExecutorBroadcast);
+pub type TaggedBroadcast = (WorkerId, ExecutorBroadcast);
 
 /// Worker 本地广播发送器
 ///
@@ -178,7 +179,7 @@ pub type TaggedBroadcast = (u64, ExecutorBroadcast);
 #[derive(Clone)]
 pub struct WorkerBroadcaster {
     /// Worker ID
-    worker_id: u64,
+    worker_id: WorkerId,
     /// 外部广播发送器（Executor 级别）
     executor_tx: broadcast::Sender<TaggedBroadcast>,
     /// 本地广播发送器（Worker 内部，不带 worker_id）
@@ -193,7 +194,7 @@ impl WorkerBroadcaster {
     /// - `worker_id`: Worker ID
     /// - `executor_tx`: 外部广播发送器
     /// - `local_capacity`: 本地广播通道容量
-    pub fn new(worker_id: u64, executor_tx: broadcast::Sender<TaggedBroadcast>, local_capacity: usize) -> Self {
+    pub fn new(worker_id: WorkerId, executor_tx: broadcast::Sender<TaggedBroadcast>, local_capacity: usize) -> Self {
         let (local_tx, _) = broadcast::channel(local_capacity);
         Self {
             worker_id,
@@ -309,7 +310,7 @@ impl StatsUpdaterHandle {
 /// 使用 `Arc<AtomicU64>` 维护 `current_chunk_size`，Executor 通过原子操作读取。
 pub(crate) struct StatsUpdater {
     /// Worker ID（用于日志）
-    worker_id: u64,
+    worker_id: WorkerId,
     /// Executor 统计数据（内部维护）
     executor_stats: ExecutorStats,
     /// 消息接收通道
@@ -337,7 +338,7 @@ impl StatsUpdater {
     ///
     /// 返回 `(StatsUpdater, StatsUpdaterHandle)`
     pub(crate) fn new(
-        worker_id: u64,
+        worker_id: WorkerId,
         broadcaster: WorkerBroadcaster,
         chunk_strategy: Box<dyn ChunkStrategy + Send>,
         initial_chunk_size: u64,
@@ -367,7 +368,7 @@ impl StatsUpdater {
     ///
     /// 持续接收消息并更新统计数据，直到通道关闭
     pub(crate) async fn run(mut self) {
-        debug!("Worker #{} Stats Updater 启动", self.worker_id);
+        debug!("Worker {} Stats Updater 启动", self.worker_id);
 
         while let Some(msg) = self.rx.recv().await {
             match msg {
@@ -389,12 +390,12 @@ impl StatsUpdater {
             }
         }
 
-        debug!("Worker #{} Stats Updater 退出", self.worker_id);
+        debug!("Worker {} Stats Updater 退出", self.worker_id);
     }
 
     /// 处理任务开始
     fn handle_task_started(&mut self) {
-        debug!("Worker #{} 任务开始", self.worker_id);
+        debug!("Worker {} 任务开始", self.worker_id);
         
         // 更新 ExecutorStats：标记开始运行
         self.executor_stats.start_running();
@@ -423,7 +424,7 @@ impl StatsUpdater {
         if new_chunk_size != current_chunk_size {
             self.chunk_size.store(new_chunk_size, Ordering::Relaxed);
             debug!(
-                "Worker #{} chunk_size 更新: {} -> {}",
+                "Worker {} chunk_size 更新: {} -> {}",
                 self.worker_id, current_chunk_size, new_chunk_size
             );
         }
@@ -443,7 +444,7 @@ impl StatsUpdater {
 
     /// 处理任务结束
     fn handle_task_ended(&mut self) {
-        debug!("Worker #{} 任务结束", self.worker_id);
+        debug!("Worker {} 任务结束", self.worker_id);
         
         // 更新 ExecutorStats：标记停止运行
         self.executor_stats.stop_running();
@@ -461,7 +462,7 @@ impl StatsUpdater {
     /// 处理 Executor 关闭
     #[inline]
     fn handle_executor_shutdown(&self) {
-        debug!("Worker #{} Executor 关闭", self.worker_id);
+        debug!("Worker {} Executor 关闭", self.worker_id);
         self.broadcaster.send_shutdown();
     }
 }

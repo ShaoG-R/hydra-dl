@@ -114,9 +114,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         });
 
         // 使用实际的 worker_id（从 handle 获取）填充 worker_handles
+        // 使用 global_id 作为 HashMap 的 key
         let initial_worker_handles: FxHashMap<u64, _> = initial_handles
             .into_iter()
-            .map(|handle| (handle.worker_id(), handle))
+            .map(|handle| (handle.global_id(), handle))
             .collect();
         swap.store(initial_worker_handles);
 
@@ -329,8 +330,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         self.worker_handles.update(|handles| {
             let mut handles = handles.clone();
             for handle in &new_handles {
-                let worker_id = handle.worker_id();
-                handles.insert(worker_id, handle.clone());
+                // 使用 global_id 作为 HashMap 的 key
+                handles.insert(handle.global_id(), handle.clone());
             }
             handles
         });

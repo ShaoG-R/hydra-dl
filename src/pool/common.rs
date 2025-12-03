@@ -25,7 +25,61 @@
 
 use deferred_map::DeferredMap;
 use log::{debug, error, info};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::task::JoinHandle;
+
+/// 全局 Worker ID 计数器
+static GLOBAL_WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Worker 标识符
+///
+/// 封装两种 ID：
+/// - `slot_id`: DeferredMap 内部分配的 ID，用于槽位管理
+/// - `global_id`: 全局唯一 ID，单调递增，用于日志和外部标识
+///
+/// # 设计说明
+///
+/// - `slot_id` 可能被复用（当 Worker 被移除后，其槽位可能分配给新 Worker）
+/// - `global_id` 永不复用，保证全局唯一性
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkerId {
+    /// DeferredMap 槽位 ID（用于内部管理）
+    slot_id: u64,
+    /// 全局唯一 ID（单调递增，用于日志和外部标识）
+    global_id: u64,
+}
+
+impl WorkerId {
+    /// 创建新的 WorkerId
+    ///
+    /// # Arguments
+    ///
+    /// - `slot_id`: DeferredMap 分配的槽位 ID
+    ///
+    /// 自动分配下一个全局唯一 ID
+    pub fn new(slot_id: u64) -> Self {
+        let global_id = GLOBAL_WORKER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self { slot_id, global_id }
+    }
+
+    /// 获取 DeferredMap 槽位 ID
+    #[inline]
+    pub fn slot_id(&self) -> u64 {
+        self.slot_id
+    }
+
+    /// 获取全局唯一 ID
+    #[inline]
+    pub fn global_id(&self) -> u64 {
+        self.global_id
+    }
+}
+
+impl std::fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.global_id)
+    }
+}
 
 /// Worker 工厂 trait
 ///
@@ -54,7 +108,7 @@ pub trait WorkerFactory: Send + Sync + 'static {
     /// 返回该 Worker 的所有协程句柄。Pool 会等待所有协程退出才认为该 Worker 已关闭。
     fn spawn_worker(
         &self,
-        worker_id: u64,
+        worker_id: WorkerId,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         input: Self::Input,
     ) -> Vec<JoinHandle<()>>;
@@ -97,7 +151,7 @@ impl<F: WorkerFactory> WorkerPool<F> {
     /// 启动单个 worker（内部辅助方法）
     fn spawn_worker_internal(
         &self,
-        worker_id: u64,
+        worker_id: WorkerId,
         input: F::Input,
     ) -> WorkerSlot {
         // 创建关闭通道
@@ -122,7 +176,7 @@ impl<F: WorkerFactory> WorkerPool<F> {
     /// # Returns
     ///
     /// 返回 (WorkerPool, 所有 worker 的 ID 列表)
-    pub fn new(factory: F, inputs: Vec<F::Input>) -> (Self, Vec<u64>) {
+    pub fn new(factory: F, inputs: Vec<F::Input>) -> (Self, Vec<WorkerId>) {
         let worker_count = inputs.len();
         let slots = DeferredMap::with_capacity(worker_count);
 
@@ -131,7 +185,8 @@ impl<F: WorkerFactory> WorkerPool<F> {
         let mut worker_ids = Vec::with_capacity(worker_count);
         for input in inputs {
             let deferred_handle = pool.slots.allocate_handle();
-            let worker_id = deferred_handle.key();
+            let slot_id = deferred_handle.key();
+            let worker_id = WorkerId::new(slot_id);
 
             let slot = pool.spawn_worker_internal(worker_id, input);
             pool.slots.insert(deferred_handle, slot);
@@ -151,17 +206,18 @@ impl<F: WorkerFactory> WorkerPool<F> {
     /// # Returns
     ///
     /// 返回新添加的 worker 的 ID 列表
-    pub fn add_workers(&mut self, inputs: Vec<F::Input>) -> Vec<u64> {
+    pub fn add_workers(&mut self, inputs: Vec<F::Input>) -> Vec<WorkerId> {
         let mut worker_ids = Vec::with_capacity(inputs.len());
         for input in inputs {
             let deferred_handle = self.slots.allocate_handle();
-            let worker_id = deferred_handle.key();
+            let slot_id = deferred_handle.key();
+            let worker_id = WorkerId::new(slot_id);
 
             let slot = self.spawn_worker_internal(worker_id, input);
             self.slots.insert(deferred_handle, slot);
 
             worker_ids.push(worker_id);
-            debug!("新 worker 添加: #{}", worker_id);
+            debug!("新 worker 添加: {}", worker_id);
         }
         worker_ids
     }
@@ -178,28 +234,28 @@ impl<F: WorkerFactory> WorkerPool<F> {
     pub async fn shutdown(&mut self) {
         info!("发送关闭信号到所有活跃 workers");
 
-        let keys: Vec<u64> = self.slots.iter().map(|(key, _)| key).collect();
-        let closed_count = keys.len();
+        let slot_ids: Vec<u64> = self.slots.iter().map(|(key, _)| key).collect();
+        let closed_count = slot_ids.len();
 
         let mut all_join_handles = Vec::with_capacity(closed_count);
 
-        for key in keys {
-            if let Some(slot) = self.slots.remove(key) {
+        for slot_id in slot_ids {
+            if let Some(slot) = self.slots.remove(slot_id) {
                 let _ = slot.shutdown_sender.send(());
-                debug!("Worker #{} 关闭信号已发送", key);
-                all_join_handles.push((key, slot.join_handles));
+                debug!("Worker (slot={}) 关闭信号已发送", slot_id);
+                all_join_handles.push((slot_id, slot.join_handles));
             }
         }
 
         info!("等待 {} 个 workers 退出...", closed_count);
 
-        for (key, handles) in all_join_handles {
+        for (slot_id, handles) in all_join_handles {
             for handle in handles {
                 if let Err(e) = handle.await {
-                    error!("Worker #{} 协程退出错误: {:?}", key, e);
+                    error!("Worker (slot={}) 协程退出错误: {:?}", slot_id, e);
                 }
             }
-            debug!("Worker #{} 已退出", key);
+            debug!("Worker (slot={}) 已退出", slot_id);
         }
 
         info!("所有 workers 已完全退出");
@@ -221,7 +277,7 @@ mod tests {
 
         fn spawn_worker(
             &self,
-            worker_id: u64,
+            worker_id: WorkerId,
             mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
             counter: Self::Input,
         ) -> Vec<JoinHandle<()>> {
@@ -229,7 +285,7 @@ mod tests {
                 loop {
                     tokio::select! {
                         _ = &mut shutdown_rx => {
-                            debug!("Worker #{} 收到关闭信号", worker_id);
+                            debug!("Worker {} 收到关闭信号", worker_id);
                             break;
                         }
                         _ = sleep(Duration::from_millis(10)) => {

@@ -28,7 +28,7 @@ pub use stats_updater::{ExecutorBroadcast, ExecutorCurrentStats, ExecutorStats, 
 use local_health_checker::{LocalHealthChecker, LocalHealthCheckerConfig};
 use stats_updater::StatsUpdater;
 
-use super::common::{WorkerFactory, WorkerPool};
+use super::common::{WorkerFactory, WorkerId, WorkerPool};
 pub(crate) use executor::{DownloadTaskExecutor, DownloadWorkerContext, ExecutorInput, ExecutorResult};
 use executor::task_allocator::TaskAllocator;
 use crate::utils::{
@@ -111,7 +111,7 @@ where
     /// 启动 Worker 协程组
     fn spawn_worker(
         &self,
-        worker_id: u64,
+        worker_id: WorkerId,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         input: Self::Input,
     ) -> Vec<JoinHandle<()>> {
@@ -189,24 +189,17 @@ where
 #[derive(Clone)]
 pub(crate) struct DownloadWorkerHandle {
     /// Worker ID
-    worker_id: u64,
+    worker_id: WorkerId,
     /// 取消信号发送器（用于健康检查触发的重试）
     cancel_tx: CancelSender,
 }
 
 impl DownloadWorkerHandle {
-    /// 创建新的下载 worker 句柄
-    pub(crate) fn new(
-        worker_id: u64,
-        cancel_tx: CancelSender,
-    ) -> Self {
-        Self { worker_id, cancel_tx }
-    }
 
-    /// 获取 worker ID
+    /// 获取全局唯一 worker ID
     #[inline]
-    pub fn worker_id(&self) -> u64 {
-        self.worker_id
+    pub fn global_id(&self) -> u64 {
+        self.worker_id.global_id()
     }
 
     // 获取用于取消的句柄
@@ -277,30 +270,32 @@ where
             writer,
         );
 
-        // 为每个 worker 创建输入参数和句柄
+        // 为每个 worker 创建输入参数
         let mut inputs = Vec::with_capacity(initial_worker_count as usize);
-        let mut handles = Vec::with_capacity(initial_worker_count as usize);
+        let mut cancel_txs = Vec::with_capacity(initial_worker_count as usize);
         let mut result_rxs = Vec::with_capacity(initial_worker_count as usize);
 
         for _ in 0..initial_worker_count {
-            let (input, handle, result_rx) = Self::create_worker_input_and_handle(
+            let (input, cancel_tx, result_rx) = Self::create_worker_input(
                 &config,
                 allocator.clone(),
                 url.clone(),
                 broadcast_tx.clone(),
             );
             inputs.push(input);
-            handles.push(handle);
+            cancel_txs.push(cancel_tx);
             result_rxs.push(result_rx);
         }
 
         // 创建通用协程池
         let (pool, worker_ids) = WorkerPool::new(factory, inputs);
 
-        // 更新句柄的 worker_id
-        for (handle, worker_id) in handles.iter_mut().zip(worker_ids.iter()) {
-            handle.worker_id = *worker_id;
-        }
+        // 使用实际的 worker_id 创建句柄
+        let handles: Vec<_> = worker_ids
+            .into_iter()
+            .zip(cancel_txs)
+            .map(|(worker_id, cancel_tx)| DownloadWorkerHandle { worker_id, cancel_tx })
+            .collect();
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
@@ -317,13 +312,15 @@ where
         )
     }
 
-    /// 创建单个 worker 的输入参数和句柄
-    fn create_worker_input_and_handle(
+    /// 创建单个 worker 的输入参数
+    ///
+    /// 返回 (input, cancel_tx, result_rx)，其中 cancel_tx 用于稍后创建 DownloadWorkerHandle
+    fn create_worker_input(
         config: &crate::config::DownloadConfig,
         allocator: Arc<ConcurrentAllocator>,
         url: String,
         broadcast_tx: broadcast::Sender<TaggedBroadcast>,
-    ) -> (DownloadWorkerInput, DownloadWorkerHandle, tokio::sync::oneshot::Receiver<ExecutorResult>) {
+    ) -> (DownloadWorkerInput, CancelSender, tokio::sync::oneshot::Receiver<ExecutorResult>) {
         // 创建统计数据
         let stats = WorkerStatsRecording::from_config(config.speed());
 
@@ -362,12 +359,7 @@ where
             local_health_config,
         };
 
-        let handle = DownloadWorkerHandle::new(
-            0, // worker_id 稍后由 WorkerPool::new 返回的 ID 更新
-            cancel_tx,
-        );
-
-        (input, handle, result_rx)
+        (input, cancel_tx, result_rx)
     }
 
     /// 动态添加新的 worker
@@ -381,27 +373,29 @@ where
     /// 成功时返回新添加的所有 worker 的句柄和结果接收器
     pub(crate) fn add_workers(&mut self, count: u64) -> (Vec<DownloadWorkerHandle>, Vec<tokio::sync::oneshot::Receiver<ExecutorResult>>) {
         let mut inputs = Vec::with_capacity(count as usize);
-        let mut handles = Vec::with_capacity(count as usize);
+        let mut cancel_txs = Vec::with_capacity(count as usize);
         let mut result_rxs = Vec::with_capacity(count as usize);
 
         for _ in 0..count {
-            let (input, handle, result_rx) = Self::create_worker_input_and_handle(
+            let (input, cancel_tx, result_rx) = Self::create_worker_input(
                 &self.config,
                 self.allocator.clone(),
                 self.url.clone(),
                 self.broadcast_tx.clone(),
             );
             inputs.push(input);
-            handles.push(handle);
+            cancel_txs.push(cancel_tx);
             result_rxs.push(result_rx);
         }
 
         let worker_ids = self.pool.add_workers(inputs);
 
-        // 更新句柄的 worker_id
-        for (handle, worker_id) in handles.iter_mut().zip(worker_ids.iter()) {
-            handle.worker_id = *worker_id;
-        }
+        // 使用实际的 worker_id 创建句柄
+        let handles: Vec<_> = worker_ids
+            .into_iter()
+            .zip(cancel_txs)
+            .map(|(worker_id, cancel_tx)| DownloadWorkerHandle { worker_id, cancel_tx })
+            .collect();
 
         (handles, result_rxs)
     }

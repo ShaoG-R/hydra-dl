@@ -15,6 +15,7 @@ mod file_writer;
 use task_allocator::{AllocationResult, TaskAllocator};
 pub(crate) use file_writer::FileWriter;
 use super::stats_updater::StatsUpdaterHandle;
+use crate::pool::common::WorkerId;
 use crate::utils::writer::MmapWriter;
 use crate::utils::{
     fetch::{ChunkRecorder, FetchRangeResult, RangeFetcher},
@@ -63,19 +64,19 @@ pub(crate) enum ExecutorResult {
     /// 所有任务成功完成
     Success {
         /// Worker ID
-        worker_id: u64,
+        worker_id: WorkerId,
     },
     /// 有任务永久失败（达到最大重试次数）
     DownloadFailed {
         /// Worker ID
-        worker_id: u64,
+        worker_id: WorkerId,
         /// 失败的 ranges 及错误信息
         failed_ranges: Vec<(AllocatedRange, String)>,
     },
     /// 写入失败（致命错误）
     WriteFailed {
         /// Worker ID
-        worker_id: u64,
+        worker_id: WorkerId,
         /// 失败的 range
         range: AllocatedRange,
         /// 错误信息
@@ -158,7 +159,7 @@ enum LoopAction {
 /// - `C`: HTTP 客户端类型
 pub(crate) struct DownloadTaskExecutor<C> {
     /// Worker ID
-    worker_id: u64,
+    worker_id: WorkerId,
     /// HTTP 客户端
     client: C,
     /// 文件写入器
@@ -169,7 +170,7 @@ pub(crate) struct DownloadTaskExecutor<C> {
 
 impl<C> DownloadTaskExecutor<C> {
     /// 创建新的下载任务执行器
-    pub(crate) fn new(worker_id: u64, client: C, writer: MmapWriter) -> Self {
+    pub(crate) fn new(worker_id: WorkerId, client: C, writer: MmapWriter) -> Self {
         Self {
             worker_id,
             client,
@@ -186,7 +187,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
     /// 任务分配和重试调度由 TaskAllocator 封装处理。
     pub(crate) async fn run_loop(mut self, input: ExecutorInput) {
         let worker_id = self.worker_id;
-        debug!("Worker #{} 主循环启动", worker_id);
+        debug!("Worker {} 主循环启动", worker_id);
 
         let ExecutorInput {
             mut context,
@@ -216,7 +217,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     let retry_count = task.retry_count();
 
                     debug!(
-                        "Worker #{} 执行任务 (range {}..{}, retry={})",
+                        "Worker {} 执行任务 (range {}..{}, retry={})",
                         worker_id, range.start(), range.end(), retry_count
                     );
 
@@ -250,7 +251,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 }
                 AllocationResult::WaitForRetry { delay, pending_count } => {
                     debug!(
-                        "Worker #{} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
+                        "Worker {} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
                         worker_id, delay, pending_count
                     );
 
@@ -272,7 +273,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             // 统一处理 action
             match action {
                 LoopAction::Shutdown => {
-                    info!("Worker #{} 收到关闭信号，退出", worker_id);
+                    info!("Worker {} 收到关闭信号，退出", worker_id);
                     file_writer.shutdown_and_wait().await;
                     break;
                 }
@@ -284,7 +285,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                         error: failure.error,
                     });
                     stats_handle.send_executor_shutdown();
-                    debug!("Worker #{} 收到写入失败信号，主循环退出", worker_id);
+                    debug!("Worker {} 收到写入失败信号，主循环退出", worker_id);
                     return;
                 }
                 LoopAction::TaskCompleted(task_result) => {
@@ -305,7 +306,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     context.task_allocator.advance_all_retries();
                 }
                 LoopAction::Done => {
-                    debug!("Worker #{} 没有更多任务，退出", worker_id);
+                    debug!("Worker {} 没有更多任务，退出", worker_id);
                     // 等待所有写入请求处理完后再退出
                     file_writer.drain_and_wait().await;
                     break;
@@ -326,7 +327,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             }
         };
         let _ = result_tx.send(result);
-        debug!("Worker #{} 主循环结束", worker_id);
+        debug!("Worker {} 主循环结束", worker_id);
     }
 
     /// 执行单个任务
@@ -341,7 +342,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
     ) -> TaskResult {
         let (start, end) = range.as_range_tuple();
         debug!(
-            "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
+            "Worker {} 执行 Range 任务: {} (range {}..{}, retry {})",
             self.worker_id, runtime.context.url, start, end, retry_count
         );
 
@@ -363,7 +364,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 if let Err(e) = runtime.file_writer.write(range.clone(), data).await {
                     // 发送失败说明 Writer 协程已关闭，直接返回 Success
                     // 实际的错误会通过 write_failure_rx 通知
-                    warn!("Worker #{} 发送写入请求失败: {:?}", self.worker_id, e);
+                    warn!("Worker {} 发送写入请求失败: {:?}", self.worker_id, e);
                     return TaskResult::Success;
                 }
 
@@ -372,7 +373,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             Ok(FetchRangeResult::Cancelled { data, bytes_downloaded }) => {
                 // 下载被取消（健康检查触发）
                 warn!(
-                    "Worker #{} Range {}..{} 被取消 (已下载 {} bytes)",
+                    "Worker {} Range {}..{} 被取消 (已下载 {} bytes)",
                     self.worker_id, start, end, bytes_downloaded
                 );
 
@@ -392,7 +393,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             Err(e) => {
                 // 下载失败
                 warn!(
-                    "Worker #{} Range {}..{} 下载失败 (重试 {}): {:?}",
+                    "Worker {} Range {}..{} 下载失败 (重试 {}): {:?}",
                     self.worker_id, start, end, retry_count, e
                 );
 
@@ -423,10 +424,10 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             let low_len = low.len() as usize;
             let partial_data = data.slice(0..low_len);
             if let Err(e) = file_writer.write(low.clone(), partial_data).await {
-                error!("Worker #{} 发送部分写入请求失败: {:?}", self.worker_id, e);
+                error!("Worker {} 发送部分写入请求失败: {:?}", self.worker_id, e);
                 return Some(range);
             }
-            debug!("Worker #{} 发送部分写入请求 {} bytes", self.worker_id, low.len());
+            debug!("Worker {} 发送部分写入请求 {} bytes", self.worker_id, low.len());
         }
 
         remaining
@@ -447,7 +448,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 max_retries
             );
             error!(
-                "Worker #{} Range {}..{} {}",
+                "Worker {} Range {}..{} {}",
                 self.worker_id,
                 range.start(),
                 range.end(),

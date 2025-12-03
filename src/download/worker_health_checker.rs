@@ -152,6 +152,7 @@ impl WorkerHealthCheckerActor {
         }
 
         let (worker_id, broadcast) = msg;
+        let worker_id = worker_id.global_id();
         match broadcast {
             ExecutorBroadcast::Stats(stats) => {
                 self.handle_stats_update(worker_id, stats);

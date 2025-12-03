@@ -17,6 +17,7 @@
 //! 4. 收到 Stats 更新时检查绝对速度阈值
 
 use super::stats_updater::{ExecutorBroadcast, ExecutorCurrentStats, WorkerBroadcaster};
+use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::{CancelHandle, CancelSender};
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
@@ -125,7 +126,7 @@ impl AnomalyTracker {
 /// 监听 WorkerBroadcaster 的本地广播，检测超时和绝对速度
 pub(crate) struct LocalHealthChecker {
     /// Worker ID（用于日志）
-    worker_id: u64,
+    worker_id: WorkerId,
     /// 配置
     config: LocalHealthCheckerConfig,
     /// 本地广播接收器
@@ -150,7 +151,7 @@ impl LocalHealthChecker {
     /// - `cancel_tx`: 取消信号发送器
     /// - `config`: 配置
     pub(crate) fn new(
-        worker_id: u64,
+        worker_id: WorkerId,
         broadcaster: &WorkerBroadcaster,
         cancel_tx: CancelSender,
         config: LocalHealthCheckerConfig,
@@ -171,7 +172,7 @@ impl LocalHealthChecker {
 
     /// 运行健康检查主循环
     pub(crate) async fn run(mut self) {
-        debug!("Worker #{} LocalHealthChecker 启动", self.worker_id);
+        debug!("Worker {} LocalHealthChecker 启动", self.worker_id);
 
         loop {
             // 根据任务状态决定是否使用超时
@@ -199,30 +200,30 @@ impl LocalHealthChecker {
                 }
                 // Lagged：落后太多消息
                 Ok(Err(broadcast::error::RecvError::Lagged(count))) => {
-                    debug!("Worker #{} LocalHealthChecker 落后 {} 条消息", self.worker_id, count);
+                    debug!("Worker {} LocalHealthChecker 落后 {} 条消息", self.worker_id, count);
                 }
                 // Closed：通道关闭
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    debug!("Worker #{} LocalHealthChecker 广播通道已关闭", self.worker_id);
+                    debug!("Worker {} LocalHealthChecker 广播通道已关闭", self.worker_id);
                     break;
                 }
             }
         }
 
-        debug!("Worker #{} LocalHealthChecker 退出", self.worker_id);
+        debug!("Worker {} LocalHealthChecker 退出", self.worker_id);
     }
 
     /// 处理超时
     fn handle_timeout(&mut self) {
         warn!(
-            "Worker #{} stats 更新超时 (>{:?}), 取消当前任务",
+            "Worker {} stats 更新超时 (>{:?}), 取消当前任务",
             self.worker_id, self.config.stale_timeout
         );
         
         // 使用之前获取的句柄发送取消信号
         if let Some(handle) = self.cancel_handle.take() {
             if handle.cancel() {
-                debug!("Worker #{} 取消信号已发送 (超时)", self.worker_id);
+                debug!("Worker {} 取消信号已发送 (超时)", self.worker_id);
             }
         }
         
@@ -241,7 +242,7 @@ impl LocalHealthChecker {
                 true
             }
             ExecutorBroadcast::Shutdown => {
-                debug!("Worker #{} LocalHealthChecker 收到关闭信号", self.worker_id);
+                debug!("Worker {} LocalHealthChecker 收到关闭信号", self.worker_id);
                 false
             }
         }
@@ -265,14 +266,14 @@ impl LocalHealthChecker {
                 if self.anomaly_tracker.exceeds_threshold() {
                     let anomaly_count = self.anomaly_tracker.anomaly_count();
                     warn!(
-                        "Worker #{} 速度异常次数过多 ({}/{}), 取消当前任务",
+                        "Worker {} 速度异常次数过多 ({}/{}), 取消当前任务",
                         self.worker_id, anomaly_count, self.config.history_size
                     );
                     
                     // 使用之前获取的句柄发送取消信号
                     if let Some(handle) = self.cancel_handle.take() {
                         if handle.cancel() {
-                            debug!("Worker #{} 取消信号已发送 (速度异常)", self.worker_id);
+                            debug!("Worker {} 取消信号已发送 (速度异常)", self.worker_id);
                         }
                     }
                     
@@ -302,7 +303,7 @@ impl LocalHealthChecker {
         let is_slow = instant_speed.as_u64() < threshold;
         if is_slow {
             debug!(
-                "Worker #{} 速度 {} 低于阈值 {}",
+                "Worker {} 速度 {} 低于阈值 {}",
                 self.worker_id,
                 instant_speed.to_formatted(self.config.size_standard),
                 DownloadSpeed::from_raw(threshold).to_formatted(self.config.size_standard)
