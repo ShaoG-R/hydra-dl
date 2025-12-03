@@ -62,9 +62,9 @@
 //!                     speed_mbps,
 //!                     executor_stats.stats_map.len());
 //!             }
-//!             DownloadProgress::Completed { total_bytes, total_time, executor_stats, .. } => {
+//!             DownloadProgress::Completed { total_written_bytes, total_time, executor_stats, .. } => {
 //!                 println!("下载完成！{:.2} MB in {:.2}s, {} 个 executors 完成",
-//!                     total_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.stats_map.len());
+//!                     total_written_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.stats_map.len());
 //!             }
 //!             DownloadProgress::Error { message } => {
 //!                 eprintln!("下载出错: {}", message);

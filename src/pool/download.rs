@@ -29,7 +29,7 @@ use local_health_checker::{LocalHealthChecker, LocalHealthCheckerConfig};
 use stats_updater::StatsUpdater;
 
 use super::common::{WorkerFactory, WorkerPool};
-pub(crate) use executor::{DownloadTaskExecutor, DownloadWorkerContext, ExecutorResult};
+pub(crate) use executor::{DownloadTaskExecutor, DownloadWorkerContext, ExecutorInput, ExecutorResult};
 use executor::task_allocator::TaskAllocator;
 use crate::utils::{
     cancel_channel::CancelHandle, chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy}, io_traits::HttpClient, stats::{WorkerStats}, writer::MmapWriter
@@ -70,16 +70,22 @@ pub(crate) struct DownloadWorkerInput {
 /// 下载任务工厂
 ///
 /// 实现 WorkerFactory trait，采用 Composite Worker 模式。
-/// 目前包含：
-/// - 协程 0: 主下载循环 (接收任务 -> HTTP请求 -> 写入)
+/// 包含：
+/// - 协程 0: 主下载循环 (接收任务 -> HTTP请求)
+/// - 协程 1: Stats Updater (统计更新)
+/// - 协程 2: Local Health Checker (本地健康检查)
 ///
 /// # 泛型参数
 ///
 /// - `C`: HTTP 客户端类型
 #[derive(Clone)]
 pub(crate) struct DownloadWorkerFactory<C> {
-    /// 下载任务执行器
-    executor: DownloadTaskExecutor<C>,
+    /// HTTP 客户端
+    client: C,
+    /// 共享的文件写入器
+    writer: MmapWriter,
+    /// 文件大小标准
+    size_standard: SizeStandard,
 }
 
 impl<C: Clone> DownloadWorkerFactory<C> {
@@ -90,7 +96,9 @@ impl<C: Clone> DownloadWorkerFactory<C> {
         size_standard: SizeStandard,
     ) -> Self {
         Self {
-            executor: DownloadTaskExecutor::new(client, writer, size_standard),
+            client,
+            writer,
+            size_standard,
         }
     }
 }
@@ -108,8 +116,6 @@ where
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         input: Self::Input,
     ) -> Vec<JoinHandle<()>> {
-        let executor = self.executor.clone();
-
         let DownloadWorkerInput {
             context,
             stats,
@@ -137,10 +143,24 @@ where
         );
         let local_health_handle = tokio::spawn(local_health_checker.run());
 
-        // --- 协程 0: 主下载循环（worker 自主从 allocator 分配任务） ---
-        let main_handle = tokio::spawn(
-            executor.run_loop(worker_id, context, stats, stats_handle, result_tx, shutdown_rx, cancel_rx),
+        // --- 创建 Executor ---
+        let executor = DownloadTaskExecutor::new(
+            worker_id,
+            self.client.clone(),
+            self.writer.clone(),
+            self.size_standard,
         );
+
+        // --- 协程 0: 主下载循环（worker 自主从 allocator 分配任务） ---
+        let executor_input = ExecutorInput {
+            context,
+            stats,
+            stats_handle,
+            result_tx,
+            shutdown_rx,
+            cancel_rx,
+        };
+        let main_handle = tokio::spawn(executor.run_loop(executor_input));
 
         vec![main_handle, stats_updater_handle, local_health_handle]
     }

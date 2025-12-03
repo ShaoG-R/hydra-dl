@@ -10,15 +10,17 @@
 
 mod retry_scheduler;
 pub(super) mod task_allocator;
+mod file_writer;
 
 use task_allocator::{AllocationResult, TaskAllocator};
+pub(crate) use file_writer::FileWriter;
 use super::stats_updater::StatsUpdaterHandle;
+use crate::utils::writer::MmapWriter;
 use crate::utils::{
     chunk_strategy::ChunkStrategy,
     fetch::{ChunkRecorder, FetchRangeResult, RangeFetcher},
     io_traits::HttpClient,
     stats::WorkerStats,
-    writer::MmapWriter,
 };
 use crate::utils::cancel_channel::CancelReceiver;
 use log::{debug, error, info, warn};
@@ -93,6 +95,34 @@ pub(crate) struct DownloadWorkerContext {
     pub(crate) url: String,
 }
 
+/// Executor 运行时输入
+///
+/// 封装 `run_loop` 所需的所有输入参数
+pub(crate) struct ExecutorInput {
+    /// Worker 上下文
+    pub context: DownloadWorkerContext,
+    /// Worker 统计数据
+    pub stats: WorkerStats,
+    /// Stats Updater 句柄
+    pub stats_handle: StatsUpdaterHandle,
+    /// 结果发送通道
+    pub result_tx: oneshot::Sender<ExecutorResult>,
+    /// 关闭信号接收器
+    pub shutdown_rx: oneshot::Receiver<()>,
+    /// 取消信号接收器
+    pub cancel_rx: CancelReceiver,
+}
+
+/// Executor 运行时状态
+///
+/// 封装 `execute_single_task` 所需的运行时引用
+struct ExecutorRuntime<'a> {
+    context: &'a mut DownloadWorkerContext,
+    stats: &'a mut WorkerStats,
+    stats_handle: &'a StatsUpdaterHandle,
+    file_writer: &'a FileWriter,
+}
+
 /// 单个任务的执行结果
 enum TaskResult {
     /// 任务成功完成
@@ -104,11 +134,20 @@ enum TaskResult {
     },
     /// 任务永久失败（达到最大重试次数）
     PermanentFailure,
-    /// 写入失败（致命错误，需立即终止）
-    WriteFailed {
-        range: AllocatedRange,
-        error: String,
-    },
+}
+
+/// 主循环 select 结果
+enum LoopAction {
+    /// 收到关闭信号
+    Shutdown,
+    /// 写入失败
+    WriteFailed(file_writer::WriteFailure),
+    /// 任务执行完成
+    TaskCompleted(TaskResult),
+    /// 等待重试完成
+    RetryWaitCompleted,
+    /// 没有更多任务
+    Done,
 }
 
 /// 下载任务执行器
@@ -118,11 +157,12 @@ enum TaskResult {
 /// # 泛型参数
 ///
 /// - `C`: HTTP 客户端类型
-#[derive(Clone)]
 pub(crate) struct DownloadTaskExecutor<C> {
+    /// Worker ID
+    worker_id: u64,
     /// HTTP 客户端
     client: C,
-    /// 共享的文件写入器
+    /// 文件写入器
     writer: MmapWriter,
     /// 文件大小标准
     size_standard: SizeStandard,
@@ -132,8 +172,9 @@ pub(crate) struct DownloadTaskExecutor<C> {
 
 impl<C> DownloadTaskExecutor<C> {
     /// 创建新的下载任务执行器
-    pub(crate) fn new(client: C, writer: MmapWriter, size_standard: SizeStandard) -> Self {
+    pub(crate) fn new(worker_id: u64, client: C, writer: MmapWriter, size_standard: SizeStandard) -> Self {
         Self {
+            worker_id,
             client,
             writer,
             size_standard,
@@ -147,32 +188,32 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
     ///
     /// 运行下载 Worker 的主事件循环，通过 TaskAllocator 统一获取任务并执行。
     /// 任务分配和重试调度由 TaskAllocator 封装处理。
-    ///
-    /// # Arguments
-    ///
-    /// - `worker_id`: Worker 的 ID
-    /// - `context`: Worker 上下文（包含 task_allocator 和 url）
-    /// - `stats`: Worker 统计数据
-    /// - `result_tx`: 结果发送通道（oneshot，仅在主循环结束时发送一次）
-    /// - `shutdown_rx`: 关闭信号接收器
-    /// - `cancel_rx`: 取消信号接收器（用于健康检查）
-    pub(crate) async fn run_loop(
-        mut self,
-        worker_id: u64,
-        mut context: DownloadWorkerContext,
-        mut stats: WorkerStats,
-        stats_handle: StatsUpdaterHandle,
-        result_tx: tokio::sync::oneshot::Sender<ExecutorResult>,
-        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-        mut cancel_rx: CancelReceiver,
-    ) {
+    pub(crate) async fn run_loop(mut self, input: ExecutorInput) {
+        let worker_id = self.worker_id;
         debug!("Worker #{} 主循环启动", worker_id);
+
+        let ExecutorInput {
+            mut context,
+            mut stats,
+            stats_handle,
+            result_tx,
+            mut shutdown_rx,
+            mut cancel_rx,
+        } = input;
+
+        // 在 Executor 内部创建 FileWriter
+        let (file_writer, mut write_failure_rx) = FileWriter::new(
+            worker_id,
+            self.writer.clone(),
+            stats_handle.clone(),
+            None,
+        );
 
         loop {
             // 通过 TaskAllocator 统一获取下一个任务
             let chunk_size = stats.get_current_chunk_size();
 
-            match context.task_allocator.next_task(chunk_size) {
+            let action = match context.task_allocator.next_task(chunk_size) {
                 AllocationResult::Task(task) => {
                     let range = task.range().clone();
                     let retry_count = task.retry_count();
@@ -186,24 +227,70 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     let task_id = context.task_allocator.current_task_id();
                     let task_cancel_rx = cancel_rx.reset(task_id);
 
-                    // 使用 select 同时监听 shutdown 信号和任务执行
-                    let task_result = tokio::select! {
+                    // 使用 select 同时监听 shutdown 信号、写入失败信号和任务执行
+                    let mut runtime = ExecutorRuntime {
+                        context: &mut context,
+                        stats: &mut stats,
+                        stats_handle: &stats_handle,
+                        file_writer: &file_writer,
+                    };
+                    tokio::select! {
                         biased;
-                        _ = &mut shutdown_rx => {
-                            info!("Worker #{} 任务执行中收到关闭信号，中断任务", worker_id);
-                            break;
+                        _ = &mut shutdown_rx => LoopAction::Shutdown,
+                        failure = &mut write_failure_rx => {
+                            match failure {
+                                Ok(f) => LoopAction::WriteFailed(f),
+                                Err(_) => continue, // 发送端被 drop，继续执行
+                            }
                         }
                         result = self.execute_single_task(
-                            worker_id,
                             range,
                             retry_count,
-                            &mut context,
-                            &mut stats,
-                            &stats_handle,
+                            &mut runtime,
                             task_cancel_rx,
-                        ) => result
-                    };
+                        ) => LoopAction::TaskCompleted(result)
+                    }
+                }
+                AllocationResult::WaitForRetry { delay, pending_count } => {
+                    debug!(
+                        "Worker #{} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
+                        worker_id, delay, pending_count
+                    );
 
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => LoopAction::Shutdown,
+                        failure = &mut write_failure_rx => {
+                            match failure {
+                                Ok(f) => LoopAction::WriteFailed(f),
+                                Err(_) => continue,
+                            }
+                        }
+                        _ = tokio::time::sleep(delay) => LoopAction::RetryWaitCompleted
+                    }
+                }
+                AllocationResult::Done => LoopAction::Done,
+            };
+
+            // 统一处理 action
+            match action {
+                LoopAction::Shutdown => {
+                    info!("Worker #{} 收到关闭信号，退出", worker_id);
+                    file_writer.shutdown_and_wait().await;
+                    break;
+                }
+                LoopAction::WriteFailed(failure) => {
+                    file_writer.shutdown_and_wait().await;
+                    let _ = result_tx.send(ExecutorResult::WriteFailed {
+                        worker_id,
+                        range: failure.range,
+                        error: failure.error,
+                    });
+                    stats_handle.send_executor_shutdown();
+                    debug!("Worker #{} 收到写入失败信号，主循环退出", worker_id);
+                    return;
+                }
+                LoopAction::TaskCompleted(task_result) => {
                     match task_result {
                         TaskResult::Success => {
                             context.task_allocator.advance_task_id();
@@ -215,40 +302,15 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                         TaskResult::PermanentFailure => {
                             context.task_allocator.advance_task_id();
                         }
-                        TaskResult::WriteFailed { range, error } => {
-                            // 写入失败是致命错误，立即终止 worker
-                            let _ = result_tx.send(ExecutorResult::WriteFailed {
-                                worker_id,
-                                range,
-                                error,
-                            });
-                            debug!("Worker #{} 写入失败，主循环退出", worker_id);
-                            return;
-                        }
                     }
                 }
-                AllocationResult::WaitForRetry { delay, pending_count } => {
-                    // 没有新任务，但有待重试任务，等待时也监听 shutdown
-                    debug!(
-                        "Worker #{} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
-                        worker_id, delay, pending_count
-                    );
-
-                    tokio::select! {
-                        biased;
-                        _ = &mut shutdown_rx => {
-                            info!("Worker #{} 等待重试期间收到关闭信号，退出", worker_id);
-                            break;
-                        }
-                        _ = tokio::time::sleep(delay) => {
-                            // 等待后，将所有待重试任务提前到当前 task_id
-                            context.task_allocator.advance_all_retries();
-                        }
-                    }
+                LoopAction::RetryWaitCompleted => {
+                    context.task_allocator.advance_all_retries();
                 }
-                AllocationResult::Done => {
-                    // 没有更多任务
+                LoopAction::Done => {
                     debug!("Worker #{} 没有更多任务，退出", worker_id);
+                    // 等待所有写入请求处理完后再退出
+                    file_writer.drain_and_wait().await;
                     break;
                 }
             }
@@ -275,46 +337,41 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
     /// 返回任务执行结果，不进行重试循环
     async fn execute_single_task(
         &mut self,
-        worker_id: u64,
         range: AllocatedRange,
         retry_count: usize,
-        context: &mut DownloadWorkerContext,
-        stats: &mut WorkerStats,
-        stats_handle: &StatsUpdaterHandle,
+        runtime: &mut ExecutorRuntime<'_>,
         cancel_rx: oneshot::Receiver<()>,
     ) -> TaskResult {
         let (start, end) = range.as_range_tuple();
         debug!(
             "Worker #{} 执行 Range 任务: {} (range {}..{}, retry {})",
-            worker_id, context.url, start, end, retry_count
+            self.worker_id, runtime.context.url, start, end, retry_count
         );
 
         // 任务开始，发送信号到辅助协程
-        stats.clear_samples();
-        stats_handle.send_task_started(range.len());
+        runtime.stats.clear_samples();
+        runtime.stats_handle.send_task_started(range.len());
 
         // 创建 Chunk 记录器
-        let mut recorder = DownloadChunkRecorder::new(stats, stats_handle);
-        let fetch_result = self.fetch_range(&context.url, &range, &mut recorder, cancel_rx).await;
+        let mut recorder = DownloadChunkRecorder::new(runtime.stats, runtime.stats_handle);
+        let fetch_result = self.fetch_range(&runtime.context.url, &range, &mut recorder, cancel_rx).await;
 
         // 任务结束，发送信号到辅助协程
-        stats_handle.send_task_ended();
+        runtime.stats_handle.send_task_ended();
 
         match fetch_result {
             Ok(FetchRangeResult::Complete(data)) => {
-                // 下载成功，写入文件
-                let written_bytes = range.len();
-                if let Err(e) = self.writer.write_range(range.clone(), data.as_ref()) {
-                    let error_msg = format!("写入失败: {:?}", e);
-                    error!("Worker #{} {}", worker_id, error_msg);
-                    return TaskResult::WriteFailed { range, error: error_msg };
+                // 下载成功，发送写入请求到 Writer 协程
+                // 写入失败由 Writer 协程通过 write_failure_rx 通知
+                if let Err(e) = runtime.file_writer.write(range.clone(), data).await {
+                    // 发送失败说明 Writer 协程已关闭，直接返回 Success
+                    // 实际的错误会通过 write_failure_rx 通知
+                    warn!("Worker #{} 发送写入请求失败: {:?}", self.worker_id, e);
+                    return TaskResult::Success;
                 }
 
-                // 通知写入成功的字节数
-                stats_handle.send_bytes_written(written_bytes);
-
                 // 根据当前速度更新分块大小
-                self.update_chunk_size(context, stats, stats_handle);
+                self.update_chunk_size(runtime);
 
                 TaskResult::Success
             }
@@ -322,54 +379,42 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 // 下载被取消（健康检查触发）
                 warn!(
                     "Worker #{} Range {}..{} 被取消 (已下载 {} bytes)",
-                    worker_id, start, end, bytes_downloaded
+                    self.worker_id, start, end, bytes_downloaded
                 );
 
                 let remaining_range = match self.handle_partial_download(
-                    worker_id,
                     range,
                     data,
                     bytes_downloaded,
-                    stats_handle,
-                ) {
+                    runtime.file_writer,
+                ).await {
                     Some(r) => r,
                     None => return TaskResult::Success, // remaining_range不存在，返回成功
                 };
 
                 let new_retry_count = retry_count + 1;
-                self.check_retry_or_fail(
-                    worker_id,
-                    remaining_range,
-                    new_retry_count,
-                    context,
-                )
+                self.check_retry_or_fail(remaining_range, new_retry_count, runtime.context)
             }
             Err(e) => {
                 // 下载失败
                 warn!(
                     "Worker #{} Range {}..{} 下载失败 (重试 {}): {:?}",
-                    worker_id, start, end, retry_count, e
+                    self.worker_id, start, end, retry_count, e
                 );
 
                 let new_retry_count = retry_count + 1;
-                self.check_retry_or_fail(
-                    worker_id,
-                    range,
-                    new_retry_count,
-                    context,
-                )
+                self.check_retry_or_fail(range, new_retry_count, runtime.context)
             }
         }
     }
 
     /// 处理部分下载的数据
-    fn handle_partial_download(
+    async fn handle_partial_download(
         &self,
-        worker_id: u64,
         range: AllocatedRange,
         data: bytes::Bytes,
         bytes_downloaded: u64,
-        stats_handle: &StatsUpdaterHandle,
+        file_writer: &FileWriter,
     ) -> Option<AllocatedRange> {
         let (low, remaining) = match range.split_at_align_down(bytes_downloaded) {
             SplitDownResult::Split { low, high } => (Some(low), Some(high)),
@@ -382,13 +427,12 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
         if let Some(low) = low {
             let low_len = low.len() as usize;
-            if let Err(e) = self.writer.write_range(low.clone(), &data[0..low_len]) {
-                error!("Worker #{} 写入部分数据失败: {:?}", worker_id, e);
+            let partial_data = data.slice(0..low_len);
+            if let Err(e) = file_writer.write(low.clone(), partial_data).await {
+                error!("Worker #{} 发送部分写入请求失败: {:?}", self.worker_id, e);
                 return Some(range);
             }
-            // 通知写入成功的字节数（使用对齐后的实际写入大小）
-            stats_handle.send_bytes_written(low.len());
-            debug!("Worker #{} 成功写入 {} bytes", worker_id, low.len());
+            debug!("Worker #{} 发送部分写入请求 {} bytes", self.worker_id, low.len());
         }
 
         remaining
@@ -397,7 +441,6 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
     /// 检查是否需要重试或标记为永久失败
     fn check_retry_or_fail(
         &mut self,
-        worker_id: u64,
         range: AllocatedRange,
         retry_count: usize,
         context: &DownloadWorkerContext,
@@ -411,7 +454,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             );
             error!(
                 "Worker #{} Range {}..{} {}",
-                worker_id,
+                self.worker_id,
                 range.start(),
                 range.end(),
                 error_msg
@@ -443,27 +486,22 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
 
     /// 根据当前速度更新分块大小
-    fn update_chunk_size(
-        &self,
-        context: &DownloadWorkerContext,
-        stats: &mut WorkerStats,
-        stats_handle: &StatsUpdaterHandle,
-    ) {
-        let instant_speed = stats.get_instant_speed();
-        let window_avg_speed = stats.get_window_avg_speed();
+    fn update_chunk_size(&self, runtime: &mut ExecutorRuntime<'_>) {
+        let instant_speed = runtime.stats.get_instant_speed();
+        let window_avg_speed = runtime.stats.get_window_avg_speed();
 
         if let (Some(instant_speed), Some(window_avg_speed)) = (instant_speed, window_avg_speed) {
-            let current_chunk_size = stats.get_current_chunk_size();
-            let new_chunk_size = context.chunk_strategy.calculate_chunk_size(
+            let current_chunk_size = runtime.stats.get_current_chunk_size();
+            let new_chunk_size = runtime.context.chunk_strategy.calculate_chunk_size(
                 current_chunk_size,
                 instant_speed,
                 window_avg_speed,
             );
 
-            stats.set_current_chunk_size(new_chunk_size);
+            runtime.stats.set_current_chunk_size(new_chunk_size);
             
             // 发送更新后的 stats 到辅助协程
-            stats_handle.send_chunk_sampled(stats.clone());
+            runtime.stats_handle.send_chunk_sampled(runtime.stats.clone());
 
             debug!(
                 "Updated chunk size: {} -> {} (speed: {}, avg: {})",
