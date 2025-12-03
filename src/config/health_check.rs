@@ -14,8 +14,14 @@ impl Defaults {
         unsafe { NonZeroU64::new_unchecked(100 * KB) };
     /// 是否启用健康检查
     pub const ENABLED: bool = true;
-    /// 最小worker数量阈值（低于此数量不执行健康检查）
-    pub const MIN_WORKERS_FOR_CHECK: u64 = 3;
+    /// 相对速度阈值（worker 速度低于健康基准的此比例时被视为显著慢速）
+    pub const RELATIVE_THRESHOLD: f64 = 0.5;
+    /// 异常历史窗口大小
+    pub const HISTORY_SIZE: usize = 10;
+    /// 异常阈值比例（历史窗口中异常比例达到此值则触发）
+    pub const ANOMALY_THRESHOLD_RATIO: f64 = 0.7;
+    /// 超时时间倍数（基于 instant_speed_window 的倍数）
+    pub const STALE_TIMEOUT_MULTIPLIER: u32 = 10;
 }
 
 // ==================== 配置结构体 ====================
@@ -29,16 +35,27 @@ pub struct HealthCheckConfig {
     pub enabled: bool,
     /// 绝对速度阈值（bytes/s）
     pub absolute_speed_threshold: Option<NonZeroU64>,
-    /// 最小worker数量阈值（低于此数量不执行健康检查）
-    pub min_workers_for_check: u64,
+    /// 相对速度阈值（0.0-1.0，worker 速度低于健康基准的此比例时被视为显著慢速）
+    pub relative_threshold: f64,
+    /// 异常历史窗口大小
+    pub history_size: usize,
+    /// 异常阈值（历史窗口中异常次数达到此值则触发取消）
+    pub anomaly_threshold: usize,
+    /// 超时时间倍数（基于 instant_speed_window 的倍数）
+    pub stale_timeout_multiplier: u32,
 }
 
 impl Default for HealthCheckConfig {
     fn default() -> Self {
+        let history_size = Defaults::HISTORY_SIZE;
+        let anomaly_threshold = (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
         Self {
             enabled: Defaults::ENABLED,
             absolute_speed_threshold: Some(Defaults::ABSOLUTE_SPEED_THRESHOLD),
-            min_workers_for_check: Defaults::MIN_WORKERS_FOR_CHECK,
+            relative_threshold: Defaults::RELATIVE_THRESHOLD,
+            history_size,
+            anomaly_threshold,
+            stale_timeout_multiplier: Defaults::STALE_TIMEOUT_MULTIPLIER,
         }
     }
 }
@@ -55,8 +72,23 @@ impl HealthCheckConfig {
     }
 
     #[inline]
-    pub fn min_workers_for_check(&self) -> u64 {
-        self.min_workers_for_check
+    pub fn relative_threshold(&self) -> f64 {
+        self.relative_threshold
+    }
+
+    #[inline]
+    pub fn history_size(&self) -> usize {
+        self.history_size
+    }
+
+    #[inline]
+    pub fn anomaly_threshold(&self) -> usize {
+        self.anomaly_threshold
+    }
+
+    #[inline]
+    pub fn stale_timeout_multiplier(&self) -> u32 {
+        self.stale_timeout_multiplier
     }
 }
 
@@ -67,16 +99,24 @@ impl HealthCheckConfig {
 pub struct HealthCheckConfigBuilder {
     pub(crate) enabled: bool,
     pub(crate) absolute_speed_threshold: Option<NonZeroU64>,
-    pub(crate) min_workers_for_check: u64,
+    pub(crate) relative_threshold: f64,
+    pub(crate) history_size: usize,
+    pub(crate) anomaly_threshold: usize,
+    pub(crate) stale_timeout_multiplier: u32,
 }
 
 impl HealthCheckConfigBuilder {
     /// 创建新的健康检查配置构建器（使用默认值）
     pub fn new() -> Self {
+        let history_size = Defaults::HISTORY_SIZE;
+        let anomaly_threshold = (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
         Self {
             enabled: Defaults::ENABLED,
             absolute_speed_threshold: Some(Defaults::ABSOLUTE_SPEED_THRESHOLD),
-            min_workers_for_check: Defaults::MIN_WORKERS_FOR_CHECK,
+            relative_threshold: Defaults::RELATIVE_THRESHOLD,
+            history_size,
+            anomaly_threshold,
+            stale_timeout_multiplier: Defaults::STALE_TIMEOUT_MULTIPLIER,
         }
     }
 
@@ -92,9 +132,27 @@ impl HealthCheckConfigBuilder {
         self
     }
 
-    /// 设置最小worker数量阈值
-    pub fn min_workers_for_check(mut self, count: u64) -> Self {
-        self.min_workers_for_check = count.max(2); // 至少需要2个worker才能比较
+    /// 设置相对速度阈值（0.0-1.0）
+    pub fn relative_threshold(mut self, ratio: f64) -> Self {
+        self.relative_threshold = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// 设置异常历史窗口大小
+    pub fn history_size(mut self, size: usize) -> Self {
+        self.history_size = size.max(1);
+        self
+    }
+
+    /// 设置异常阈值
+    pub fn anomaly_threshold(mut self, threshold: usize) -> Self {
+        self.anomaly_threshold = threshold;
+        self
+    }
+
+    /// 设置超时时间倍数
+    pub fn stale_timeout_multiplier(mut self, multiplier: u32) -> Self {
+        self.stale_timeout_multiplier = multiplier.max(1);
         self
     }
 
@@ -103,7 +161,10 @@ impl HealthCheckConfigBuilder {
         HealthCheckConfig {
             enabled: self.enabled,
             absolute_speed_threshold: self.absolute_speed_threshold,
-            min_workers_for_check: self.min_workers_for_check,
+            relative_threshold: self.relative_threshold,
+            history_size: self.history_size,
+            anomaly_threshold: self.anomaly_threshold,
+            stale_timeout_multiplier: self.stale_timeout_multiplier,
         }
     }
 }

@@ -33,32 +33,26 @@ pub(crate) struct LocalHealthCheckerConfig {
     pub absolute_threshold: Option<NonZeroU64>,
     /// 文件大小单位标准（用于日志）
     pub size_standard: SizeStandard,
-    /// 异常历史窗口大小
+    /// 异常历史窗口大小（来自 HealthCheckConfig）
     pub history_size: usize,
-    /// 异常阈值（历史窗口中异常次数达到此值则取消）
+    /// 异常阈值（来自 HealthCheckConfig）
     pub anomaly_threshold: usize,
 }
 
 impl LocalHealthCheckerConfig {
     /// 从下载配置创建
     pub fn from_download_config(config: &crate::config::DownloadConfig) -> Self {
-        // 超时时间：速度统计窗口的 3 倍
-        let stale_timeout = config.speed().instant_speed_window() * 10;
-        
-        // 绝对速度阈值
-        let absolute_threshold = config.health_check().absolute_speed_threshold();
-        
-        // 历史窗口大小：10 次
-        let history_size = 10;
-        // 异常阈值：历史窗口的 70%
-        let anomaly_threshold = (history_size as f64 * 0.7).ceil() as usize;
-        
+        let health_check = config.health_check();
+        // 超时时间：速度统计窗口 × 倍数
+        let stale_timeout =
+            config.speed().instant_speed_window() * health_check.stale_timeout_multiplier();
+
         Self {
             stale_timeout,
-            absolute_threshold,
+            absolute_threshold: health_check.absolute_speed_threshold(),
             size_standard: config.speed().size_standard(),
-            history_size,
-            anomaly_threshold,
+            history_size: health_check.history_size(),
+            anomaly_threshold: health_check.anomaly_threshold(),
         }
     }
 }

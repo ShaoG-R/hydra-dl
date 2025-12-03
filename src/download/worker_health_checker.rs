@@ -325,20 +325,22 @@ impl WorkerHealthCheckerActor {
             broadcast_rx,
         } = params;
 
+        let health_check = config.health_check();
+
         // 绝对速度阈值仍然用于相对速度检测的安全过滤
         // (不会取消绝对速度达标但相对较慢的 worker)
-        let absolute_threshold = config
-            .health_check()
+        let absolute_threshold = health_check
             .absolute_speed_threshold()
             .map(|v| Speed(v.get()));
-        let logic =
-            WorkerHealthCheckerLogic::new(absolute_threshold, 0.5, config.speed().size_standard());
+        let logic = WorkerHealthCheckerLogic::new(
+            absolute_threshold,
+            health_check.relative_threshold(),
+            config.speed().size_standard(),
+        );
 
         // 从配置获取健康检查参数
-        // 历史窗口大小：默认 10 次
-        let history_size = 10;
-        // 异常阈值：历史窗口的 70%（即 10 次中有 7 次异常）
-        let anomaly_threshold = (history_size as f64 * 0.7).ceil() as usize;
+        let history_size = health_check.history_size();
+        let anomaly_threshold = health_check.anomaly_threshold();
 
         debug!(
             "WorkerHealthChecker 启动: history_size={}, anomaly_threshold={}",
