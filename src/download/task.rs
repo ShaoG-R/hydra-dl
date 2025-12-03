@@ -44,8 +44,6 @@ pub struct DownloadTask<C: HttpClient> {
     stats_handle: DownloadStatsHandle,
     /// 永久失败的 ranges
     failed_ranges: Vec<(AllocatedRange, String)>,
-    /// 完成的 worker 数量
-    completed_workers: usize,
 }
 
 impl<C: HttpClient + Clone> DownloadTask<C> {
@@ -137,7 +135,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             health_checker,
             stats_handle,
             failed_ranges: Vec::new(),
-            completed_workers: 0,
         }
     }
 
@@ -146,14 +143,12 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     /// Worker 自主分配任务并重试，这里只监听结果
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
     pub(super) async fn wait_for_completion(&mut self) -> crate::Result<Vec<(AllocatedRange, String)>> {
-        let total_workers = self.pool.worker_count() as usize;
-        info!("等待 {} 个 workers 完成", total_workers);
-
         // 事件循环：处理 worker 结果和启动请求
         loop {
             tokio::select! {
                 // 处理 worker 启动请求
                 Some(request) = self.launch_request_rx.recv() => {
+                    
                     self.handle_launch_request(request).await;
                 },
                 // 处理 worker 结果（从 FuturesUnordered 中获取）
@@ -161,11 +156,10 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                     match result {
                         Ok(ExecutorResult::Success { worker_id }) => {
                             info!("Worker #{} 完成任务", worker_id);
-                            self.completed_workers += 1;
                             
-                            // 检查是否所有 worker 都完成了
-                            if self.completed_workers >= total_workers {
-                                info!("所有 {} 个 workers 已完成", total_workers);
+                            // 检查是否所有写入完成
+                            if self.writer.is_complete() {
+                                info!("所有写入已完成");
                                 break;
                             }
                         }
@@ -179,13 +173,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                                 );
                             }
                             self.failed_ranges.extend(failed_ranges);
-                            self.completed_workers += 1;
                             
-                            // 检查是否所有 worker 都完成了
-                            if self.completed_workers >= total_workers {
-                                warn!("所有 workers 已完成，但有 {} 个永久失败", self.failed_ranges.len());
-                                break;
-                            }
+                            info!("有任务永久失败，终止下载");
+                            break;
                         }
                         Ok(ExecutorResult::WriteFailed { worker_id, range, error }) => {
                             // 写入失败是致命错误，立即终止
@@ -199,11 +189,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                         Err(_) => {
                             // oneshot 通道被取消（worker 异常退出）
                             warn!("Worker result channel cancelled");
-                            self.completed_workers += 1;
-                            
-                            if self.completed_workers >= total_workers {
-                                break;
-                            }
+                            break;
                         }
                     }
                 },

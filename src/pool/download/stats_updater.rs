@@ -13,9 +13,9 @@
 //!
 //! 统计更新通过 broadcast channel 广播 `ExecutorBroadcast` 消息到所有订阅者。
 
-use crate::utils::stats::WorkerStats;
+use crate::utils::stats::{SpeedStats, WorkerStats};
 use log::debug;
-use net_bytes::{DownloadAcceleration, DownloadSpeed};
+use net_bytes::DownloadSpeed;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
@@ -28,18 +28,7 @@ pub enum ExecutorCurrentStats {
     #[default]
     Stopped,
     /// Executor 运行中，包含实时统计数据
-    Running {
-        /// 当前分块大小 (bytes)
-        current_chunk_size: u64,
-        /// 平均速度（从开始到现在）
-        avg_speed: Option<DownloadSpeed>,
-        /// 实时速度（基于短时间窗口）
-        instant_speed: Option<DownloadSpeed>,
-        /// 窗口平均速度（基于较长时间窗口）
-        window_avg_speed: Option<DownloadSpeed>,
-        /// 实时加速度
-        instant_acceleration: Option<DownloadAcceleration>,
-    },
+    Running(SpeedStats),
 }
 
 /// Executor 统计信息
@@ -80,13 +69,10 @@ impl ExecutorStats {
             self.run_start_time = Some(Instant::now());
         }
         // 初始化为运行状态，但还没有速度数据
-        self.current_stats = ExecutorCurrentStats::Running {
+        self.current_stats = ExecutorCurrentStats::Running(SpeedStats {
             current_chunk_size,
-            avg_speed: None,
-            instant_speed: None,
-            window_avg_speed: None,
-            instant_acceleration: None,
-        };
+            ..SpeedStats::empty()
+        });
     }
 
     /// 标记 Executor 停止运行
@@ -100,24 +86,25 @@ impl ExecutorStats {
 
     /// 更新统计数据（从 WorkerStats 同步）
     pub(crate) fn update_from_worker_stats(&mut self, worker_stats: &WorkerStats) {
-        let (total_bytes, _) = worker_stats.get_summary();
-        self.total_bytes = total_bytes;
+        self.total_bytes = worker_stats.get_total_bytes();
         
-        if matches!(self.current_stats, ExecutorCurrentStats::Running{..}) {
-            self.current_stats = ExecutorCurrentStats::Running {
-                current_chunk_size: worker_stats.get_current_chunk_size(),
-                avg_speed: worker_stats.get_speed(),
-                instant_speed: worker_stats.get_instant_speed(),
-                window_avg_speed: worker_stats.get_window_avg_speed(),
-                instant_acceleration: worker_stats.get_instant_acceleration(),
-            };
+        if matches!(self.current_stats, ExecutorCurrentStats::Running(_)) {
+            self.current_stats = ExecutorCurrentStats::Running(worker_stats.get_speed_stats());
+        }
+    }
+
+    /// 获取速度统计（如果正在运行）
+    pub fn get_speed_stats(&self) -> Option<SpeedStats> {
+        match &self.current_stats {
+            ExecutorCurrentStats::Running(stats) => Some(*stats),
+            ExecutorCurrentStats::Stopped => None,
         }
     }
 
     /// 获取实时速度
     pub fn get_instant_speed(&self) -> Option<DownloadSpeed> {
         match &self.current_stats {
-            ExecutorCurrentStats::Running { instant_speed, .. } => *instant_speed,
+            ExecutorCurrentStats::Running(stats) => stats.instant_speed,
             ExecutorCurrentStats::Stopped => None,
         }
     }
@@ -125,7 +112,7 @@ impl ExecutorStats {
     /// 获取窗口平均速度
     pub fn get_window_avg_speed(&self) -> Option<DownloadSpeed> {
         match &self.current_stats {
-            ExecutorCurrentStats::Running { window_avg_speed, .. } => *window_avg_speed,
+            ExecutorCurrentStats::Running(stats) => stats.window_avg_speed,
             ExecutorCurrentStats::Stopped => None,
         }
     }
@@ -133,15 +120,7 @@ impl ExecutorStats {
     /// 获取平均速度
     pub fn get_avg_speed(&self) -> Option<DownloadSpeed> {
         match &self.current_stats {
-            ExecutorCurrentStats::Running { avg_speed, .. } => *avg_speed,
-            ExecutorCurrentStats::Stopped => None,
-        }
-    }
-
-    /// 获取实时加速度
-    pub fn get_instant_acceleration(&self) -> Option<DownloadAcceleration> {
-        match &self.current_stats {
-            ExecutorCurrentStats::Running { instant_acceleration, .. } => *instant_acceleration,
+            ExecutorCurrentStats::Running(stats) => stats.avg_speed,
             ExecutorCurrentStats::Stopped => None,
         }
     }

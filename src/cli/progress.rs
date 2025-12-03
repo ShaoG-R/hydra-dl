@@ -102,9 +102,24 @@ impl ProgressManager {
                 // 更新主进度条
                 self.main_bar.set_position(bytes_downloaded);
 
-                // 只在有实时速度时显示速度和 ETA
+                // 只在有实时速度时显示速度、加速度和 ETA
                 let (speed_str, eta) = if let Some(instant) = instant_speed {
+                    // 速度显示
                     let speed_display = instant.to_formatted(self.size_standard).to_string();
+                    // 加速度显示（仅主进度条）
+                    let accel_display = instant_acceleration
+                        .map(|a| {
+                            let v = a.as_i64();
+                            if v > 0 {
+                                format!(" ↑{}", a.to_formatted(self.size_standard))
+                            } else if v < 0 {
+                                format!(" ↓{}", a.to_formatted(self.size_standard))
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .unwrap_or_default();
+                    let speed_display = format!("{}{}", speed_display, accel_display);
                     let eta_display = {
                         let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded);
 
@@ -127,7 +142,7 @@ impl ProgressManager {
                 let chunk_sizes: Vec<u64> = executor_stats
                     .iter()
                     .filter_map(|(_, s)| match &s.current_stats {
-                        ExecutorCurrentStats::Running { current_chunk_size, .. } => Some(*current_chunk_size),
+                        ExecutorCurrentStats::Running(stats) => Some(stats.current_chunk_size),
                         ExecutorCurrentStats::Stopped => None,
                     })
                     .collect();
@@ -177,28 +192,15 @@ impl ProgressManager {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
                             // 根据 current_stats 状态显示不同信息
                             let msg = match &stats.current_stats {
-                                ExecutorCurrentStats::Running { instant_speed, instant_acceleration, current_chunk_size, .. } => {
-                                    let speed = instant_speed
+                                ExecutorCurrentStats::Running(speed_stats) => {
+                                    let speed = speed_stats.instant_speed
                                         .map(|s| s.to_formatted(self.size_standard).to_string())
                                         .unwrap_or_default();
-                                    let accel = instant_acceleration
-                                        .map(|a| {
-                                            let v = a.as_i64();
-                                            if v > 0 {
-                                                format!(" ↑{}", a.to_formatted(self.size_standard))
-                                            } else if v < 0 {
-                                                format!(" ↓{}", a.to_formatted(self.size_standard))
-                                            } else {
-                                                String::new()
-                                            }
-                                        })
-                                        .unwrap_or_default();
                                     format!(
-                                        "{}, 分块: {} {} {}",
+                                        "{}, 分块: {} {}",
                                         format_bytes(stats.total_bytes),
-                                        format_bytes(*current_chunk_size),
-                                        speed,
-                                        accel
+                                        format_bytes(speed_stats.current_chunk_size),
+                                        speed
                                     )
                                 }
                                 ExecutorCurrentStats::Stopped => {
@@ -251,8 +253,8 @@ impl ProgressManager {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
                             // 从 current_stats 提取平均速度
                             let avg_speed_str = match &stats.current_stats {
-                                ExecutorCurrentStats::Running { avg_speed, .. } => {
-                                    avg_speed
+                                ExecutorCurrentStats::Running(speed_stats) => {
+                                    speed_stats.avg_speed
                                         .map(|s| s.to_formatted(self.size_standard).to_string())
                                         .unwrap_or("N/A".to_string())
                                 }

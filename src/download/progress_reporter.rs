@@ -8,6 +8,7 @@ use log::debug;
 use net_bytes::{DownloadAcceleration, DownloadSpeed};
 use smr_swap::LocalReader;
 use std::num::NonZeroU64;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// 下载进度更新信息
@@ -105,6 +106,10 @@ struct ProgressReporterActor {
     progress_timer: tokio::time::Interval,
     /// 启动时间（用于计算总耗时）
     start_time: std::time::Instant,
+    /// 上次实时速度（用于计算加速度）
+    last_instant_speed: Option<DownloadSpeed>,
+    /// 上次速度记录时间（用于计算加速度）
+    last_speed_time: Option<Instant>,
 }
 
 impl ProgressReporterActor {
@@ -129,6 +134,8 @@ impl ProgressReporterActor {
             aggregated_stats,
             progress_timer,
             start_time: std::time::Instant::now(),
+            last_instant_speed: None,
+            last_speed_time: None,
         }
     }
 
@@ -206,7 +213,7 @@ impl ProgressReporterActor {
     }
 
     /// 生成进度更新消息（从 aggregated_stats 获取所有数据）
-    fn generate_progress_update(&self) -> Option<DownloadProgress> {
+    fn generate_progress_update(&mut self) -> Option<DownloadProgress> {
         // 只有当有 sender 时才生成消息（虽然调用方也会检查，但双重检查无害）
         if self.progress_sender.is_none() {
             return None;
@@ -225,16 +232,54 @@ impl ProgressReporterActor {
             0.0
         };
 
+        // 一次性获取所有速度统计，避免多次遍历
+        let speed_stats = executor_stats.get_total_speed_stats();
+        let current_instant_speed = speed_stats.and_then(|s| s.instant_speed);
+
+        // 计算实时加速度
+        let now = Instant::now();
+        let instant_acceleration = self.calculate_acceleration(current_instant_speed, now);
+
+        // 更新上次速度记录
+        if current_instant_speed.is_some() {
+            self.last_instant_speed = current_instant_speed;
+            self.last_speed_time = Some(now);
+        }
+
         Some(DownloadProgress::Progress {
             bytes_downloaded: total_bytes,
             total_size: self.total_size,
             percentage,
-            avg_speed: executor_stats.get_total_avg_speed(),
-            instant_speed: executor_stats.get_total_instant_speed(),
-            window_avg_speed: executor_stats.get_total_window_avg_speed(),
-            instant_acceleration: executor_stats.get_total_instant_acceleration(),
+            avg_speed: speed_stats.and_then(|s| s.avg_speed),
+            instant_speed: current_instant_speed,
+            window_avg_speed: speed_stats.and_then(|s| s.window_avg_speed),
+            instant_acceleration,
             executor_stats,
         })
+    }
+
+    /// 计算实时加速度
+    ///
+    /// 使用上次记录的实时速度和当前实时速度计算加速度
+    fn calculate_acceleration(
+        &self,
+        current_speed: Option<DownloadSpeed>,
+        now: Instant,
+    ) -> Option<DownloadAcceleration> {
+        let current = current_speed?;
+        let last_speed = self.last_instant_speed?;
+        let last_time = self.last_speed_time?;
+
+        let duration = now.duration_since(last_time);
+        if duration.is_zero() {
+            return None;
+        }
+
+        Some(DownloadAcceleration::new(
+            last_speed.as_u64(),
+            current.as_u64(),
+            duration,
+        ))
     }
 
     /// 生成完成统计消息（从 aggregated_stats 获取所有数据）

@@ -43,7 +43,7 @@ impl LocalHealthCheckerConfig {
     /// 从下载配置创建
     pub fn from_download_config(config: &crate::config::DownloadConfig) -> Self {
         // 超时时间：速度统计窗口的 3 倍
-        let stale_timeout = config.speed().instant_speed_window() * 3;
+        let stale_timeout = config.speed().instant_speed_window() * 10;
         
         // 绝对速度阈值
         let absolute_threshold = config.health_check().absolute_speed_threshold();
@@ -252,11 +252,11 @@ impl LocalHealthChecker {
     /// 处理 Stats 更新
     fn handle_stats_update(&mut self, stats: &super::stats_updater::ExecutorStats) {
         match &stats.current_stats {
-            ExecutorCurrentStats::Running { instant_speed, .. } => {
+            ExecutorCurrentStats::Running(stats) => {
                 self.task_running = true;
                 
                 // 检查绝对速度阈值
-                let is_anomaly = self.check_absolute_speed(*instant_speed);
+                let is_anomaly = self.check_absolute_speed(stats.instant_speed);
                 self.anomaly_tracker.record(is_anomaly);
                 
                 // 检查是否超过异常阈值

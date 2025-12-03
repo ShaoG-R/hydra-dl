@@ -1,5 +1,27 @@
 use super::speed_calculator::SpeedCalculator;
-use net_bytes::{DownloadAcceleration, DownloadSpeed};
+use net_bytes::DownloadSpeed;
+
+/// 速度统计快照
+///
+/// 封装所有速度相关的统计数据，一次性获取避免多次遍历
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpeedStats {
+    /// 当前分块大小 (bytes)
+    pub current_chunk_size: u64,
+    /// 平均速度（从开始到现在）
+    pub avg_speed: Option<DownloadSpeed>,
+    /// 实时速度（基于短时间窗口）
+    pub instant_speed: Option<DownloadSpeed>,
+    /// 窗口平均速度（基于较长时间窗口）
+    pub window_avg_speed: Option<DownloadSpeed>,
+}
+
+impl SpeedStats {
+    /// 创建空的速度统计
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
 
 
 /// 下载速度统计
@@ -130,31 +152,27 @@ impl WorkerStats {
         self.speed_calculator.get_window_avg_speed()
     }
 
-    /// 获取实时下载加速度
+    /// 获取所有速度统计的快照
     ///
-    /// # Returns
-    ///
-    /// 返回 `Some(DownloadAcceleration)` 如果加速度计算有效，否则返回 `None`
-    ///
-    /// 注意：需要至少3个采样点才能计算加速度
+    /// 一次性获取所有速度相关数据，避免多次调用
     #[inline]
-    pub(crate) fn get_instant_acceleration(&self) -> Option<DownloadAcceleration> {
-        self.speed_calculator.get_instant_acceleration()
+    pub(crate) fn get_speed_stats(&self) -> SpeedStats {
+        SpeedStats {
+            current_chunk_size: self.current_chunk_size,
+            avg_speed: self.get_speed(),
+            instant_speed: self.speed_calculator.get_instant_speed(),
+            window_avg_speed: self.speed_calculator.get_window_avg_speed(),
+        }
     }
 
-    /// 获取统计摘要
+    /// 获取总下载字节数
     ///
     /// # Returns
     ///
-    /// `(总字节数, 总耗时秒数, 完成的 range 数)`
-    #[allow(dead_code)]
-    pub(crate) fn get_summary(&self) -> (u64, f64) {
-        let bytes = self.total_bytes;
-        let elapsed_secs = self
-            .worker_start_time
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
-        (bytes, elapsed_secs)
+    /// `(总字节数)`
+    #[inline]
+    pub(crate) fn get_total_bytes(&self) -> u64 {
+        self.total_bytes
     }
 
     /// 获取当前分块大小

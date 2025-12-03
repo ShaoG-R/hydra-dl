@@ -10,9 +10,10 @@
 //! - 提供查询接口获取聚合后的统计数据
 
 use crate::pool::download::{ExecutorBroadcast, ExecutorStats, TaggedBroadcast};
+use crate::utils::stats::SpeedStats;
 use lite_sync::oneshot::lite;
 use log::debug;
-use net_bytes::{DownloadAcceleration, DownloadSpeed};
+use net_bytes::DownloadSpeed;
 use rustc_hash::FxHashMap;
 use smr_swap::{LocalReader, SmrSwap};
 use tokio::sync::broadcast;
@@ -76,21 +77,11 @@ impl AggregatedStats {
     ///
     /// 将所有 Worker 的窗口平均速度相加
     pub fn get_total_window_avg_speed(&self) -> Option<DownloadSpeed> {
-        let mut total: u64 = 0;
-        let mut has_any = false;
-
-        for (_, stats) in self.stats_map.iter() {
-            if let Some(speed) = stats.get_window_avg_speed() {
-                total += speed.as_u64();
-                has_any = true;
-            }
-        }
-
-        if has_any {
-            Some(DownloadSpeed::from_raw(total))
-        } else {
-            None
-        }
+        self.stats_map
+            .values()
+            .filter_map(|s| s.get_window_avg_speed().map(|v| v.as_u64()))
+            .reduce(|a, b| a + b)
+            .map(DownloadSpeed::from_raw)
     }
 
     /// 获取所有 Worker 的总下载字节数
@@ -100,56 +91,53 @@ impl AggregatedStats {
 
     /// 获取所有 Worker 的总实时速度
     pub fn get_total_instant_speed(&self) -> Option<DownloadSpeed> {
-        let mut total: u64 = 0;
-        let mut has_any = false;
-
-        for (_, stats) in self.stats_map.iter() {
-            if let Some(speed) = stats.get_instant_speed() {
-                total += speed.as_u64();
-                has_any = true;
-            }
-        }
-
-        if has_any {
-            Some(DownloadSpeed::from_raw(total))
-        } else {
-            None
-        }
+        self.stats_map
+            .values()
+            .filter_map(|s| s.get_instant_speed().map(|v| v.as_u64()))
+            .reduce(|a, b| a + b)
+            .map(DownloadSpeed::from_raw)
     }
 
     /// 获取所有 Worker 的总平均速度
     pub fn get_total_avg_speed(&self) -> Option<DownloadSpeed> {
-        let mut total: u64 = 0;
-        let mut has_any = false;
-
-        for (_, stats) in self.stats_map.iter() {
-            if let Some(speed) = stats.get_avg_speed() {
-                total += speed.as_u64();
-                has_any = true;
-            }
-        }
-
-        if has_any {
-            Some(DownloadSpeed::from_raw(total))
-        } else {
-            None
-        }
+        self.stats_map
+            .values()
+            .filter_map(|s| s.get_avg_speed().map(|v| v.as_u64()))
+            .reduce(|a, b| a + b)
+            .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取所有 Worker 的总实时加速度
-    pub fn get_total_instant_acceleration(&self) -> Option<DownloadAcceleration> {
-        let mut total: i64 = 0;
+    /// 获取所有 Worker 的聚合速度统计
+    ///
+    /// 单次遍历聚合所有速度数据，避免多次遍历 map
+    pub fn get_total_speed_stats(&self) -> Option<SpeedStats> {
+        let mut avg_speed: u64 = 0;
+        let mut instant_speed: u64 = 0;
+        let mut window_avg_speed: u64 = 0;
         let mut has_any = false;
 
-        for (_, stats) in self.stats_map.iter() {
-            if let Some(accel) = stats.get_instant_acceleration() {
-                total += accel.as_i64();
+        for stats in self.stats_map.values() {
+            if let Some(speed_stats) = stats.get_speed_stats() {
                 has_any = true;
+                if let Some(s) = speed_stats.avg_speed {
+                    avg_speed += s.as_u64();
+                }
+                if let Some(s) = speed_stats.instant_speed {
+                    instant_speed += s.as_u64();
+                }
+                if let Some(s) = speed_stats.window_avg_speed {
+                    window_avg_speed += s.as_u64();
+                }
             }
         }
 
         if has_any {
-            Some(DownloadAcceleration::from_raw(total))
+            Some(SpeedStats {
+                current_chunk_size: 0, // 聚合统计不使用此字段
+                avg_speed: if avg_speed > 0 { Some(DownloadSpeed::from_raw(avg_speed)) } else { None },
+                instant_speed: if instant_speed > 0 { Some(DownloadSpeed::from_raw(instant_speed)) } else { None },
+                window_avg_speed: if window_avg_speed > 0 { Some(DownloadSpeed::from_raw(window_avg_speed)) } else { None },
+            })
         } else {
             None
         }
