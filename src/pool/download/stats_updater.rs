@@ -1,6 +1,6 @@
 //! Stats Updater 辅助协程
 //!
-//! 负责维护 `SmrSwap<WorkerStats>` 的更新，从主下载协程接收消息并更新统计数据。
+//! 负责维护统计数据的更新，从主下载协程接收消息并更新统计数据。
 //!
 //! # 设计说明
 //!
@@ -12,10 +12,18 @@
 //! 这样可以将统计更新的开销从热路径中移除，提高下载性能。
 //!
 //! 统计更新通过 broadcast channel 广播 `ExecutorBroadcast` 消息到所有订阅者。
+//!
+//! # chunk_size 维护
+//!
+//! `current_chunk_size` 由 `Arc<AtomicU64>` 维护，Executor 通过原子操作读取。
+//! 当 `ChunkSampled` 消息到达时，使用 `ChunkStrategy` 计算新的 chunk size 并更新。
 
-use crate::utils::stats::{SpeedStats, WorkerStats};
+use crate::utils::chunk_strategy::ChunkStrategy;
+use crate::utils::stats::{SpeedStats, WorkerStatsActive};
 use log::debug;
 use net_bytes::DownloadSpeed;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
@@ -67,15 +75,12 @@ impl ExecutorStats {
     }
 
     /// 标记 Executor 开始运行
-    pub(crate) fn start_running(&mut self, current_chunk_size: u64) {
+    /// 
+    /// 只设置运行开始时间，`current_stats` 会在首次采样成功时更新为 `Running`
+    pub(crate) fn start_running(&mut self) {
         if self.run_start_time.is_none() {
             self.run_start_time = Some(Instant::now());
         }
-        // 初始化为运行状态，但还没有速度数据
-        self.current_stats = ExecutorCurrentStats::Running(SpeedStats {
-            current_chunk_size,
-            ..SpeedStats::empty()
-        });
     }
 
     /// 标记 Executor 停止运行
@@ -87,16 +92,12 @@ impl ExecutorStats {
         self.current_stats = ExecutorCurrentStats::Stopped;
     }
 
-    /// 更新统计数据（从 WorkerStats 同步）
-    /// 
-    /// 注意：written_bytes 由 BytesWritten 消息单独管理，这里不覆盖
-    pub(crate) fn update_from_worker_stats(&mut self, worker_stats: &WorkerStats) {
+    /// 更新统计数据（从 WorkerStatsActive 同步）
+    pub(crate) fn update_from_worker_stats(&mut self, current_chunk_size: u64, worker_stats: &WorkerStatsActive) {
         self.downloaded_bytes = worker_stats.get_total_bytes();
-        // written_bytes 不从 WorkerStats 同步，由 add_written_bytes 单独累加
         
-        if matches!(self.current_stats, ExecutorCurrentStats::Running(_)) {
-            self.current_stats = ExecutorCurrentStats::Running(worker_stats.get_speed_stats());
-        }
+        // 激活状态的 WorkerStats 保证速度数据有效
+        self.current_stats = ExecutorCurrentStats::Running(worker_stats.get_speed_stats(current_chunk_size));
     }
 
     /// 添加已写入的字节数
@@ -115,7 +116,7 @@ impl ExecutorStats {
     /// 获取实时速度
     pub fn get_instant_speed(&self) -> Option<DownloadSpeed> {
         match &self.current_stats {
-            ExecutorCurrentStats::Running(stats) => stats.instant_speed,
+            ExecutorCurrentStats::Running(stats) => Some(stats.instant_speed),
             ExecutorCurrentStats::Stopped => None,
         }
     }
@@ -123,7 +124,7 @@ impl ExecutorStats {
     /// 获取窗口平均速度
     pub fn get_window_avg_speed(&self) -> Option<DownloadSpeed> {
         match &self.current_stats {
-            ExecutorCurrentStats::Running(stats) => stats.window_avg_speed,
+            ExecutorCurrentStats::Running(stats) => Some(stats.window_avg_speed),
             ExecutorCurrentStats::Stopped => None,
         }
     }
@@ -131,7 +132,7 @@ impl ExecutorStats {
     /// 获取平均速度
     pub fn get_avg_speed(&self) -> Option<DownloadSpeed> {
         match &self.current_stats {
-            ExecutorCurrentStats::Running(stats) => stats.avg_speed,
+            ExecutorCurrentStats::Running(stats) => Some(stats.avg_speed),
             ExecutorCurrentStats::Stopped => None,
         }
     }
@@ -141,11 +142,9 @@ impl ExecutorStats {
 #[derive(Debug, Clone)]
 pub(crate) enum StatsMessage {
     /// 任务开始
-    TaskStarted{
-        initial_chunk_size: u64
-    },
-    /// Chunk 采样成功，包含当前的 WorkerStats 快照
-    ChunkSampled(WorkerStats),
+    TaskStarted,
+    /// Chunk 采样成功，包含激活状态的 WorkerStats 快照
+    ChunkSampled(WorkerStatsActive),
     /// 成功写入磁盘的字节数
     BytesWritten(u64),
     /// 任务结束
@@ -246,25 +245,33 @@ impl Default for StatsUpdaterConfig {
 
 /// Stats Updater 句柄
 ///
-/// 用于向辅助协程发送消息
+/// 用于向辅助协程发送消息，并提供 `current_chunk_size` 的读取接口
 #[derive(Clone)]
 pub(crate) struct StatsUpdaterHandle {
     tx: mpsc::Sender<StatsMessage>,
+    /// chunk size 读取器（通过 Arc<AtomicU64> 实现无锁读取）
+    chunk_size: Arc<AtomicU64>,
 }
 
 impl StatsUpdaterHandle {
+    /// 读取当前 chunk size
+    ///
+    /// 通过 `AtomicU64` 无锁读取
+    #[inline]
+    pub(crate) fn read_chunk_size(&self) -> u64 {
+        self.chunk_size.load(Ordering::Relaxed)
+    }
+
     /// 发送任务开始信号
     #[inline]
-    pub(crate) fn send_task_started(&self, initial_chunk_size: u64) {
+    pub(crate) fn send_task_started(&self) {
         // 使用 try_send 避免阻塞，如果通道满了就跳过
-        let _ = self.tx.try_send(StatsMessage::TaskStarted {
-            initial_chunk_size
-        });
+        let _ = self.tx.try_send(StatsMessage::TaskStarted);
     }
 
     /// 发送采样成功信号
     #[inline]
-    pub(crate) fn send_chunk_sampled(&self, stats: WorkerStats) {
+    pub(crate) fn send_chunk_sampled(&self, stats: WorkerStatsActive) {
         // 使用 try_send 避免阻塞，如果通道满了就跳过
         let _ = self.tx.try_send(StatsMessage::ChunkSampled(stats));
     }
@@ -293,9 +300,13 @@ impl StatsUpdaterHandle {
 
 /// Stats Updater 辅助协程
 ///
-/// 持有 `SmrSwap<WorkerStats>` 并根据接收到的消息实时更新统计数据。
+/// 根据接收到的消息实时更新统计数据。
 /// 内部维护 `ExecutorStats` 用于记录总运行时长和总下载字节数。
 /// 通过 broadcast channel 广播 `ExecutorStats` 更新和关闭信号。
+///
+/// # chunk_size 维护
+///
+/// 使用 `Arc<AtomicU64>` 维护 `current_chunk_size`，Executor 通过原子操作读取。
 pub(crate) struct StatsUpdater {
     /// Worker ID（用于日志）
     worker_id: u64,
@@ -305,6 +316,10 @@ pub(crate) struct StatsUpdater {
     rx: mpsc::Receiver<StatsMessage>,
     /// Worker 广播器（封装外部和本地广播）
     broadcaster: WorkerBroadcaster,
+    /// 分块策略（用于计算 chunk size）
+    chunk_strategy: Box<dyn ChunkStrategy + Send>,
+    /// 当前 chunk size（Arc<AtomicU64> 维护）
+    chunk_size: Arc<AtomicU64>,
 }
 
 impl StatsUpdater {
@@ -314,6 +329,8 @@ impl StatsUpdater {
     ///
     /// - `worker_id`: Worker ID
     /// - `broadcaster`: Worker 广播器，用于发送 ExecutorStats 更新和关闭信号
+    /// - `chunk_strategy`: 分块策略，用于计算 chunk size
+    /// - `initial_chunk_size`: 初始 chunk size
     /// - `config`: 配置（可选，使用默认配置）
     ///
     /// # Returns
@@ -322,19 +339,26 @@ impl StatsUpdater {
     pub(crate) fn new(
         worker_id: u64,
         broadcaster: WorkerBroadcaster,
+        chunk_strategy: Box<dyn ChunkStrategy + Send>,
+        initial_chunk_size: u64,
         config: Option<StatsUpdaterConfig>,
     ) -> (Self, StatsUpdaterHandle) {
         let config = config.unwrap_or_default();
         let (tx, rx) = mpsc::channel(config.channel_capacity);
+
+        // 创建 Arc<AtomicU64> 用于维护 chunk_size
+        let chunk_size = Arc::new(AtomicU64::new(initial_chunk_size));
 
         let updater = Self {
             worker_id,
             executor_stats: ExecutorStats::new(),
             rx,
             broadcaster,
+            chunk_strategy,
+            chunk_size: chunk_size.clone(),
         };
 
-        let handle = StatsUpdaterHandle { tx };
+        let handle = StatsUpdaterHandle { tx, chunk_size };
 
         (updater, handle)
     }
@@ -347,8 +371,8 @@ impl StatsUpdater {
 
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                StatsMessage::TaskStarted{ initial_chunk_size } => {
-                    self.handle_task_started(initial_chunk_size);
+                StatsMessage::TaskStarted => {
+                    self.handle_task_started();
                 }
                 StatsMessage::ChunkSampled(worker_stats) => {
                     self.handle_chunk_sampled(worker_stats);
@@ -369,21 +393,41 @@ impl StatsUpdater {
     }
 
     /// 处理任务开始
-    fn handle_task_started(&mut self, initial_chunk_size: u64) {
+    fn handle_task_started(&mut self) {
         debug!("Worker #{} 任务开始", self.worker_id);
         
         // 更新 ExecutorStats：标记开始运行
-        self.executor_stats.start_running(initial_chunk_size);
+        self.executor_stats.start_running();
         
         // 广播到订阅者
         self.broadcast_stats();
     }
 
     /// 处理采样成功
-    fn handle_chunk_sampled(&mut self, worker_stats: WorkerStats) {
-        // 更新 ExecutorStats：同步速度数据
-        self.executor_stats.update_from_worker_stats(&worker_stats);
-        
+    fn handle_chunk_sampled(&mut self, worker_stats: WorkerStatsActive) {
+        let current_chunk_size = self.chunk_size.load(Ordering::Relaxed);
+        // 更新 ExecutorStats：同步速度数据（WorkerStatsActive 保证有效）
+        self.executor_stats.update_from_worker_stats(current_chunk_size, &worker_stats);
+
+        // 使用 ChunkStrategy 计算新的 chunk size
+        let current_chunk_size = self.chunk_size.load(Ordering::Relaxed);
+        let instant_speed = worker_stats.get_instant_speed();
+        let window_avg_speed = worker_stats.get_window_avg_speed();
+        let new_chunk_size = self.chunk_strategy.calculate_chunk_size(
+            current_chunk_size,
+            instant_speed,
+            window_avg_speed,
+        );
+
+        // 更新 AtomicU64 中的 chunk_size
+        if new_chunk_size != current_chunk_size {
+            self.chunk_size.store(new_chunk_size, Ordering::Relaxed);
+            debug!(
+                "Worker #{} chunk_size 更新: {} -> {}",
+                self.worker_id, current_chunk_size, new_chunk_size
+            );
+        }
+
         // 广播到订阅者
         self.broadcast_stats();
     }

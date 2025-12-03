@@ -160,15 +160,9 @@ fn compute_summary(stats_map: &FxHashMap<u64, ExecutorStats>) -> DownloadSummary
 
         // 速度统计只从运行中的 Executor 获取
         if let Some(speed_stats) = stats.get_speed_stats() {
-            if let Some(s) = speed_stats.avg_speed {
-                avg_speed += s.as_u64();
-            }
-            if let Some(s) = speed_stats.instant_speed {
-                instant_speed += s.as_u64();
-            }
-            if let Some(s) = speed_stats.window_avg_speed {
-                window_avg_speed += s.as_u64();
-            }
+            avg_speed += speed_stats.avg_speed.as_u64();
+            instant_speed += speed_stats.instant_speed.as_u64();
+            window_avg_speed += speed_stats.window_avg_speed.as_u64();
         }
     }
 

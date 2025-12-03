@@ -279,6 +279,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::broadcast;
     use crate::pool::download::stats_updater::{StatsUpdater, WorkerBroadcaster};
+    use crate::utils::chunk_strategy::SpeedBasedChunkStrategy;
 
     #[tokio::test]
     async fn test_file_writer_shutdown() {
@@ -289,7 +290,22 @@ mod tests {
         // 创建 stats updater
         let (broadcast_tx, _) = broadcast::channel(16);
         let broadcaster = WorkerBroadcaster::new(0, broadcast_tx, 16);
-        let (_stats_updater, stats_handle) = StatsUpdater::new(0, broadcaster, None);
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::new(
+            1024 * 1024,      // min: 1 MB
+            16 * 1024 * 1024, // max: 16 MB
+            2.0,              // expected duration: 2s
+            0.3,              // smoothing factor
+            0.7,              // instant speed weight
+            0.3,              // avg speed weight
+        ));
+        let initial_chunk_size = 4 * 1024 * 1024; // 4 MB
+        let (_stats_updater, stats_handle) = StatsUpdater::new(
+            0,
+            broadcaster,
+            chunk_strategy,
+            initial_chunk_size,
+            None,
+        );
 
         // 创建 file writer
         let (file_writer, _failure_rx) = FileWriter::new(0, writer, stats_handle, None);

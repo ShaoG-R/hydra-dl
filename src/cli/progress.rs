@@ -194,12 +194,10 @@ impl ProgressManager {
                             let msg = match &stats.current_stats {
                                 ExecutorCurrentStats::Running(speed_stats) => {
                                     let speed = speed_stats.instant_speed
-                                        .map(|s| s.to_formatted(self.size_standard).to_string())
-                                        .unwrap_or_default();
+                                        .to_formatted(self.size_standard).to_string();
                                     format!(
-                                        "{}, 分块: {} {}",
+                                        "{} {}",
                                         format_bytes(stats.written_bytes),
-                                        format_bytes(speed_stats.current_chunk_size),
                                         speed
                                     )
                                 }
@@ -256,8 +254,7 @@ impl ProgressManager {
                             let avg_speed_str = match &stats.current_stats {
                                 ExecutorCurrentStats::Running(speed_stats) => {
                                     speed_stats.avg_speed
-                                        .map(|s| s.to_formatted(self.size_standard).to_string())
-                                        .unwrap_or("N/A".to_string())
+                                        .to_formatted(self.size_standard).to_string()
                                 }
                                 ExecutorCurrentStats::Stopped => "N/A".to_string(),
                             };

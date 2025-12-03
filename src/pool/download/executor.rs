@@ -17,40 +17,41 @@ pub(crate) use file_writer::FileWriter;
 use super::stats_updater::StatsUpdaterHandle;
 use crate::utils::writer::MmapWriter;
 use crate::utils::{
-    chunk_strategy::ChunkStrategy,
     fetch::{ChunkRecorder, FetchRangeResult, RangeFetcher},
     io_traits::HttpClient,
-    stats::WorkerStats,
+    stats::WorkerStatsRecording,
 };
 use crate::utils::cancel_channel::CancelReceiver;
 use log::{debug, error, info, warn};
-use net_bytes::{FormattedValue, SizeStandard};
 use ranged_mmap::{AllocatedRange, SplitDownResult};
 use tokio::sync::oneshot;
 
 
 /// 下载 Chunk 记录器
 ///
-/// 实现 `ChunkRecorder` trait，封装 `WorkerStats` 和 `StatsUpdaterHandle`
+/// 实现 `ChunkRecorder` trait，封装 `WorkerStatsRecording` 和 `StatsUpdaterHandle`。
+/// chunk_size 计算已移至 StatsUpdater，此处仅负责采样和发送。
 pub(crate) struct DownloadChunkRecorder<'a> {
-    stats: &'a mut WorkerStats,
+    stats: &'a mut WorkerStatsRecording,
     stats_handle: &'a StatsUpdaterHandle,
 }
 
 impl<'a> DownloadChunkRecorder<'a> {
     /// 创建新的下载 Chunk 记录器
-    pub(crate) fn new(stats: &'a mut WorkerStats, stats_handle: &'a StatsUpdaterHandle) -> Self {
-        Self { stats, stats_handle }
+    pub(crate) fn new(stats: &'a mut WorkerStatsRecording, stats_handle: &'a StatsUpdaterHandle) -> Self {
+        Self { 
+            stats, 
+            stats_handle,
+        }
     }
 }
 
 impl ChunkRecorder for DownloadChunkRecorder<'_> {
     fn record_chunk(&mut self, bytes: u64) {
-        let sampled = self.stats.record_chunk(bytes);
-        
-        // 如果采样成功，发送统计数据到辅助协程
-        if sampled {
-            self.stats_handle.send_chunk_sampled(self.stats.clone());
+        // 采样成功时返回 WorkerStatsActive
+        if let Some(active) = self.stats.record_chunk(bytes) {
+            // 发送统计数据到辅助协程（chunk_size 计算由 StatsUpdater 处理）
+            self.stats_handle.send_chunk_sampled(active);
         }
     }
 }
@@ -84,11 +85,9 @@ pub(crate) enum ExecutorResult {
 
 /// 下载 Worker 的上下文
 ///
-/// 包含每个 worker 独立的分块策略和下载 URL。
-/// 只由主下载协程持有，其他辅助协程不需要访问。
+/// 包含任务分配器和下载 URL。
+/// 分块策略已移至 StatsUpdater，通过 SmrSwap 维护 chunk_size。
 pub(crate) struct DownloadWorkerContext {
-    /// 该 worker 的独立分块策略
-    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send + Sync>,
     /// 任务分配器（封装了 allocator 和重试调度）
     pub(crate) task_allocator: TaskAllocator,
     /// 下载 URL
@@ -102,7 +101,7 @@ pub(crate) struct ExecutorInput {
     /// Worker 上下文
     pub context: DownloadWorkerContext,
     /// Worker 统计数据
-    pub stats: WorkerStats,
+    pub stats: WorkerStatsRecording,
     /// Stats Updater 句柄
     pub stats_handle: StatsUpdaterHandle,
     /// 结果发送通道
@@ -118,7 +117,7 @@ pub(crate) struct ExecutorInput {
 /// 封装 `execute_single_task` 所需的运行时引用
 struct ExecutorRuntime<'a> {
     context: &'a mut DownloadWorkerContext,
-    stats: &'a mut WorkerStats,
+    stats: &'a mut WorkerStatsRecording,
     stats_handle: &'a StatsUpdaterHandle,
     file_writer: &'a FileWriter,
 }
@@ -164,20 +163,17 @@ pub(crate) struct DownloadTaskExecutor<C> {
     client: C,
     /// 文件写入器
     writer: MmapWriter,
-    /// 文件大小标准
-    size_standard: SizeStandard,
     /// 累计的失败 ranges
     failed_ranges: Vec<(AllocatedRange, String)>,
 }
 
 impl<C> DownloadTaskExecutor<C> {
     /// 创建新的下载任务执行器
-    pub(crate) fn new(worker_id: u64, client: C, writer: MmapWriter, size_standard: SizeStandard) -> Self {
+    pub(crate) fn new(worker_id: u64, client: C, writer: MmapWriter) -> Self {
         Self {
             worker_id,
             client,
             writer,
-            size_standard,
             failed_ranges: Vec::new(),
         }
     }
@@ -211,7 +207,8 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
         loop {
             // 通过 TaskAllocator 统一获取下一个任务
-            let chunk_size = stats.get_current_chunk_size();
+            // chunk_size 从 StatsUpdaterHandle 读取（由 SmrSwap 维护）
+            let chunk_size = stats_handle.read_chunk_size();
 
             let action = match context.task_allocator.next_task(chunk_size) {
                 AllocationResult::Task(task) => {
@@ -350,7 +347,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
         // 任务开始，发送信号到辅助协程
         runtime.stats.clear_samples();
-        runtime.stats_handle.send_task_started(range.len());
+        runtime.stats_handle.send_task_started();
 
         // 创建 Chunk 记录器
         let mut recorder = DownloadChunkRecorder::new(runtime.stats, runtime.stats_handle);
@@ -369,9 +366,6 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     warn!("Worker #{} 发送写入请求失败: {:?}", self.worker_id, e);
                     return TaskResult::Success;
                 }
-
-                // 根据当前速度更新分块大小
-                self.update_chunk_size(runtime);
 
                 TaskResult::Success
             }
@@ -482,35 +476,6 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         RangeFetcher::new(&self.client, url, fetch_range, recorder)
             .fetch_with_cancel(cancel_rx)
             .await
-    }
-
-
-    /// 根据当前速度更新分块大小
-    fn update_chunk_size(&self, runtime: &mut ExecutorRuntime<'_>) {
-        let instant_speed = runtime.stats.get_instant_speed();
-        let window_avg_speed = runtime.stats.get_window_avg_speed();
-
-        if let (Some(instant_speed), Some(window_avg_speed)) = (instant_speed, window_avg_speed) {
-            let current_chunk_size = runtime.stats.get_current_chunk_size();
-            let new_chunk_size = runtime.context.chunk_strategy.calculate_chunk_size(
-                current_chunk_size,
-                instant_speed,
-                window_avg_speed,
-            );
-
-            runtime.stats.set_current_chunk_size(new_chunk_size);
-            
-            // 发送更新后的 stats 到辅助协程
-            runtime.stats_handle.send_chunk_sampled(runtime.stats.clone());
-
-            debug!(
-                "Updated chunk size: {} -> {} (speed: {}, avg: {})",
-                current_chunk_size,
-                new_chunk_size,
-                FormattedValue::new(instant_speed, self.size_standard),
-                FormattedValue::new(window_avg_speed, self.size_standard)
-            );
-        }
     }
 }
 

@@ -293,30 +293,22 @@ impl LocalHealthChecker {
     /// 检查绝对速度是否低于阈值
     ///
     /// 返回 true 表示速度异常（低于阈值）
-    fn check_absolute_speed(&self, instant_speed: Option<DownloadSpeed>) -> bool {
+    fn check_absolute_speed(&self, instant_speed: DownloadSpeed) -> bool {
         let threshold = match self.config.absolute_threshold {
             Some(t) => t.get(),
             None => return false, // 未配置阈值，不检查
         };
 
-        match instant_speed {
-            Some(speed) => {
-                let is_slow = speed.as_u64() < threshold;
-                if is_slow {
-                    debug!(
-                        "Worker #{} 速度 {} 低于阈值 {}",
-                        self.worker_id,
-                        speed.to_formatted(self.config.size_standard),
-                        DownloadSpeed::from_raw(threshold).to_formatted(self.config.size_standard)
-                    );
-                }
-                is_slow
-            }
-            None => {
-                // 没有速度数据，视为正常（刚开始下载）
-                false
-            }
+        let is_slow = instant_speed.as_u64() < threshold;
+        if is_slow {
+            debug!(
+                "Worker #{} 速度 {} 低于阈值 {}",
+                self.worker_id,
+                instant_speed.to_formatted(self.config.size_standard),
+                DownloadSpeed::from_raw(threshold).to_formatted(self.config.size_standard)
+            );
         }
+        is_slow
     }
 }
 

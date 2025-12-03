@@ -32,10 +32,9 @@ use super::common::{WorkerFactory, WorkerPool};
 pub(crate) use executor::{DownloadTaskExecutor, DownloadWorkerContext, ExecutorInput, ExecutorResult};
 use executor::task_allocator::TaskAllocator;
 use crate::utils::{
-    cancel_channel::CancelHandle, chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy}, io_traits::HttpClient, stats::{WorkerStats}, writer::MmapWriter
+    cancel_channel::CancelHandle, chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy}, io_traits::HttpClient, stats::{WorkerStatsRecording}, writer::MmapWriter
 };
 use log::info;
-use net_bytes::{SizeStandard};
 use ranged_mmap::allocator::concurrent::Allocator as ConcurrentAllocator;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -49,10 +48,14 @@ use std::sync::Arc;
 ///
 /// 包含 spawn_worker 所需的所有下载特定数据
 pub(crate) struct DownloadWorkerInput {
-    /// 上下文（包含 allocator、url、分块策略等）
+    /// 上下文（包含 task_allocator、url）
     pub(crate) context: DownloadWorkerContext,
     /// 统计数据
-    pub(crate) stats: WorkerStats,
+    pub(crate) stats: WorkerStatsRecording,
+    /// 分块策略（传递给 StatsUpdater）
+    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send>,
+    /// 初始 chunk size
+    pub(crate) initial_chunk_size: u64,
     /// 结果发送通道（oneshot，仅在 worker 完成时发送一次）
     pub(crate) result_tx: tokio::sync::oneshot::Sender<ExecutorResult>,
     /// 取消信号接收器（用于健康检查触发的重试）
@@ -84,8 +87,6 @@ pub(crate) struct DownloadWorkerFactory<C> {
     client: C,
     /// 共享的文件写入器
     writer: MmapWriter,
-    /// 文件大小标准
-    size_standard: SizeStandard,
 }
 
 impl<C: Clone> DownloadWorkerFactory<C> {
@@ -93,12 +94,10 @@ impl<C: Clone> DownloadWorkerFactory<C> {
     pub(crate) fn new(
         client: C,
         writer: MmapWriter,
-        size_standard: SizeStandard,
     ) -> Self {
         Self {
             client,
             writer,
-            size_standard,
         }
     }
 }
@@ -119,6 +118,8 @@ where
         let DownloadWorkerInput {
             context,
             stats,
+            chunk_strategy,
+            initial_chunk_size,
             result_tx,
             cancel_rx,
             cancel_tx,
@@ -131,7 +132,14 @@ where
         let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx, 16);
 
         // --- 协程 1: Stats Updater 辅助协程 ---
-        let (stats_updater, stats_handle) = StatsUpdater::new(worker_id, broadcaster.clone(), None);
+        // chunk_strategy 和 initial_chunk_size 传递给 StatsUpdater
+        let (stats_updater, stats_handle) = StatsUpdater::new(
+            worker_id,
+            broadcaster.clone(),
+            chunk_strategy,
+            initial_chunk_size,
+            None,
+        );
         let stats_updater_handle = tokio::spawn(stats_updater.run());
 
         // --- 协程 2: 本地健康检查协程 ---
@@ -148,7 +156,6 @@ where
             worker_id,
             self.client.clone(),
             self.writer.clone(),
-            self.size_standard,
         );
 
         // --- 协程 0: 主下载循环（worker 自主从 allocator 分配任务） ---
@@ -268,7 +275,6 @@ where
         let factory = DownloadWorkerFactory::new(
             client,
             writer,
-            config.speed().size_standard(),
         );
 
         // 为每个 worker 创建输入参数和句柄
@@ -319,20 +325,21 @@ where
         broadcast_tx: broadcast::Sender<TaggedBroadcast>,
     ) -> (DownloadWorkerInput, DownloadWorkerHandle, tokio::sync::oneshot::Receiver<ExecutorResult>) {
         // 创建统计数据
-        let mut stats = WorkerStats::from_config(config.speed());
-        stats.set_current_chunk_size(config.chunk().initial_size());
+        let stats = WorkerStatsRecording::from_config(config.speed());
 
         // 创建任务分配器
         let task_allocator = TaskAllocator::new(allocator, config.retry().clone());
 
-        // 创建上下文
-        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(config))
-            as Box<dyn ChunkStrategy + Send + Sync>;
+        // 创建上下文（chunk_strategy 已移至 StatsUpdater）
         let context = DownloadWorkerContext {
-            chunk_strategy,
             task_allocator,
             url,
         };
+
+        // 创建分块策略（传递给 StatsUpdater）
+        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::from_config(config))
+            as Box<dyn ChunkStrategy + Send>;
+        let initial_chunk_size = config.chunk().initial_size();
 
         // 创建取消通道（用于健康检查触发重试）
         let (cancel_tx, cancel_rx) = cancel_channel();
@@ -346,6 +353,8 @@ where
         let input = DownloadWorkerInput {
             context,
             stats,
+            chunk_strategy,
+            initial_chunk_size,
             result_tx,
             cancel_rx,
             cancel_tx: cancel_tx.clone(),
