@@ -17,7 +17,7 @@
 //! 4. 收到 Stats 更新时检查绝对速度阈值
 
 use super::stats_updater::{ExecutorBroadcast, ExecutorCurrentStats, WorkerBroadcaster};
-use crate::utils::cancel_channel::CancelSender;
+use crate::utils::cancel_channel::{CancelHandle, CancelSender};
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use std::num::NonZeroU64;
@@ -132,6 +132,8 @@ pub(crate) struct LocalHealthChecker {
     broadcast_rx: broadcast::Receiver<ExecutorBroadcast>,
     /// 取消信号发送器
     cancel_tx: CancelSender,
+    /// 当前任务的取消句柄（在任务开始时获取）
+    cancel_handle: Option<CancelHandle>,
     /// 异常追踪器
     anomaly_tracker: AnomalyTracker,
     /// 是否有任务在运行
@@ -161,6 +163,7 @@ impl LocalHealthChecker {
             config,
             broadcast_rx,
             cancel_tx,
+            cancel_handle: None,
             anomaly_tracker,
             task_running: false,
         }
@@ -216,10 +219,11 @@ impl LocalHealthChecker {
             self.worker_id, self.config.stale_timeout
         );
         
-        // 发送取消信号
-        let handle = self.cancel_tx.get_handle();
-        if handle.cancel() {
-            debug!("Worker #{} 取消信号已发送 (超时)", self.worker_id);
+        // 使用之前获取的句柄发送取消信号
+        if let Some(handle) = self.cancel_handle.take() {
+            if handle.cancel() {
+                debug!("Worker #{} 取消信号已发送 (超时)", self.worker_id);
+            }
         }
         
         // 重置状态
@@ -247,7 +251,11 @@ impl LocalHealthChecker {
     fn handle_stats_update(&mut self, stats: &super::stats_updater::ExecutorStats) {
         match &stats.current_stats {
             ExecutorCurrentStats::Running(stats) => {
-                self.task_running = true;
+                // 任务刚开始时获取取消句柄
+                if !self.task_running {
+                    self.cancel_handle = Some(self.cancel_tx.get_handle());
+                    self.task_running = true;
+                }
                 
                 // 检查绝对速度阈值
                 let is_anomaly = self.check_absolute_speed(stats.instant_speed);
@@ -261,19 +269,22 @@ impl LocalHealthChecker {
                         self.worker_id, anomaly_count, self.config.history_size
                     );
                     
-                    // 发送取消信号
-                    let handle = self.cancel_tx.get_handle();
-                    if handle.cancel() {
-                        debug!("Worker #{} 取消信号已发送 (速度异常)", self.worker_id);
+                    // 使用之前获取的句柄发送取消信号
+                    if let Some(handle) = self.cancel_handle.take() {
+                        if handle.cancel() {
+                            debug!("Worker #{} 取消信号已发送 (速度异常)", self.worker_id);
+                        }
                     }
                     
-                    // 重置追踪器
+                    // 重置状态
+                    self.task_running = false;
                     self.anomaly_tracker.reset();
                 }
             }
             ExecutorCurrentStats::Stopped => {
                 // 任务停止，重置状态
                 self.task_running = false;
+                self.cancel_handle = None;
                 self.anomaly_tracker.reset();
             }
         }
