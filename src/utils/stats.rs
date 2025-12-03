@@ -4,6 +4,7 @@ use net_bytes::DownloadSpeed;
 /// 速度统计快照
 ///
 /// 封装所有速度相关的统计数据，一次性获取避免多次遍历
+/// 注意：进度相关的 written_bytes 由 ExecutorStats 单独管理
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpeedStats {
     /// 当前分块大小 (bytes)
@@ -24,36 +25,13 @@ impl SpeedStats {
 }
 
 
-/// 下载速度统计
+/// Worker 速度统计
 ///
-/// 线程安全的统计结构，在下载过程中被所有 worker 共享并实时更新
-/// 使用完全无锁的原子操作，实现高性能并发
-///
-/// # 支持两种速度计算
-///
-/// 1. **平均速度**：从开始到现在的总体平均速度
-///    - 通过 `get_speed()` 获取
-///    - 计算公式：总下载字节数 / 总耗时
-///
-/// 2. **实时速度**：基于环形缓冲区和线性回归的速度
-///    - 通过 `get_instant_speed()` 和 `get_window_avg_speed()` 获取
-///    - 采用环形缓冲区存储最近的采样点，使用线性回归计算速度
-///    - 时间窗口可配置（默认瞬时 1 秒，窗口平均 5 秒）
-///
-/// # 性能优化
-///
-/// - 所有字段使用原子操作，完全无锁并发
-/// - `start_time` 委托给 SpeedCalculator 管理
-/// - 速度计算器使用环形缓冲区和原子操作，无需 Mutex
-/// - 支持父子统计聚合，子统计自动更新父级
-/// - 自动采样：每 100ms 自动记录一次采样点
-///
-/// # 线程安全
-///
-/// 所有方法都是线程安全的，可以被多个 worker 并发调用
+/// 专注于速度计算，跟踪 total_bytes（包含重试字节）用于速度计算。
+/// 进度相关的 written_bytes 由 ExecutorStats 单独管理。
 #[derive(Clone)]
 pub(crate) struct WorkerStats {
-    /// 总下载字节数
+    /// 总下载字节数（包括重试的重复字节，用于速度计算）
     total_bytes: u64,
     /// 速度计算器（管理瞬时速度和窗口平均速度的采样点）
     speed_calculator: SpeedCalculator,
@@ -165,16 +143,16 @@ impl WorkerStats {
         }
     }
 
-    /// 获取总下载字节数
+    /// 获取总下载字节数（包括重试的重复字节）
     ///
     /// # Returns
     ///
-    /// `(总字节数)`
+    /// 总传输字节数（用于速度计算）
     #[inline]
     pub(crate) fn get_total_bytes(&self) -> u64 {
         self.total_bytes
     }
-
+    
     /// 获取当前分块大小
     ///
     /// # Returns

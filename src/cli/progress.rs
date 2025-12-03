@@ -91,7 +91,7 @@ impl ProgressManager {
             }
 
             DownloadProgress::Progress {
-                bytes_downloaded,
+                written_bytes,
                 total_size,
                 percentage: _,
                 instant_speed,
@@ -100,7 +100,7 @@ impl ProgressManager {
                 ..
             } => {
                 // 更新主进度条
-                self.main_bar.set_position(bytes_downloaded);
+                self.main_bar.set_position(written_bytes);
 
                 // 只在有实时速度时显示速度、加速度和 ETA
                 let (speed_str, eta) = if let Some(instant) = instant_speed {
@@ -121,7 +121,7 @@ impl ProgressManager {
                         .unwrap_or_default();
                     let speed_display = format!("{}{}", speed_display, accel_display);
                     let eta_display = {
-                        let remaining_bytes = total_size.get().saturating_sub(bytes_downloaded);
+                        let remaining_bytes = total_size.get().saturating_sub(written_bytes);
 
                         // 使用加速度改进 ETA 预测
                         let eta_secs = instant_acceleration
@@ -198,7 +198,7 @@ impl ProgressManager {
                                         .unwrap_or_default();
                                     format!(
                                         "{}, 分块: {} {}",
-                                        format_bytes(stats.total_bytes),
+                                        format_bytes(stats.written_bytes),
                                         format_bytes(speed_stats.current_chunk_size),
                                         speed
                                     )
@@ -206,7 +206,7 @@ impl ProgressManager {
                                 ExecutorCurrentStats::Stopped => {
                                     format!(
                                         "{} [已停止]",
-                                        format_bytes(stats.total_bytes),
+                                        format_bytes(stats.written_bytes),
                                     )
                                 }
                             };
@@ -217,15 +217,16 @@ impl ProgressManager {
             }
 
             DownloadProgress::Completed {
-                total_bytes,
+                total_written_bytes,
                 total_time,
                 avg_speed,
                 executor_stats,
+                ..
             } => {
                 // 完成主进度条
                 self.main_bar.finish_with_message(format!(
                     "完成！{} in {}, 平均速度: {}",
-                    format_bytes(total_bytes),
+                    format_bytes(total_written_bytes),
                     format_duration(total_time),
                     avg_speed
                         .map(|s| s.to_formatted(self.size_standard).to_string())
@@ -262,7 +263,7 @@ impl ProgressManager {
                             };
                             worker_bar.finish_with_message(format!(
                                 "完成：{}, 平均: {}",
-                                format_bytes(stats.total_bytes),
+                                format_bytes(stats.written_bytes),
                                 avg_speed_str
                             ));
                         }

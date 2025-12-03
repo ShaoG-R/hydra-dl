@@ -303,11 +303,15 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         match fetch_result {
             Ok(FetchRangeResult::Complete(data)) => {
                 // 下载成功，写入文件
+                let written_bytes = range.len();
                 if let Err(e) = self.writer.write_range(range.clone(), data.as_ref()) {
                     let error_msg = format!("写入失败: {:?}", e);
                     error!("Worker #{} {}", worker_id, error_msg);
                     return TaskResult::WriteFailed { range, error: error_msg };
                 }
+
+                // 通知写入成功的字节数
+                stats_handle.send_bytes_written(written_bytes);
 
                 // 根据当前速度更新分块大小
                 self.update_chunk_size(context, stats, stats_handle);
@@ -326,6 +330,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     range,
                     data,
                     bytes_downloaded,
+                    stats_handle,
                 ) {
                     Some(r) => r,
                     None => return TaskResult::Success, // remaining_range不存在，返回成功
@@ -364,6 +369,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         range: AllocatedRange,
         data: bytes::Bytes,
         bytes_downloaded: u64,
+        stats_handle: &StatsUpdaterHandle,
     ) -> Option<AllocatedRange> {
         let (low, remaining) = match range.split_at_align_down(bytes_downloaded) {
             SplitDownResult::Split { low, high } => (Some(low), Some(high)),
@@ -376,11 +382,13 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
         if let Some(low) = low {
             let low_len = low.len() as usize;
-            if let Err(e) = self.writer.write_range(low, &data[0..low_len]) {
+            if let Err(e) = self.writer.write_range(low.clone(), &data[0..low_len]) {
                 error!("Worker #{} 写入部分数据失败: {:?}", worker_id, e);
                 return Some(range);
             }
-            debug!("Worker #{} 成功写入 {} bytes", worker_id, bytes_downloaded);
+            // 通知写入成功的字节数（使用对齐后的实际写入大小）
+            stats_handle.send_bytes_written(low.len());
+            debug!("Worker #{} 成功写入 {} bytes", worker_id, low.len());
         }
 
         remaining

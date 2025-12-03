@@ -38,8 +38,10 @@ pub enum ExecutorCurrentStats {
 pub struct ExecutorStats {
     /// 总运行时长
     pub total_duration: Duration,
-    /// 总下载字节数
-    pub total_bytes: u64,
+    /// 总下载字节数（包括重试的重复字节，用于速度计算）
+    pub downloaded_bytes: u64,
+    /// 已写入磁盘的有效字节数（不包含重试的重复字节，用于进度计算）
+    pub written_bytes: u64,
     /// 当前运行状态统计
     pub current_stats: ExecutorCurrentStats,
     /// 内部：运行开始时间（用于计算总运行时长）
@@ -50,7 +52,8 @@ impl Default for ExecutorStats {
     fn default() -> Self {
         Self {
             total_duration: Duration::ZERO,
-            total_bytes: 0,
+            downloaded_bytes: 0,
+            written_bytes: 0,
             current_stats: ExecutorCurrentStats::Stopped,
             run_start_time: None,
         }
@@ -85,12 +88,20 @@ impl ExecutorStats {
     }
 
     /// 更新统计数据（从 WorkerStats 同步）
+    /// 
+    /// 注意：written_bytes 由 BytesWritten 消息单独管理，这里不覆盖
     pub(crate) fn update_from_worker_stats(&mut self, worker_stats: &WorkerStats) {
-        self.total_bytes = worker_stats.get_total_bytes();
+        self.downloaded_bytes = worker_stats.get_total_bytes();
+        // written_bytes 不从 WorkerStats 同步，由 add_written_bytes 单独累加
         
         if matches!(self.current_stats, ExecutorCurrentStats::Running(_)) {
             self.current_stats = ExecutorCurrentStats::Running(worker_stats.get_speed_stats());
         }
+    }
+
+    /// 添加已写入的字节数
+    pub(crate) fn add_written_bytes(&mut self, bytes: u64) {
+        self.written_bytes += bytes;
     }
 
     /// 获取速度统计（如果正在运行）
@@ -135,6 +146,8 @@ pub(crate) enum StatsMessage {
     },
     /// Chunk 采样成功，包含当前的 WorkerStats 快照
     ChunkSampled(WorkerStats),
+    /// 成功写入磁盘的字节数
+    BytesWritten(u64),
     /// 任务结束
     TaskEnded,
     /// Executor 关闭
@@ -256,6 +269,13 @@ impl StatsUpdaterHandle {
         let _ = self.tx.try_send(StatsMessage::ChunkSampled(stats));
     }
 
+    /// 发送写入成功信号
+    #[inline]
+    pub(crate) fn send_bytes_written(&self, bytes: u64) {
+        // 使用 try_send 避免阻塞，如果通道满了就跳过
+        let _ = self.tx.try_send(StatsMessage::BytesWritten(bytes));
+    }
+
     /// 发送任务结束信号
     #[inline]
     pub(crate) fn send_task_ended(&self) {
@@ -333,6 +353,9 @@ impl StatsUpdater {
                 StatsMessage::ChunkSampled(worker_stats) => {
                     self.handle_chunk_sampled(worker_stats);
                 }
+                StatsMessage::BytesWritten(bytes) => {
+                    self.handle_bytes_written(bytes);
+                }
                 StatsMessage::TaskEnded => {
                     self.handle_task_ended();
                 }
@@ -360,6 +383,15 @@ impl StatsUpdater {
     fn handle_chunk_sampled(&mut self, worker_stats: WorkerStats) {
         // 更新 ExecutorStats：同步速度数据
         self.executor_stats.update_from_worker_stats(&worker_stats);
+        
+        // 广播到订阅者
+        self.broadcast_stats();
+    }
+
+    /// 处理写入成功
+    fn handle_bytes_written(&mut self, bytes: u64) {
+        // 更新 ExecutorStats：累加已写入字节数
+        self.executor_stats.add_written_bytes(bytes);
         
         // 广播到订阅者
         self.broadcast_stats();

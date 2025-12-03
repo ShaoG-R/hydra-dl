@@ -10,7 +10,6 @@
 //! - 提供查询接口获取聚合后的统计数据
 
 use crate::pool::download::{ExecutorBroadcast, ExecutorStats, TaggedBroadcast};
-use crate::utils::stats::SpeedStats;
 use lite_sync::oneshot::lite;
 use log::debug;
 use net_bytes::DownloadSpeed;
@@ -52,6 +51,23 @@ pub struct AggregatedStats {
     pub stats_map: FxHashMap<u64, ExecutorStats>,
 }
 
+/// 下载统计摘要
+///
+/// 单次遍历聚合所有统计数据，用于进度展示
+#[derive(Debug, Clone, Default)]
+pub struct DownloadSummary {
+    /// 已写入磁盘的有效字节数（不包含重试的重复字节，用于进度计算）
+    pub written_bytes: u64,
+    /// 已下载的总字节数（包括重试的重复字节，用于速度计算）
+    pub downloaded_bytes: u64,
+    /// 平均速度（从开始到现在）
+    pub avg_speed: Option<DownloadSpeed>,
+    /// 实时速度（基于短时间窗口）
+    pub instant_speed: Option<DownloadSpeed>,
+    /// 窗口平均速度（基于较长时间窗口）
+    pub window_avg_speed: Option<DownloadSpeed>,
+}
+
 impl AggregatedStats {
     /// 获取指定 Executor 的统计
     pub fn get(&self, worker_id: u64) -> Option<&ExecutorStats> {
@@ -84,11 +100,6 @@ impl AggregatedStats {
             .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取所有 Worker 的总下载字节数
-    pub fn get_total_bytes(&self) -> u64 {
-        self.stats_map.values().map(|s| s.total_bytes).sum()
-    }
-
     /// 获取所有 Worker 的总实时速度
     pub fn get_total_instant_speed(&self) -> Option<DownloadSpeed> {
         self.stats_map
@@ -107,18 +118,23 @@ impl AggregatedStats {
             .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取所有 Worker 的聚合速度统计
+    /// 获取下载统计摘要
     ///
-    /// 单次遍历聚合所有速度数据，避免多次遍历 map
-    pub fn get_total_speed_stats(&self) -> Option<SpeedStats> {
+    /// 单次遍历聚合所有统计数据，避免多次遍历 map
+    pub fn get_summary(&self) -> DownloadSummary {
         let mut avg_speed: u64 = 0;
         let mut instant_speed: u64 = 0;
         let mut window_avg_speed: u64 = 0;
-        let mut has_any = false;
+        let mut written_bytes: u64 = 0;
+        let mut downloaded_bytes: u64 = 0;
 
         for stats in self.stats_map.values() {
+            // 直接从 ExecutorStats 累加（包括已停止的 Executor）
+            written_bytes += stats.written_bytes;
+            downloaded_bytes += stats.downloaded_bytes;
+            
+            // 速度统计只从运行中的 Executor 获取
             if let Some(speed_stats) = stats.get_speed_stats() {
-                has_any = true;
                 if let Some(s) = speed_stats.avg_speed {
                     avg_speed += s.as_u64();
                 }
@@ -131,15 +147,12 @@ impl AggregatedStats {
             }
         }
 
-        if has_any {
-            Some(SpeedStats {
-                current_chunk_size: 0, // 聚合统计不使用此字段
-                avg_speed: if avg_speed > 0 { Some(DownloadSpeed::from_raw(avg_speed)) } else { None },
-                instant_speed: if instant_speed > 0 { Some(DownloadSpeed::from_raw(instant_speed)) } else { None },
-                window_avg_speed: if window_avg_speed > 0 { Some(DownloadSpeed::from_raw(window_avg_speed)) } else { None },
-            })
-        } else {
-            None
+        DownloadSummary {
+            written_bytes,
+            downloaded_bytes,
+            avg_speed: if avg_speed > 0 { Some(DownloadSpeed::from_raw(avg_speed)) } else { None },
+            instant_speed: if instant_speed > 0 { Some(DownloadSpeed::from_raw(instant_speed)) } else { None },
+            window_avg_speed: if window_avg_speed > 0 { Some(DownloadSpeed::from_raw(window_avg_speed)) } else { None },
         }
     }
 }

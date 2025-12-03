@@ -25,8 +25,10 @@ pub enum DownloadProgress {
     },
     /// 下载进度更新（包含总体统计和所有 Executor 的聚合统计）
     Progress {
-        /// 已下载字节数
-        bytes_downloaded: u64,
+        /// 已写入磁盘的有效字节数（不包含重试的重复字节，用于进度计算）
+        written_bytes: u64,
+        /// 已下载的总字节数（包括重试的重复字节，用于速度计算）
+        downloaded_bytes: u64,
         /// 文件总大小（bytes）
         total_size: NonZeroU64,
         /// 下载百分比 (0.0 ~ 100.0)
@@ -44,8 +46,10 @@ pub enum DownloadProgress {
     },
     /// 下载已完成（包含最终的 Executor 聚合统计）
     Completed {
-        /// 总下载字节数
-        total_bytes: u64,
+        /// 已写入磁盘的有效字节数（不包含重试的重复字节）
+        total_written_bytes: u64,
+        /// 总下载字节数（包括重试的重复字节）
+        total_downloaded_bytes: u64,
         /// 总耗时（秒）
         total_time: f64,
         /// 平均速度 (bytes/s)
@@ -222,19 +226,17 @@ impl ProgressReporterActor {
         // 从 aggregated_stats 获取所有 Executor 的统计
         let executor_stats = self.get_aggregated_stats();
 
-        // 从聚合统计获取总体数据
-        let total_bytes = executor_stats.get_total_bytes();
+        // 一次性获取所有统计数据
+        let summary = executor_stats.get_summary();
 
-        // 计算百分比
+        // 计算百分比（基于已写入字节数）
         let percentage = if self.total_size.get() > 0 {
-            (total_bytes as f64 / self.total_size.get() as f64) * 100.0
+            (summary.written_bytes as f64 / self.total_size.get() as f64) * 100.0
         } else {
             0.0
         };
 
-        // 一次性获取所有速度统计，避免多次遍历
-        let speed_stats = executor_stats.get_total_speed_stats();
-        let current_instant_speed = speed_stats.and_then(|s| s.instant_speed);
+        let current_instant_speed = summary.instant_speed;
 
         // 计算实时加速度
         let now = Instant::now();
@@ -247,12 +249,13 @@ impl ProgressReporterActor {
         }
 
         Some(DownloadProgress::Progress {
-            bytes_downloaded: total_bytes,
+            written_bytes: summary.written_bytes,
+            downloaded_bytes: summary.downloaded_bytes,
             total_size: self.total_size,
             percentage,
-            avg_speed: speed_stats.and_then(|s| s.avg_speed),
+            avg_speed: summary.avg_speed,
             instant_speed: current_instant_speed,
-            window_avg_speed: speed_stats.and_then(|s| s.window_avg_speed),
+            window_avg_speed: summary.window_avg_speed,
             instant_acceleration,
             executor_stats,
         })
@@ -286,14 +289,16 @@ impl ProgressReporterActor {
     fn generate_completion_stats(&self) -> DownloadProgress {
         // 从 aggregated_stats 获取所有 Executor 的统计
         let executor_stats = self.get_aggregated_stats();
+        let summary = executor_stats.get_summary();
 
         // 计算总耗时
         let elapsed_secs = self.start_time.elapsed().as_secs_f64();
 
         DownloadProgress::Completed {
-            total_bytes: executor_stats.get_total_bytes(),
+            total_written_bytes: summary.written_bytes,
+            total_downloaded_bytes: summary.downloaded_bytes,
             total_time: elapsed_secs,
-            avg_speed: executor_stats.get_total_avg_speed(),
+            avg_speed: summary.avg_speed,
             executor_stats,
         }
     }
