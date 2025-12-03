@@ -28,25 +28,22 @@ use log::{debug, error, info};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::task::JoinHandle;
 
-/// 全局 Worker ID 计数器
-static GLOBAL_WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Worker 标识符
 ///
 /// 封装两种 ID：
 /// - `slot_id`: DeferredMap 内部分配的 ID，用于槽位管理
-/// - `global_id`: 全局唯一 ID，单调递增，用于日志和外部标识
+/// - `pool_id`: 池内唯一 ID，单调递增，用于日志和外部标识
 ///
 /// # 设计说明
 ///
 /// - `slot_id` 可能被复用（当 Worker 被移除后，其槽位可能分配给新 Worker）
-/// - `global_id` 永不复用，保证全局唯一性
+/// - `pool_id` 在池内永不复用，保证池内唯一性
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkerId {
     /// DeferredMap 槽位 ID（用于内部管理）
     slot_id: u64,
-    /// 全局唯一 ID（单调递增，用于日志和外部标识）
-    global_id: u64,
+    /// 池内唯一 ID（单调递增，用于日志和外部标识）
+    pool_id: u64,
 }
 
 impl WorkerId {
@@ -55,11 +52,9 @@ impl WorkerId {
     /// # Arguments
     ///
     /// - `slot_id`: DeferredMap 分配的槽位 ID
-    ///
-    /// 自动分配下一个全局唯一 ID
-    pub fn new(slot_id: u64) -> Self {
-        let global_id = GLOBAL_WORKER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self { slot_id, global_id }
+    /// - `pool_id`: 池内唯一 ID（由 WorkerPool 分配）
+    pub fn new(slot_id: u64, pool_id: u64) -> Self {
+        Self { slot_id, pool_id }
     }
 
     /// 获取 DeferredMap 槽位 ID
@@ -68,16 +63,16 @@ impl WorkerId {
         self.slot_id
     }
 
-    /// 获取全局唯一 ID
+    /// 获取池内唯一 ID
     #[inline]
-    pub fn global_id(&self) -> u64 {
-        self.global_id
+    pub fn pool_id(&self) -> u64 {
+        self.pool_id
     }
 }
 
 impl std::fmt::Display for WorkerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "#{}", self.global_id)
+        write!(f, "#{}", self.pool_id)
     }
 }
 
@@ -145,6 +140,8 @@ pub struct WorkerPool<F: WorkerFactory> {
     pub(crate) slots: DeferredMap<WorkerSlot>,
     /// 工厂（用于 spawn 新 worker）
     factory: F,
+    /// 池内 Worker ID 计数器（每个池独立）
+    next_worker_id: AtomicU64,
 }
 
 impl<F: WorkerFactory> WorkerPool<F> {
@@ -180,13 +177,18 @@ impl<F: WorkerFactory> WorkerPool<F> {
         let worker_count = inputs.len();
         let slots = DeferredMap::with_capacity(worker_count);
 
-        let mut pool = Self { slots, factory };
+        let mut pool = Self {
+            slots,
+            factory,
+            next_worker_id: AtomicU64::new(0),
+        };
 
         let mut worker_ids = Vec::with_capacity(worker_count);
         for input in inputs {
             let deferred_handle = pool.slots.allocate_handle();
             let slot_id = deferred_handle.key();
-            let worker_id = WorkerId::new(slot_id);
+            let pool_id = pool.next_worker_id.fetch_add(1, Ordering::Relaxed);
+            let worker_id = WorkerId::new(slot_id, pool_id);
 
             let slot = pool.spawn_worker_internal(worker_id, input);
             pool.slots.insert(deferred_handle, slot);
@@ -211,7 +213,8 @@ impl<F: WorkerFactory> WorkerPool<F> {
         for input in inputs {
             let deferred_handle = self.slots.allocate_handle();
             let slot_id = deferred_handle.key();
-            let worker_id = WorkerId::new(slot_id);
+            let pool_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
+            let worker_id = WorkerId::new(slot_id, pool_id);
 
             let slot = self.spawn_worker_internal(worker_id, input);
             self.slots.insert(deferred_handle, slot);

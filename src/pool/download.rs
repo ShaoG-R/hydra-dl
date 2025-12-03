@@ -196,10 +196,10 @@ pub(crate) struct DownloadWorkerHandle {
 
 impl DownloadWorkerHandle {
 
-    /// 获取全局唯一 worker ID
+    /// 获取池内唯一 worker ID
     #[inline]
-    pub fn global_id(&self) -> u64 {
-        self.worker_id.global_id()
+    pub fn pool_id(&self) -> u64 {
+        self.worker_id.pool_id()
     }
 
     // 获取用于取消的句柄

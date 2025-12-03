@@ -231,10 +231,10 @@ impl DownloadStats {
                 result = self.broadcast_rx.recv() => {
                     match result {
                         Ok((worker_id, ExecutorBroadcast::Stats(stats))) => {
-                            self.handle_update(worker_id.global_id(), stats);
+                            self.handle_update(worker_id.pool_id(), stats);
                         }
                         Ok((worker_id, ExecutorBroadcast::Shutdown)) => {
-                            self.handle_remove(worker_id.global_id());
+                            self.handle_remove(worker_id.pool_id());
                         }
                         Err(broadcast::error::RecvError::Lagged(count)) => {
                             // 消息丢失，记录日志但继续运行
@@ -305,8 +305,8 @@ mod tests {
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
         // 创建 WorkerBroadcaster 用于发送消息
-        let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0), broadcast_tx.clone(), 4);
-        let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(0), broadcast_tx, 4);
+        let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx.clone(), 4);
+        let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx, 4);
 
         // 发送更新（通过广播）
         let executor_stats = ExecutorStats::default();
@@ -328,8 +328,8 @@ mod tests {
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
         // 创建 WorkerBroadcaster 用于发送消息
-        let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0), broadcast_tx.clone(), 4);
-        let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(0), broadcast_tx, 4);
+        let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx.clone(), 4);
+        let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx, 4);
 
         // 添加两个 executor
         let executor_stats = ExecutorStats::default();
@@ -356,7 +356,7 @@ mod tests {
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
         // 创建 WorkerBroadcaster 用于发送消息
-        let broadcaster = WorkerBroadcaster::new(WorkerId::new(0), broadcast_tx, 4);
+        let broadcaster = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx, 4);
 
         // 发送一些消息确保 actor 在运行
         let executor_stats = ExecutorStats::default();
