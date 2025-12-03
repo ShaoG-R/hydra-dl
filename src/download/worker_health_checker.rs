@@ -20,6 +20,7 @@ mod logic;
 
 use crate::config::DownloadConfig;
 use crate::pool::download::{DownloadWorkerHandle, ExecutorBroadcast, ExecutorStats, TaggedBroadcast};
+use crate::utils::cancel_channel::CancelHandle;
 use lite_sync::oneshot::lite;
 use log::{debug, warn};
 use rustc_hash::FxHashMap;
@@ -163,6 +164,9 @@ impl WorkerHealthCheckerActor {
 
     /// 处理统计更新
     fn handle_stats_update(&mut self, worker_id: u64, stats: ExecutorStats) {
+        // 在检测前获取取消句柄
+        let cancel_handle = self.get_cancel_handle(worker_id);
+
         // 更新当前统计
         self.current_stats.insert(worker_id, stats);
 
@@ -185,10 +189,14 @@ impl WorkerHealthCheckerActor {
                     "Worker #{} 相对速度异常次数过多 ({}/{}), 取消当前下载",
                     worker_id, anomaly_count, self.history_size
                 );
-                self.cancel_worker(worker_id, format!(
-                    "相对速度异常 ({}/{})",
-                    anomaly_count, self.history_size
-                ));
+                
+                // 使用之前获取的句柄取消
+                if let Some(handle) = cancel_handle {
+                    self.cancel_with_handle(worker_id, handle, format!(
+                        "相对速度异常 ({}/{})",
+                        anomaly_count, self.history_size
+                    ));
+                }
                 
                 // 重置该 worker 的健康追踪器
                 self.reset_worker_tracking(worker_id);
@@ -239,15 +247,18 @@ impl WorkerHealthCheckerActor {
         }
     }
 
-    /// 取消指定 worker 的当前下载
-    fn cancel_worker(&self, worker_id: u64, reason: String) {
+    /// 获取指定 worker 的取消句柄
+    fn get_cancel_handle(&self, worker_id: u64) -> Option<CancelHandle> {
         let handles = self.worker_handles.load();
-        if let Some(handle) = handles.get(&worker_id) {
-            if handle.cancel_handle().cancel() {
-                debug!("Worker #{} 已取消: {}", worker_id, reason);
-            } else {
-                warn!("Worker #{} 发送取消信号失败 (task_id 不匹配或 channel 已关闭)", worker_id);
-            }
+        handles.get(&worker_id).map(|h| h.cancel_handle())
+    }
+
+    /// 使用指定句柄取消 worker 的当前下载
+    fn cancel_with_handle(&self, worker_id: u64, handle: CancelHandle, reason: String) {
+        if handle.cancel() {
+            debug!("Worker #{} 已取消: {}", worker_id, reason);
+        } else {
+            warn!("Worker #{} 发送取消信号失败 (task_id 不匹配或 channel 已关闭)", worker_id);
         }
     }
 }
