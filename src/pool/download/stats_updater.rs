@@ -26,7 +26,7 @@ use crate::pool::common::WorkerId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// Executor 当前运行状态统计
 ///
@@ -175,15 +175,15 @@ pub type TaggedBroadcast = (WorkerId, ExecutorBroadcast);
 ///
 /// 封装 Worker 内部的广播分发，包含：
 /// - 外部广播：发送 `(worker_id, ExecutorBroadcast)` 到 Executor 级别的订阅者
-/// - 本地广播：发送 `ExecutorBroadcast` 到 Worker 本地的协程（如健康检测）
+/// - 本地 Watch：发送最新的 `ExecutorBroadcast` 到 Worker 本地的协程（如健康检测）
 #[derive(Clone)]
 pub struct WorkerBroadcaster {
     /// Worker ID
     worker_id: WorkerId,
     /// 外部广播发送器（Executor 级别）
     executor_tx: broadcast::Sender<TaggedBroadcast>,
-    /// 本地广播发送器（Worker 内部，不带 worker_id）
-    local_tx: broadcast::Sender<ExecutorBroadcast>,
+    /// 本地 watch 发送器（Worker 内部，只保留最新消息）
+    local_watch_tx: watch::Sender<ExecutorBroadcast>,
 }
 
 impl WorkerBroadcaster {
@@ -193,39 +193,39 @@ impl WorkerBroadcaster {
     ///
     /// - `worker_id`: Worker ID
     /// - `executor_tx`: 外部广播发送器
-    /// - `local_capacity`: 本地广播通道容量
-    pub fn new(worker_id: WorkerId, executor_tx: broadcast::Sender<TaggedBroadcast>, local_capacity: usize) -> Self {
-        let (local_tx, _) = broadcast::channel(local_capacity);
+    pub fn new(worker_id: WorkerId, executor_tx: broadcast::Sender<TaggedBroadcast>) -> Self {
+        // 初始值为 Shutdown，表示尚未开始
+        let (local_watch_tx, _) = watch::channel(ExecutorBroadcast::Shutdown);
         Self {
             worker_id,
             executor_tx,
-            local_tx,
+            local_watch_tx,
         }
     }
 
-    /// 订阅本地广播（用于健康检测协程）
-    pub fn subscribe_local(&self) -> broadcast::Receiver<ExecutorBroadcast> {
-        self.local_tx.subscribe()
+    /// 订阅本地 watch（用于健康检测协程）
+    pub fn subscribe_local(&self) -> watch::Receiver<ExecutorBroadcast> {
+        self.local_watch_tx.subscribe()
     }
 
     /// 发送统计更新
     /// - 外部广播：`(worker_id, ExecutorBroadcast::Stats)`
-    /// - 本地广播：`ExecutorBroadcast::Stats`
+    /// - 本地 watch：更新最新 `ExecutorBroadcast::Stats`
     #[inline]
     pub fn send_stats(&self, stats: ExecutorStats) {
         let msg = ExecutorBroadcast::Stats(stats);
         let _ = self.executor_tx.send((self.worker_id, msg.clone()));
-        let _ = self.local_tx.send(msg);
+        let _ = self.local_watch_tx.send(msg);
     }
 
     /// 发送关闭信号
     /// - 外部广播：`(worker_id, ExecutorBroadcast::Shutdown)`
-    /// - 本地广播：`ExecutorBroadcast::Shutdown`
+    /// - 本地 watch：发送 `ExecutorBroadcast::Shutdown`
     #[inline]
     pub fn send_shutdown(&self) {
         let msg = ExecutorBroadcast::Shutdown;
         let _ = self.executor_tx.send((self.worker_id, msg.clone()));
-        let _ = self.local_tx.send(msg);
+        let _ = self.local_watch_tx.send(msg);
     }
 }
 

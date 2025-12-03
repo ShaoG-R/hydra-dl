@@ -292,7 +292,7 @@ mod tests {
         // 创建 stats updater
         let (broadcast_tx, _) = broadcast::channel(16);
         let worker_id = WorkerId::new(0, 0);
-        let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx, 16);
+        let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx);
         let chunk_strategy = Box::new(SpeedBasedChunkStrategy::new(
             1024 * 1024,      // min: 1 MB
             16 * 1024 * 1024, // max: 16 MB

@@ -129,7 +129,7 @@ where
 
         // --- 创建 WorkerBroadcaster ---
         // 在此处创建，因为这里才知道真正的 worker_id
-        let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx, 16);
+        let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx);
 
         // --- 协程 1: Stats Updater 辅助协程 ---
         // chunk_strategy 和 initial_chunk_size 传递给 StatsUpdater

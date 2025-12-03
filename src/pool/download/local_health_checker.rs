@@ -23,7 +23,7 @@ use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use std::num::NonZeroU64;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 /// 本地健康检查器配置
 #[derive(Debug, Clone)]
@@ -123,14 +123,14 @@ impl AnomalyTracker {
 
 /// 本地健康检查协程
 ///
-/// 监听 WorkerBroadcaster 的本地广播，检测超时和绝对速度
+/// 监听 WorkerBroadcaster 的本地 watch，检测超时和绝对速度
 pub(crate) struct LocalHealthChecker {
     /// Worker ID（用于日志）
     worker_id: WorkerId,
     /// 配置
     config: LocalHealthCheckerConfig,
-    /// 本地广播接收器
-    broadcast_rx: broadcast::Receiver<ExecutorBroadcast>,
+    /// 本地 watch 接收器
+    watch_rx: watch::Receiver<ExecutorBroadcast>,
     /// 取消信号发送器
     cancel_tx: CancelSender,
     /// 当前任务的取消句柄（在任务开始时获取）
@@ -147,7 +147,7 @@ impl LocalHealthChecker {
     /// # Arguments
     ///
     /// - `worker_id`: Worker ID
-    /// - `broadcaster`: Worker 广播器，用于订阅本地广播
+    /// - `broadcaster`: Worker 广播器，用于订阅本地 watch
     /// - `cancel_tx`: 取消信号发送器
     /// - `config`: 配置
     pub(crate) fn new(
@@ -156,13 +156,13 @@ impl LocalHealthChecker {
         cancel_tx: CancelSender,
         config: LocalHealthCheckerConfig,
     ) -> Self {
-        let broadcast_rx = broadcaster.subscribe_local();
+        let watch_rx = broadcaster.subscribe_local();
         let anomaly_tracker = AnomalyTracker::new(config.history_size, config.anomaly_threshold);
         
         Self {
             worker_id,
             config,
-            broadcast_rx,
+            watch_rx,
             cancel_tx,
             cancel_handle: None,
             anomaly_tracker,
@@ -180,11 +180,11 @@ impl LocalHealthChecker {
                 // 任务运行中，使用超时监听
                 tokio::time::timeout(
                     self.config.stale_timeout,
-                    self.broadcast_rx.recv()
+                    self.watch_rx.changed()
                 ).await
             } else {
                 // 任务未运行，无限等待
-                Ok(self.broadcast_rx.recv().await)
+                Ok(self.watch_rx.changed().await)
             };
 
             match result {
@@ -192,19 +192,16 @@ impl LocalHealthChecker {
                 Err(_timeout) => {
                     self.handle_timeout();
                 }
-                // 收到消息
-                Ok(Ok(msg)) => {
+                // watch 值已更新
+                Ok(Ok(())) => {
+                    let msg = self.watch_rx.borrow().clone();
                     if !self.handle_broadcast(msg) {
                         break;
                     }
                 }
-                // Lagged：落后太多消息
-                Ok(Err(broadcast::error::RecvError::Lagged(count))) => {
-                    debug!("Worker {} LocalHealthChecker 落后 {} 条消息", self.worker_id, count);
-                }
-                // Closed：通道关闭
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    debug!("Worker {} LocalHealthChecker 广播通道已关闭", self.worker_id);
+                // watch 通道关闭
+                Ok(Err(_)) => {
+                    debug!("Worker {} LocalHealthChecker watch 通道已关闭", self.worker_id);
                     break;
                 }
             }
