@@ -10,7 +10,6 @@ use log::{debug, error, info};
 use net_bytes::{DownloadSpeed, FileSizeFormat};
 use smr_swap::LocalReader;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 /// Worker 启动请求
@@ -264,8 +263,6 @@ pub(super) struct ProgressiveLauncherParams {
     pub aggregated_stats: LocalReader<AggregatedStats>,
     /// 文件总大小
     pub total_size: u64,
-    /// 已写入字节数（共享引用）
-    pub written_bytes: Arc<AtomicU64>,
     /// 启动偏移时间
     pub start_offset: std::time::Duration,
 }
@@ -333,7 +330,9 @@ impl ProgressiveLauncherActor {
             tokio::select! {
                 // 内部定时器：自主触发检查
                 _ = self.channels.check_timer.tick() => {
-                    self.check_and_launch().await;
+                    if !self.check_and_launch().await {
+                        break;
+                    }
                 }
                 // 外部消息
                 msg = &mut self.channels.shutdown_rx => {
@@ -356,25 +355,33 @@ impl ProgressiveLauncherActor {
     }
 
     /// 检查并尝试启动下一批 worker
-    async fn check_and_launch(&mut self) {
+    /// 
+    /// 返回 `true` 表示应继续运行，`false` 表示应终止
+    async fn check_and_launch(&mut self) -> bool {
         // 检查是否还有下一批待启动
         if !self.logic.should_check_next_stage() {
-            return;
+            return true;
         }
 
         let decision = {
             let aggregated_stats = self.params.aggregated_stats.load();
+            let bytes_summary = aggregated_stats.get_bytes_summary();
+
+            // 检查是否下载已完成
+            if bytes_summary.written_bytes >= self.params.total_size {
+                debug!("下载已完成，ProgressiveLauncherActor 自动终止");
+                return false;
+            }
 
             // 检测并调整启动阶段（应对 worker 数量变化）
             let current_worker_count = aggregated_stats.len() as u64;
             self.logic
                 .adjust_stage_for_worker_count(current_worker_count);
 
-            // 从共享数据获取信息并决策
-            let written = self.params.written_bytes.load(Ordering::SeqCst);
+            // 从聚合统计获取信息并决策
             self.logic.decide_next_launch(
                 &*aggregated_stats,
-                written,
+                bytes_summary.written_bytes,
                 self.params.total_size,
                 &self.params.config,
             )
@@ -418,6 +425,8 @@ impl ProgressiveLauncherActor {
                 // 无需启动，继续等待
             }
         }
+
+        true
     }
 
     /// 记录等待原因的日志

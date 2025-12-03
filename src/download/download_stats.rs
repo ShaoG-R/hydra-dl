@@ -49,6 +49,19 @@ impl DownloadStatsHandle {
 pub struct AggregatedStats {
     /// 所有 Executor 的统计映射
     pub stats_map: FxHashMap<u64, ExecutorStats>,
+    /// 预计算的下载摘要
+    summary: DownloadSummary,
+}
+
+/// 字节统计
+///
+/// 仅包含已写入和已下载的字节数
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BytesSummary {
+    /// 已写入磁盘的有效字节数（不包含重试的重复字节，用于进度计算）
+    pub written_bytes: u64,
+    /// 已下载的总字节数（包括重试的重复字节，用于速度计算）
+    pub downloaded_bytes: u64,
 }
 
 /// 下载统计摘要
@@ -118,42 +131,53 @@ impl AggregatedStats {
             .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取下载统计摘要
+    /// 获取字节统计
     ///
-    /// 单次遍历聚合所有统计数据，避免多次遍历 map
-    pub fn get_summary(&self) -> DownloadSummary {
-        let mut avg_speed: u64 = 0;
-        let mut instant_speed: u64 = 0;
-        let mut window_avg_speed: u64 = 0;
-        let mut written_bytes: u64 = 0;
-        let mut downloaded_bytes: u64 = 0;
+    /// 仅遍历获取已写入和已下载的字节数，不计算速度
+    pub fn get_bytes_summary(&self) -> BytesSummary {
+        BytesSummary { written_bytes: self.summary.written_bytes, downloaded_bytes: self.summary.downloaded_bytes }
+    }
 
-        for stats in self.stats_map.values() {
-            // 直接从 ExecutorStats 累加（包括已停止的 Executor）
-            written_bytes += stats.written_bytes;
-            downloaded_bytes += stats.downloaded_bytes;
-            
-            // 速度统计只从运行中的 Executor 获取
-            if let Some(speed_stats) = stats.get_speed_stats() {
-                if let Some(s) = speed_stats.avg_speed {
-                    avg_speed += s.as_u64();
-                }
-                if let Some(s) = speed_stats.instant_speed {
-                    instant_speed += s.as_u64();
-                }
-                if let Some(s) = speed_stats.window_avg_speed {
-                    window_avg_speed += s.as_u64();
-                }
+    /// 获取预计算的下载统计摘要
+    #[inline]
+    pub fn get_summary(&self) -> &DownloadSummary {
+        &self.summary
+    }
+}
+
+/// 从 stats_map 计算 DownloadSummary
+fn compute_summary(stats_map: &FxHashMap<u64, ExecutorStats>) -> DownloadSummary {
+    let mut avg_speed: u64 = 0;
+    let mut instant_speed: u64 = 0;
+    let mut window_avg_speed: u64 = 0;
+    let mut written_bytes: u64 = 0;
+    let mut downloaded_bytes: u64 = 0;
+
+    for stats in stats_map.values() {
+        // 直接从 ExecutorStats 累加（包括已停止的 Executor）
+        written_bytes += stats.written_bytes;
+        downloaded_bytes += stats.downloaded_bytes;
+
+        // 速度统计只从运行中的 Executor 获取
+        if let Some(speed_stats) = stats.get_speed_stats() {
+            if let Some(s) = speed_stats.avg_speed {
+                avg_speed += s.as_u64();
+            }
+            if let Some(s) = speed_stats.instant_speed {
+                instant_speed += s.as_u64();
+            }
+            if let Some(s) = speed_stats.window_avg_speed {
+                window_avg_speed += s.as_u64();
             }
         }
+    }
 
-        DownloadSummary {
-            written_bytes,
-            downloaded_bytes,
-            avg_speed: if avg_speed > 0 { Some(DownloadSpeed::from_raw(avg_speed)) } else { None },
-            instant_speed: if instant_speed > 0 { Some(DownloadSpeed::from_raw(instant_speed)) } else { None },
-            window_avg_speed: if window_avg_speed > 0 { Some(DownloadSpeed::from_raw(window_avg_speed)) } else { None },
-        }
+    DownloadSummary {
+        written_bytes,
+        downloaded_bytes,
+        avg_speed: if avg_speed > 0 { Some(DownloadSpeed::from_raw(avg_speed)) } else { None },
+        instant_speed: if instant_speed > 0 { Some(DownloadSpeed::from_raw(instant_speed)) } else { None },
+        window_avg_speed: if window_avg_speed > 0 { Some(DownloadSpeed::from_raw(window_avg_speed)) } else { None },
     }
 }
 
@@ -254,6 +278,7 @@ impl DownloadStats {
         self.stats.update(|s| {
             let mut s = s.clone();
             s.stats_map.insert(worker_id, stats.clone());
+            s.summary = compute_summary(&s.stats_map);
             s
         });
     }
@@ -263,6 +288,7 @@ impl DownloadStats {
         self.stats.update(|s| {
             let mut s = s.clone();
             s.stats_map.remove(&worker_id);
+            s.summary = compute_summary(&s.stats_map);
             s
         });
     }

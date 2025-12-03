@@ -78,7 +78,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 config: Arc::clone(&config),
                 aggregated_stats: aggregated_stats_reader.clone(),
                 total_size: writer.total_size(),
-                written_bytes: writer.written_bytes_ref(),
                 start_offset: std::time::Duration::ZERO,
             });
 
