@@ -155,7 +155,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 Some(result) = self.result_futures.next() => {
                     match result {
                         Ok(ExecutorResult::Success { worker_id }) => {
-                            info!("Worker #{} 完成任务", worker_id);
+                            info!("Worker {} 完成任务", worker_id);
                             
                             // 检查是否所有写入完成
                             if self.writer.is_complete() {

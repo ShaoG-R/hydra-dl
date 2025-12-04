@@ -549,11 +549,11 @@ impl StatsUpdater {
                 });
                 self.broadcast_stats();
             }
-            ExecutorStats::Running(TaskStats::Ended { .. }) => {
+            ExecutorStats::Running(TaskStats::Ended { written_bytes, .. }) => {
                 debug!("Worker {} 新任务开始 (Ended -> Started)", self.worker_id);
                 self.state = ExecutorStats::Running(TaskStats::Started {
                     start_time: Instant::now(),
-                    written_bytes: 0,
+                    written_bytes: *written_bytes,
                 });
                 self.broadcast_stats();
             }
@@ -690,9 +690,37 @@ impl StatsUpdater {
     }
 
     /// 处理 Executor 关闭
-    #[inline]
-    fn handle_executor_shutdown(&self) {
+    ///
+    /// 从当前状态提取统计数据，转换到 Stopped 状态并广播，然后发送 Shutdown 信号
+    fn handle_executor_shutdown(&mut self) {
         debug!("Worker {} Executor 关闭", self.worker_id);
+
+        // 从当前状态提取统计数据
+        let stopped_stats = match &self.state {
+            ExecutorStats::Pending => StoppedExecutorStats {
+                total_duration: Duration::ZERO,
+                downloaded_bytes: 0,
+                written_bytes: 0,
+            },
+            ExecutorStats::Running(task_stats) => {
+                let total_duration = task_stats
+                    .start_time()
+                    .map(|t| t.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                StoppedExecutorStats {
+                    total_duration,
+                    downloaded_bytes: task_stats.downloaded_bytes(),
+                    written_bytes: task_stats.written_bytes(),
+                }
+            }
+            ExecutorStats::Stopped(stats) => stats.clone(),
+        };
+
+        // 转换到 Stopped 状态并广播
+        self.state = ExecutorStats::Stopped(stopped_stats);
+        self.broadcast_stats();
+
+        // 发送 Shutdown 信号
         self.broadcaster.send_shutdown();
     }
 }
