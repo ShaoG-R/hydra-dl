@@ -521,7 +521,7 @@ impl ProgressiveLauncher {
     /// 这个方法会消耗 self，确保 actor 完全停止并释放所有引用
     pub(super) async fn shutdown_and_wait(mut self) {
         // 发送关闭消息
-        let _ = self.shutdown_tx.notify(());
+        self.shutdown_tx.send_unchecked(());
 
         // 等待 actor 任务完成
         if let Some(handle) = self.actor_handle.take() {
