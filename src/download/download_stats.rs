@@ -72,8 +72,17 @@ impl CompletedStats {
 }
 
 /// 聚合后的统计数据
-#[derive(Debug, Clone, Default)]
-pub struct AggregatedStats {
+#[derive(Debug, Clone)]
+pub enum AggregatedStats {
+    /// 等待第一个统计更新
+    Pending,
+    /// 运行中，包含实际统计数据
+    Running(RunningStats),
+}
+
+/// 运行中的统计数据
+#[derive(Debug, Clone)]
+pub struct RunningStats {
     /// 待命中的 Executor 映射（Pending 状态）
     pub pending_stats_map: FxHashMap<u64, ()>,
     /// 运行中的 Executor 映射（Running 状态，存储 TaskStats）
@@ -82,6 +91,24 @@ pub struct AggregatedStats {
     pub completed_stats: CompletedStats,
     /// 预计算的下载摘要
     summary: DownloadSummary,
+}
+
+impl RunningStats {
+    /// 创建新的运行统计
+    fn new() -> Self {
+        Self {
+            pending_stats_map: FxHashMap::default(),
+            running_stats_map: FxHashMap::default(),
+            completed_stats: CompletedStats::default(),
+            summary: DownloadSummary {
+                written_bytes: 0,
+                downloaded_bytes: 0,
+                avg_speed: DownloadSpeed::from_raw(0),
+                instant_speed: DownloadSpeed::from_raw(0),
+                window_avg_speed: DownloadSpeed::from_raw(0),
+            },
+        }
+    }
 }
 
 /// 字节统计
@@ -98,121 +125,179 @@ pub struct BytesSummary {
 /// 下载统计摘要
 ///
 /// 单次遍历聚合所有统计数据，用于进度展示
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DownloadSummary {
     /// 已写入磁盘的有效字节数（不包含重试的重复字节，用于进度计算）
     pub written_bytes: u64,
     /// 已下载的总字节数（包括重试的重复字节，用于速度计算）
     pub downloaded_bytes: u64,
     /// 平均速度（从开始到现在）
-    pub avg_speed: Option<DownloadSpeed>,
+    pub avg_speed: DownloadSpeed,
     /// 实时速度（基于短时间窗口）
-    pub instant_speed: Option<DownloadSpeed>,
+    pub instant_speed: DownloadSpeed,
     /// 窗口平均速度（基于较长时间窗口）
-    pub window_avg_speed: Option<DownloadSpeed>,
+    pub window_avg_speed: DownloadSpeed,
 }
 
 impl AggregatedStats {
+    /// 获取运行统计的引用（如果处于 Running 状态）
+    #[inline]
+    pub fn as_running(&self) -> Option<&RunningStats> {
+        match self {
+            AggregatedStats::Pending => None,
+            AggregatedStats::Running(stats) => Some(stats),
+        }
+    }
+
     /// 获取指定运行中的 Executor 的任务统计
     pub fn get_running(&self, worker_id: u64) -> Option<&TaskStats> {
-        self.running_stats_map.get(&worker_id)
+        match self {
+            AggregatedStats::Pending => None,
+            AggregatedStats::Running(s) => s.running_stats_map.get(&worker_id),
+        }
     }
 
     /// 获取待命中的 Executor 数量
     pub fn pending_count(&self) -> usize {
-        self.pending_stats_map.len()
+        match self {
+            AggregatedStats::Pending => 0,
+            AggregatedStats::Running(s) => s.pending_stats_map.len(),
+        }
     }
 
     /// 获取运行中的 Executor 数量
     pub fn running_count(&self) -> usize {
-        self.running_stats_map.len()
+        match self {
+            AggregatedStats::Pending => 0,
+            AggregatedStats::Running(s) => s.running_stats_map.len(),
+        }
     }
 
     /// 获取已完成的 Executor 数量
     pub fn completed_count(&self) -> u64 {
-        self.completed_stats.count
+        match self {
+            AggregatedStats::Pending => 0,
+            AggregatedStats::Running(s) => s.completed_stats.count,
+        }
     }
 
     /// 获取总 Executor 数量（待命 + 运行中 + 已完成）
     pub fn total_count(&self) -> u64 {
-        self.pending_stats_map.len() as u64
-            + self.running_stats_map.len() as u64
-            + self.completed_stats.count
+        match self {
+            AggregatedStats::Pending => 0,
+            AggregatedStats::Running(s) => {
+                s.pending_stats_map.len() as u64
+                    + s.running_stats_map.len() as u64
+                    + s.completed_stats.count
+            }
+        }
     }
 
     /// 检查是否没有任何 Executor
     pub fn is_empty(&self) -> bool {
-        self.pending_stats_map.is_empty()
-            && self.running_stats_map.is_empty()
-            && self.completed_stats.count == 0
+        match self {
+            AggregatedStats::Pending => true,
+            AggregatedStats::Running(s) => {
+                s.pending_stats_map.is_empty()
+                    && s.running_stats_map.is_empty()
+                    && s.completed_stats.count == 0
+            }
+        }
     }
 
     /// 迭代所有待命中的 Executor
-    pub fn iter_pending(&self) -> impl Iterator<Item = &u64> {
-        self.pending_stats_map.keys()
+    pub fn iter_pending(&self) -> Box<dyn Iterator<Item = &u64> + '_> {
+        match self {
+            AggregatedStats::Pending => Box::new(std::iter::empty()),
+            AggregatedStats::Running(s) => Box::new(s.pending_stats_map.keys()),
+        }
     }
 
     /// 迭代所有运行中的 Executor 统计
-    pub fn iter_running(&self) -> impl Iterator<Item = (&u64, &TaskStats)> {
-        self.running_stats_map.iter()
+    pub fn iter_running(&self) -> Box<dyn Iterator<Item = (&u64, &TaskStats)> + '_> {
+        match self {
+            AggregatedStats::Pending => Box::new(std::iter::empty()),
+            AggregatedStats::Running(s) => Box::new(s.running_stats_map.iter()),
+        }
     }
 
     /// 获取运行中的 Executor 数量（别名，用于兼容旧 API）
     pub fn len(&self) -> usize {
-        self.running_stats_map.len()
+        self.running_count()
     }
 
     /// 获取已完成 Executor 的累计统计
-    pub fn get_completed_stats(&self) -> &CompletedStats {
-        &self.completed_stats
+    pub fn get_completed_stats(&self) -> Option<&CompletedStats> {
+        match self {
+            AggregatedStats::Pending => None,
+            AggregatedStats::Running(s) => Some(&s.completed_stats),
+        }
     }
 
     /// 获取所有运行中 Executor 的总窗口平均速度
     ///
     /// 将所有 TaskStats::Running 的窗口平均速度相加
     pub fn get_total_window_avg_speed(&self) -> Option<DownloadSpeed> {
-        self.running_stats_map
-            .values()
-            .filter_map(|s| s.get_window_avg_speed())
-            .map(|s| s.as_u64())
-            .reduce(|a, b| a + b)
-            .map(DownloadSpeed::from_raw)
+        match self {
+            AggregatedStats::Pending => None,
+            AggregatedStats::Running(s) => s.running_stats_map
+                .values()
+                .filter_map(|t| t.get_window_avg_speed())
+                .map(|t| t.as_u64())
+                .reduce(|a, b| a + b)
+                .map(DownloadSpeed::from_raw),
+        }
     }
 
     /// 获取所有运行中 Executor 的总实时速度
     pub fn get_total_instant_speed(&self) -> Option<DownloadSpeed> {
-        self.running_stats_map
-            .values()
-            .filter_map(|s| s.get_instant_speed())
-            .map(|s| s.as_u64())
-            .reduce(|a, b| a + b)
-            .map(DownloadSpeed::from_raw)
+        match self {
+            AggregatedStats::Pending => None,
+            AggregatedStats::Running(s) => s.running_stats_map
+                .values()
+                .filter_map(|t| t.get_instant_speed())
+                .map(|t| t.as_u64())
+                .reduce(|a, b| a + b)
+                .map(DownloadSpeed::from_raw),
+        }
     }
 
     /// 获取所有运行中 Executor 的总平均速度
     pub fn get_total_avg_speed(&self) -> Option<DownloadSpeed> {
-        self.running_stats_map
-            .values()
-            .filter_map(|s| s.get_avg_speed())
-            .map(|s| s.as_u64())
-            .reduce(|a, b| a + b)
-            .map(DownloadSpeed::from_raw)
+        match self {
+            AggregatedStats::Pending => None,
+            AggregatedStats::Running(s) => s.running_stats_map
+                .values()
+                .filter_map(|t| t.get_avg_speed())
+                .map(|t| t.as_u64())
+                .reduce(|a, b| a + b)
+                .map(DownloadSpeed::from_raw),
+        }
     }
 
     /// 获取字节统计
     ///
     /// 仅遍历获取已写入和已下载的字节数，不计算速度
     pub fn get_bytes_summary(&self) -> BytesSummary {
-        BytesSummary {
-            written_bytes: self.summary.written_bytes,
-            downloaded_bytes: self.summary.downloaded_bytes,
+        match self {
+            AggregatedStats::Pending => BytesSummary {
+                written_bytes: 0,
+                downloaded_bytes: 0,
+            },
+            AggregatedStats::Running(s) => BytesSummary {
+                written_bytes: s.summary.written_bytes,
+                downloaded_bytes: s.summary.downloaded_bytes,
+            },
         }
     }
 
     /// 获取预计算的下载统计摘要
     #[inline]
-    pub fn get_summary(&self) -> &DownloadSummary {
-        &self.summary
+    pub fn get_summary(&self) -> Option<&DownloadSummary> {
+        match self {
+            AggregatedStats::Pending => None,
+            AggregatedStats::Running(s) => Some(&s.summary),
+        }
     }
 }
 
@@ -248,21 +333,9 @@ fn compute_summary(
     DownloadSummary {
         written_bytes,
         downloaded_bytes,
-        avg_speed: if avg_speed > 0 {
-            Some(DownloadSpeed::from_raw(avg_speed))
-        } else {
-            None
-        },
-        instant_speed: if instant_speed > 0 {
-            Some(DownloadSpeed::from_raw(instant_speed))
-        } else {
-            None
-        },
-        window_avg_speed: if window_avg_speed > 0 {
-            Some(DownloadSpeed::from_raw(window_avg_speed))
-        } else {
-            None
-        },
+        avg_speed: DownloadSpeed::from_raw(avg_speed),
+        instant_speed: DownloadSpeed::from_raw(instant_speed),
+        window_avg_speed: DownloadSpeed::from_raw(window_avg_speed),
     }
 }
 
@@ -291,8 +364,8 @@ impl DownloadStats {
     pub(crate) fn spawn(broadcast_rx: broadcast::Receiver<TaggedBroadcast>) -> (DownloadStatsHandle, LocalReader<AggregatedStats>) {
         let (shutdown_tx, shutdown_rx) = lite::channel();
 
-        // 使用 SmrSwap 包装统计数据
-        let stats = SmrSwap::new(AggregatedStats::default());
+        // 使用 SmrSwap 包装统计数据，初始为 Pending 状态
+        let stats = SmrSwap::new(AggregatedStats::Pending);
         let stats_reader = stats.local();
 
         let aggregator = Self {
@@ -353,31 +426,35 @@ impl DownloadStats {
             }
         }
 
-        // 清空统计数据
-        self.stats.store(AggregatedStats::default());
+        // 重置为 Pending 状态
+        self.stats.store(AggregatedStats::Pending);
         debug!("DownloadStats 退出");
     }
 
     /// 处理统计更新
     fn handle_update(&mut self, worker_id: u64, stats: ExecutorStats) {
         self.stats.update(|s| {
-            let mut s = s.clone();
+            // 如果是 Pending 状态，转换为 Running
+            let mut running = match s {
+                AggregatedStats::Pending => RunningStats::new(),
+                AggregatedStats::Running(r) => r.clone(),
+            };
 
             match stats {
                 ExecutorStats::Pending => {
                     // 待命状态，添加到 pending_stats_map
-                    s.pending_stats_map.insert(worker_id, ());
+                    running.pending_stats_map.insert(worker_id, ());
                 }
                 ExecutorStats::Running(task_stats) => {
                     // Running 状态，从 pending 移除，更新到 running_stats_map
-                    s.pending_stats_map.remove(&worker_id);
-                    s.running_stats_map.insert(worker_id, task_stats);
+                    running.pending_stats_map.remove(&worker_id);
+                    running.running_stats_map.insert(worker_id, task_stats);
                 }
                 ExecutorStats::Stopped(stopped_stats) => {
                     // Executor 已停止，从所有映射移除并累加到 completed_stats
-                    s.pending_stats_map.remove(&worker_id);
-                    s.running_stats_map.remove(&worker_id);
-                    s.completed_stats.accumulate(
+                    running.pending_stats_map.remove(&worker_id);
+                    running.running_stats_map.remove(&worker_id);
+                    running.completed_stats.accumulate(
                         stopped_stats.total_duration,
                         stopped_stats.downloaded_bytes,
                         stopped_stats.written_bytes,
@@ -385,22 +462,25 @@ impl DownloadStats {
                 }
             }
 
-            s.summary = compute_summary(&s.running_stats_map, &s.completed_stats);
-            s
+            running.summary = compute_summary(&running.running_stats_map, &running.completed_stats);
+            AggregatedStats::Running(running)
         });
     }
 
     /// 处理 Executor 关闭（Shutdown 信号）
     fn handle_shutdown(&mut self, worker_id: u64) {
         self.stats.update(|s| {
-            let mut s = s.clone();
-
-            // 从所有状态映射中移除
-            s.pending_stats_map.remove(&worker_id);
-            s.running_stats_map.remove(&worker_id);
-
-            s.summary = compute_summary(&s.running_stats_map, &s.completed_stats);
-            s
+            match s {
+                AggregatedStats::Pending => AggregatedStats::Pending,
+                AggregatedStats::Running(r) => {
+                    let mut running = r.clone();
+                    // 从所有状态映射中移除
+                    running.pending_stats_map.remove(&worker_id);
+                    running.running_stats_map.remove(&worker_id);
+                    running.summary = compute_summary(&running.running_stats_map, &running.completed_stats);
+                    AggregatedStats::Running(running)
+                }
+            }
         });
     }
 }

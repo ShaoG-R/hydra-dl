@@ -103,9 +103,9 @@ impl ProgressManager {
                 self.main_bar.set_position(written_bytes);
 
                 // 只在有实时速度时显示速度、加速度和 ETA
-                let (speed_str, eta) = if let Some(instant) = instant_speed {
+                let (speed_str, eta) = if instant_speed.as_u64() > 0 {
                     // 速度显示
-                    let speed_display = instant.to_formatted(self.size_standard).to_string();
+                    let speed_display = instant_speed.to_formatted(self.size_standard).to_string();
                     // 加速度显示（仅主进度条）
                     let accel_display = instant_acceleration
                         .map(|a| {
@@ -126,10 +126,10 @@ impl ProgressManager {
                         // 使用加速度改进 ETA 预测
                         let eta_secs = instant_acceleration
                             .and_then(|accel| {
-                                accel.predict_eta(instant.as_decimal(), remaining_bytes)
+                                accel.predict_eta(instant_speed.as_decimal(), remaining_bytes)
                             })
                             .and_then(|d| Decimal::to_u64(&d))
-                            .unwrap_or_else(|| remaining_bytes / instant.as_u64());
+                            .unwrap_or_else(|| remaining_bytes / instant_speed.as_u64());
 
                         format!(", ETA: {}", format_duration(eta_secs as f64))
                     };
@@ -237,9 +237,7 @@ impl ProgressManager {
                     "完成！{} in {}, 平均速度: {}",
                     format_bytes(total_written_bytes),
                     format_duration(total_time),
-                    avg_speed
-                        .map(|s| s.to_formatted(self.size_standard).to_string())
-                        .unwrap_or("N/A".to_string())
+                    avg_speed.to_formatted(self.size_standard)
                 ));
 
                 // 详细模式：显示每个 worker 的最终统计
@@ -273,13 +271,10 @@ impl ProgressManager {
                         }
                     }
 
-                    // 其余 worker 已完成（从 completed_stats 获取总计）
-                    let completed = executor_stats.get_completed_stats();
-                    if completed.count > 0 {
-                        for idx in executor_stats.len()..self.worker_bars.len() {
-                            if let Some(worker_bar) = self.worker_bars.get(idx) {
-                                worker_bar.finish_with_message("已完成".to_string());
-                            }
+                    // 显示已停止的 worker 数量
+                    if let Some(completed) = executor_stats.get_completed_stats() {
+                        if completed.count > 0 {
+                            println!("{} 个 worker 已停止", completed.count);
                         }
                     }
                 }

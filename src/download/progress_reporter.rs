@@ -34,11 +34,11 @@ pub enum DownloadProgress {
         /// 下载百分比 (0.0 ~ 100.0)
         percentage: f64,
         /// 平均速度 (bytes/s)
-        avg_speed: Option<DownloadSpeed>,
-        /// 实时速度 (bytes/s)，如果无效则为 None
-        instant_speed: Option<DownloadSpeed>,
-        /// 窗口平均速度 (bytes/s)，如果无效则为 None
-        window_avg_speed: Option<DownloadSpeed>,
+        avg_speed: DownloadSpeed,
+        /// 实时速度 (bytes/s)
+        instant_speed: DownloadSpeed,
+        /// 窗口平均速度 (bytes/s)
+        window_avg_speed: DownloadSpeed,
         /// 实时加速度 (bytes/s²)，如果无效则为 None
         instant_acceleration: Option<DownloadAcceleration>,
         /// 所有 Executor 的聚合统计信息
@@ -53,7 +53,7 @@ pub enum DownloadProgress {
         /// 总耗时（秒）
         total_time: f64,
         /// 平均速度 (bytes/s)
-        avg_speed: Option<DownloadSpeed>,
+        avg_speed: DownloadSpeed,
         /// 所有 Executor 的最终聚合统计信息
         executor_stats: AggregatedStats,
     },
@@ -111,7 +111,7 @@ struct ProgressReporterActor {
     /// 启动时间（用于计算总耗时）
     start_time: std::time::Instant,
     /// 上次实时速度（用于计算加速度）
-    last_instant_speed: Option<DownloadSpeed>,
+    last_instant_speed: DownloadSpeed,
     /// 上次速度记录时间（用于计算加速度）
     last_speed_time: Option<Instant>,
 }
@@ -138,7 +138,7 @@ impl ProgressReporterActor {
             aggregated_stats,
             progress_timer,
             start_time: std::time::Instant::now(),
-            last_instant_speed: None,
+            last_instant_speed: DownloadSpeed::from_raw(0),
             last_speed_time: None,
         }
     }
@@ -226,8 +226,8 @@ impl ProgressReporterActor {
         // 从 aggregated_stats 获取所有 Executor 的统计
         let executor_stats = self.get_aggregated_stats();
 
-        // 一次性获取所有统计数据
-        let summary = executor_stats.get_summary();
+        // 获取统计摘要，如果还在 Pending 状态则不发送进度
+        let summary = executor_stats.get_summary()?;
 
         // 计算百分比（基于已写入字节数）
         let percentage = if self.total_size.get() > 0 {
@@ -243,7 +243,7 @@ impl ProgressReporterActor {
         let instant_acceleration = self.calculate_acceleration(current_instant_speed, now);
 
         // 更新上次速度记录
-        if current_instant_speed.is_some() {
+        if current_instant_speed.as_u64() > 0 {
             self.last_instant_speed = current_instant_speed;
             self.last_speed_time = Some(now);
         }
@@ -266,11 +266,15 @@ impl ProgressReporterActor {
     /// 使用上次记录的实时速度和当前实时速度计算加速度
     fn calculate_acceleration(
         &self,
-        current_speed: Option<DownloadSpeed>,
+        current_speed: DownloadSpeed,
         now: Instant,
     ) -> Option<DownloadAcceleration> {
-        let current = current_speed?;
-        let last_speed = self.last_instant_speed?;
+        if current_speed.as_u64() == 0 {
+            return None;
+        }
+        if self.last_instant_speed.as_u64() == 0 {
+            return None;
+        }
         let last_time = self.last_speed_time?;
 
         let duration = now.duration_since(last_time);
@@ -279,8 +283,8 @@ impl ProgressReporterActor {
         }
 
         Some(DownloadAcceleration::new(
-            last_speed.as_u64(),
-            current.as_u64(),
+            self.last_instant_speed.as_u64(),
+            current_speed.as_u64(),
             duration,
         ))
     }
@@ -289,16 +293,21 @@ impl ProgressReporterActor {
     fn generate_completion_stats(&self) -> DownloadProgress {
         // 从 aggregated_stats 获取所有 Executor 的统计
         let executor_stats = self.get_aggregated_stats();
-        let summary = executor_stats.get_summary();
 
         // 计算总耗时
         let elapsed_secs = self.start_time.elapsed().as_secs_f64();
 
+        // 获取摘要，如果还在 Pending 状态则使用默认值
+        let (written, downloaded, avg) = match executor_stats.get_summary() {
+            Some(s) => (s.written_bytes, s.downloaded_bytes, s.avg_speed),
+            None => (0, 0, DownloadSpeed::from_raw(0)),
+        };
+
         DownloadProgress::Completed {
-            total_written_bytes: summary.written_bytes,
-            total_downloaded_bytes: summary.downloaded_bytes,
+            total_written_bytes: written,
+            total_downloaded_bytes: downloaded,
             total_time: elapsed_secs,
-            avg_speed: summary.avg_speed,
+            avg_speed: avg,
             executor_stats,
         }
     }
@@ -375,7 +384,7 @@ mod tests {
 
     // 辅助函数：创建空的 aggregated_stats
     fn create_empty_aggregated_stats() -> LocalReader<AggregatedStats> {
-        let smr = smr_swap::SmrSwap::new(AggregatedStats::default());
+        let smr = smr_swap::SmrSwap::new(AggregatedStats::Pending);
         smr.local()
     }
 
