@@ -120,8 +120,11 @@ impl ProgressiveLauncherLogic {
         let mut speeds = Vec::with_capacity(aggregated_stats.len());
         let threshold = config.progressive().min_speed_threshold();
 
-        for (_, running_stats) in aggregated_stats.iter_running() {
-            let instant_speed = running_stats.get_instant_speed();
+        for (_, task_stats) in aggregated_stats.iter_running() {
+            // 只处理有速度统计的任务（TaskStats::Running）
+            let Some(instant_speed) = task_stats.get_instant_speed() else {
+                continue;
+            };
 
             // 检查速度是否达标
             if let Some(threshold) = threshold {

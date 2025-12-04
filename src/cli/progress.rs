@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::utils::{format_bytes, format_duration};
 use crate::download::DownloadProgress;
+use crate::pool::download::TaskStats;
 
 /// 进度条管理器
 pub struct ProgressManager {
@@ -137,10 +138,16 @@ impl ProgressManager {
                     (String::new(), String::new())
                 };
 
-                // 计算分块大小范围（只统计运行中的 Executor）
+                // 计算分块大小范围（只统计 TaskStats::Running 的 Executor）
                 let chunk_sizes: Vec<u64> = executor_stats
                     .iter_running()
-                    .map(|(_, s)| s.speed_stats.current_chunk_size)
+                    .filter_map(|(_, task)| {
+                        if let TaskStats::Running { data, .. } = task {
+                            Some(data.speed_stats.current_chunk_size)
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 let chunk_info = if !chunk_sizes.is_empty() {
                     let min_chunk = chunk_sizes.iter().min().copied().unwrap_or(0);
@@ -184,32 +191,32 @@ impl ProgressManager {
                         }
                     }
 
-                    // 按照三个分组更新 worker 进度条：下载中、任务开始、准备中
-                    
-                    // 组 1: 下载中 (Running)
-                    for (&worker_id, running_stats) in executor_stats.iter_running() {
+                    // 按照 TaskStats 状态更新 worker 进度条
+                    for (&worker_id, task_stats) in executor_stats.iter_running() {
                         if let Some(worker_bar) = self.worker_bars.get(worker_id as usize) {
-                            let speed = running_stats.get_instant_speed()
-                                .to_formatted(self.size_standard).to_string();
-                            let msg = format!(
-                                "下载中: {} {}",
-                                format_bytes(running_stats.written_bytes),
-                                speed
-                            );
+                            let msg = match task_stats {
+                                TaskStats::Started { start_time, .. } => {
+                                    let elapsed = start_time.elapsed();
+                                    format!("任务开始: 已运行 {:.1}s", elapsed.as_secs_f64())
+                                }
+                                TaskStats::Running { data, .. } => {
+                                    let speed = data.get_instant_speed()
+                                        .to_formatted(self.size_standard).to_string();
+                                    format!(
+                                        "下载中: {} {}",
+                                        format_bytes(data.written_bytes),
+                                        speed
+                                    )
+                                }
+                                TaskStats::Ended { written_bytes, .. } => {
+                                    format!("任务结束: {}", format_bytes(*written_bytes))
+                                }
+                            };
                             worker_bar.set_message(msg);
                         }
                     }
 
-                    // 组 2: 任务开始 (TaskStarted)
-                    for (&worker_id, start_time) in executor_stats.iter_task_started() {
-                        if let Some(worker_bar) = self.worker_bars.get(worker_id as usize) {
-                            let elapsed = start_time.elapsed();
-                            let msg = format!("任务开始: 已运行 {:.1}s", elapsed.as_secs_f64());
-                            worker_bar.set_message(msg);
-                        }
-                    }
-
-                    // 组 3: 准备中 (Pending)
+                    // Pending 状态
                     for &worker_id in executor_stats.iter_pending() {
                         if let Some(worker_bar) = self.worker_bars.get(worker_id as usize) {
                             worker_bar.set_message("准备中...".to_string());
@@ -253,13 +260,14 @@ impl ProgressManager {
                     }
 
                     // 显示仍在运行的 worker 统计
-                    for (idx, (_, running_stats)) in executor_stats.iter_running().enumerate() {
+                    for (idx, (_, task_stats)) in executor_stats.iter_running().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
-                            let avg_speed_str = running_stats.get_avg_speed()
-                                .to_formatted(self.size_standard).to_string();
+                            let avg_speed_str = task_stats.get_avg_speed()
+                                .map(|s| s.to_formatted(self.size_standard).to_string())
+                                .unwrap_or_else(|| "N/A".to_string());
                             worker_bar.finish_with_message(format!(
                                 "完成：{}, 平均: {}",
-                                format_bytes(running_stats.written_bytes),
+                                format_bytes(task_stats.written_bytes()),
                                 avg_speed_str
                             ));
                         }

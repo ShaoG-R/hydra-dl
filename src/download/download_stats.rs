@@ -10,8 +10,7 @@
 //! - `completed_stats`: 累计已完成 Executor 的统计数据（只累加数值，不存储 ExecutorStats）
 //! - 提供查询接口获取聚合后的统计数据
 
-use crate::pool::download::{ExecutorBroadcast, ExecutorStats, RunningTaskData, TaggedBroadcast, TaskStats};
-use std::time::Instant;
+use crate::pool::download::{ExecutorBroadcast, ExecutorStats, TaggedBroadcast, TaskStats};
 use std::time::Duration;
 use lite_sync::oneshot::lite;
 use log::debug;
@@ -77,12 +76,8 @@ impl CompletedStats {
 pub struct AggregatedStats {
     /// 待命中的 Executor 映射（Pending 状态）
     pub pending_stats_map: FxHashMap<u64, ()>,
-    /// 已启动的任务映射（TaskStats::Started 状态，记录启动时间）
-    pub task_started_stats_map: FxHashMap<u64, Instant>,
-    /// 正在运行的任务统计映射（TaskStats::Running 状态）
-    pub running_stats_map: FxHashMap<u64, RunningTaskData>,
-    /// 已结束的任务映射（TaskStats::Ended 状态，等待下一个任务）
-    pub task_ended_stats_map: FxHashMap<u64, ()>,
+    /// 运行中的 Executor 映射（Running 状态，存储 TaskStats）
+    pub running_stats_map: FxHashMap<u64, TaskStats>,
     /// 已完成 Executor 的累计统计（Stopped 状态）
     pub completed_stats: CompletedStats,
     /// 预计算的下载摘要
@@ -118,8 +113,8 @@ pub struct DownloadSummary {
 }
 
 impl AggregatedStats {
-    /// 获取指定正在运行的任务的统计
-    pub fn get_running(&self, worker_id: u64) -> Option<&RunningTaskData> {
+    /// 获取指定运行中的 Executor 的任务统计
+    pub fn get_running(&self, worker_id: u64) -> Option<&TaskStats> {
         self.running_stats_map.get(&worker_id)
     }
 
@@ -128,19 +123,9 @@ impl AggregatedStats {
         self.pending_stats_map.len()
     }
 
-    /// 获取已启动的任务数量
-    pub fn task_started_count(&self) -> usize {
-        self.task_started_stats_map.len()
-    }
-
-    /// 获取正在运行的任务数量
+    /// 获取运行中的 Executor 数量
     pub fn running_count(&self) -> usize {
         self.running_stats_map.len()
-    }
-
-    /// 获取已结束的任务数量
-    pub fn task_ended_count(&self) -> usize {
-        self.task_ended_stats_map.len()
     }
 
     /// 获取已完成的 Executor 数量
@@ -148,21 +133,17 @@ impl AggregatedStats {
         self.completed_stats.count
     }
 
-    /// 获取总 Executor 数量（待命 + 已启动 + 运行中 + 已结束 + 已完成）
+    /// 获取总 Executor 数量（待命 + 运行中 + 已完成）
     pub fn total_count(&self) -> u64 {
         self.pending_stats_map.len() as u64
-            + self.task_started_stats_map.len() as u64
             + self.running_stats_map.len() as u64
-            + self.task_ended_stats_map.len() as u64
             + self.completed_stats.count
     }
 
     /// 检查是否没有任何 Executor
     pub fn is_empty(&self) -> bool {
         self.pending_stats_map.is_empty()
-            && self.task_started_stats_map.is_empty()
             && self.running_stats_map.is_empty()
-            && self.task_ended_stats_map.is_empty()
             && self.completed_stats.count == 0
     }
 
@@ -171,17 +152,12 @@ impl AggregatedStats {
         self.pending_stats_map.keys()
     }
 
-    /// 迭代所有已启动的任务（返回 worker_id 和启动时间）
-    pub fn iter_task_started(&self) -> impl Iterator<Item = (&u64, &Instant)> {
-        self.task_started_stats_map.iter()
-    }
-
-    /// 迭代所有正在运行的任务统计
-    pub fn iter_running(&self) -> impl Iterator<Item = (&u64, &RunningTaskData)> {
+    /// 迭代所有运行中的 Executor 统计
+    pub fn iter_running(&self) -> impl Iterator<Item = (&u64, &TaskStats)> {
         self.running_stats_map.iter()
     }
 
-    /// 获取正在运行的任务数量（别名，用于兼容旧 API）
+    /// 获取运行中的 Executor 数量（别名，用于兼容旧 API）
     pub fn len(&self) -> usize {
         self.running_stats_map.len()
     }
@@ -191,31 +167,34 @@ impl AggregatedStats {
         &self.completed_stats
     }
 
-    /// 获取所有运行中任务的总窗口平均速度
+    /// 获取所有运行中 Executor 的总窗口平均速度
     ///
-    /// 将所有运行中任务的窗口平均速度相加
+    /// 将所有 TaskStats::Running 的窗口平均速度相加
     pub fn get_total_window_avg_speed(&self) -> Option<DownloadSpeed> {
         self.running_stats_map
             .values()
-            .map(|s| s.get_window_avg_speed().as_u64())
+            .filter_map(|s| s.get_window_avg_speed())
+            .map(|s| s.as_u64())
             .reduce(|a, b| a + b)
             .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取所有运行中任务的总实时速度
+    /// 获取所有运行中 Executor 的总实时速度
     pub fn get_total_instant_speed(&self) -> Option<DownloadSpeed> {
         self.running_stats_map
             .values()
-            .map(|s| s.get_instant_speed().as_u64())
+            .filter_map(|s| s.get_instant_speed())
+            .map(|s| s.as_u64())
             .reduce(|a, b| a + b)
             .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取所有运行中任务的总平均速度
+    /// 获取所有运行中 Executor 的总平均速度
     pub fn get_total_avg_speed(&self) -> Option<DownloadSpeed> {
         self.running_stats_map
             .values()
-            .map(|s| s.get_avg_speed().as_u64())
+            .filter_map(|s| s.get_avg_speed())
+            .map(|s| s.as_u64())
             .reduce(|a, b| a + b)
             .map(DownloadSpeed::from_raw)
     }
@@ -239,7 +218,7 @@ impl AggregatedStats {
 
 /// 从 running_stats_map 和 completed_stats 计算 DownloadSummary
 fn compute_summary(
-    running_stats_map: &FxHashMap<u64, RunningTaskData>,
+    running_stats_map: &FxHashMap<u64, TaskStats>,
     completed_stats: &CompletedStats,
 ) -> DownloadSummary {
     let mut avg_speed: u64 = 0;
@@ -250,15 +229,16 @@ fn compute_summary(
     let mut written_bytes: u64 = 0;
     let mut downloaded_bytes: u64 = 0;
 
-    for data in running_stats_map.values() {
-        written_bytes += data.written_bytes;
-        downloaded_bytes += data.downloaded_bytes;
+    for task_stats in running_stats_map.values() {
+        written_bytes += task_stats.written_bytes();
+        downloaded_bytes += task_stats.downloaded_bytes();
 
-        // 速度统计从运行中的任务获取
-        let speed_stats = data.get_speed_stats();
-        avg_speed += speed_stats.avg_speed.as_u64();
-        instant_speed += speed_stats.instant_speed.as_u64();
-        window_avg_speed += speed_stats.window_avg_speed.as_u64();
+        // 速度统计仅从 TaskStats::Running 获取
+        if let Some(speed_stats) = task_stats.get_speed_stats() {
+            avg_speed += speed_stats.avg_speed.as_u64();
+            instant_speed += speed_stats.instant_speed.as_u64();
+            window_avg_speed += speed_stats.window_avg_speed.as_u64();
+        }
     }
 
     // 加上已完成 Executor 的累计字节数
@@ -388,28 +368,15 @@ impl DownloadStats {
                     // 待命状态，添加到 pending_stats_map
                     s.pending_stats_map.insert(worker_id, ());
                 }
-                ExecutorStats::Running(TaskStats::Started { start_time, .. }) => {
-                    // 任务已启动，从 pending/task_ended 移除，添加到 task_started
+                ExecutorStats::Running(task_stats) => {
+                    // Running 状态，从 pending 移除，更新到 running_stats_map
                     s.pending_stats_map.remove(&worker_id);
-                    s.task_ended_stats_map.remove(&worker_id);
-                    s.task_started_stats_map.insert(worker_id, start_time);
-                }
-                ExecutorStats::Running(TaskStats::Running { data, .. }) => {
-                    // 任务运行中，从 task_started 移除，更新到 running_stats_map
-                    s.task_started_stats_map.remove(&worker_id);
-                    s.running_stats_map.insert(worker_id, data);
-                }
-                ExecutorStats::Running(TaskStats::Ended { .. }) => {
-                    // 任务已结束，从 running_stats_map 移除，添加到 task_ended
-                    s.running_stats_map.remove(&worker_id);
-                    s.task_ended_stats_map.insert(worker_id, ());
+                    s.running_stats_map.insert(worker_id, task_stats);
                 }
                 ExecutorStats::Stopped(stopped_stats) => {
                     // Executor 已停止，从所有映射移除并累加到 completed_stats
                     s.pending_stats_map.remove(&worker_id);
-                    s.task_started_stats_map.remove(&worker_id);
                     s.running_stats_map.remove(&worker_id);
-                    s.task_ended_stats_map.remove(&worker_id);
                     s.completed_stats.accumulate(
                         stopped_stats.total_duration,
                         stopped_stats.downloaded_bytes,
@@ -430,17 +397,7 @@ impl DownloadStats {
 
             // 从所有状态映射中移除
             s.pending_stats_map.remove(&worker_id);
-            s.task_started_stats_map.remove(&worker_id);
-            s.task_ended_stats_map.remove(&worker_id);
-
-            // 如果任务还在 running_stats_map 中，累加到 completed_stats
-            if let Some(running_data) = s.running_stats_map.remove(&worker_id) {
-                s.completed_stats.accumulate(
-                    running_data.current_duration,
-                    running_data.downloaded_bytes,
-                    running_data.written_bytes,
-                );
-            }
+            s.running_stats_map.remove(&worker_id);
 
             s.summary = compute_summary(&s.running_stats_map, &s.completed_stats);
             s
