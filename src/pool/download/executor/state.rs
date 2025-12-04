@@ -49,6 +49,11 @@ impl RunningState {
     pub fn into_task_state(self) -> TaskState {
         TaskState::Running(self)
     }
+
+    /// 设置统计数据
+    fn set_stats(&mut self, stats: WorkerStatsActive) {
+        self.stats = stats;
+    }
 }
 
 /// Ended 状态数据封装
@@ -113,91 +118,96 @@ impl TaskState {
 // 内部状态机实现
 // ==========================================
 
-/// 内部任务状态（包含 Pending）
+/// 初始状态
 #[derive(Debug)]
-pub(crate) enum TaskInternalState {
-    /// 初始状态
-    Pending,
-    /// 活跃状态
-    Active(TaskState),
+pub struct Pending;
+
+/// 活跃状态（Started 或 Running）
+#[derive(Debug)]
+pub enum Active {
+    Started(StartedState),
+    Running(RunningState),
 }
 
-impl TaskInternalState {
+/// 内部任务状态（泛型状态机）
+#[derive(Debug)]
+pub(crate) struct TaskInternalState<S> {
+    pub state: S,
+}
+
+impl TaskInternalState<Pending> {
     /// 创建新的内部状态（Pending）
     pub fn new() -> Self {
-        Self::Pending
+        Self { state: Pending }
     }
 
-    /// 转换到 Started 状态，并返回 StartedState
-    pub fn transition_to_started(&mut self) -> StartedState {
-        let state_struct = StartedState {
+    /// 转换到 Started 状态
+    pub fn transition_to_started(self) -> TaskInternalState<Active> {
+        let started = StartedState {
             start_time: Instant::now(),
         };
-
-        *self = TaskInternalState::Active(TaskState::Started(state_struct.clone()));
-        state_struct
+        TaskInternalState {
+            state: Active::Started(started),
+        }
     }
+}
 
-    /// 转换到 Running 状态，并返回 RunningState
-    pub fn transition_to_running(&mut self, stats: WorkerStatsActive) -> Option<RunningState> {
-        // 只有从 Started 状态才能首次进入 Running
-        if let TaskInternalState::Active(TaskState::Started(started)) = self {
-            let state_struct = RunningState {
-                start_time: started.start_time,
-                stats,
-            };
-
-            *self = TaskInternalState::Active(TaskState::Running(state_struct.clone()));
-            Some(state_struct)
-        } else {
-            None
+impl TaskInternalState<Active> {
+    /// 转换到 Running 状态或更新统计数据
+    ///
+    /// 如果当前是 Started，则转换为 Running。
+    /// 如果当前是 Running，则更新统计数据。
+    pub fn transition_to_running(&mut self, stats: WorkerStatsActive) {
+        match &mut self.state {
+            Active::Started(started) => {
+                let running = RunningState {
+                    start_time: started.start_time,
+                    stats,
+                };
+                self.state = Active::Running(running);
+            }
+            Active::Running(running) => {
+                running.set_stats(stats);
+            }
         }
     }
 
-    /// 更新统计数据，并返回最新的 RunningState
-    pub fn update_stats(&mut self, new_stats: WorkerStatsActive) -> Option<RunningState> {
-        // 只有在 Running 状态下才能更新
-        if let TaskInternalState::Active(TaskState::Running(running)) = self {
-            let state_struct = RunningState {
-                start_time: running.start_time,
-                stats: new_stats,
-            };
-
-            *self = TaskInternalState::Active(TaskState::Running(state_struct.clone()));
-            Some(state_struct)
-        } else {
-            None
-        }
-    }
-
-    /// 转换到 Ended 状态，并返回 EndedState
-    pub fn transition_to_ended(&mut self) -> Option<EndedState> {
-        let elapsed = match self {
-            TaskInternalState::Active(TaskState::Started(s)) => s.start_time.elapsed(),
-            TaskInternalState::Active(TaskState::Running(s)) => s.start_time.elapsed(),
-            _ => return None,
+    /// 转换到 Ended 状态
+    pub fn transition_to_ended(self) -> TaskInternalState<EndedState> {
+        let start_time = match &self.state {
+            Active::Started(s) => s.start_time,
+            Active::Running(s) => s.start_time,
         };
 
         let state_struct = EndedState {
-            consumed_time: elapsed,
+            consumed_time: start_time.elapsed(),
         };
 
-        *self = TaskInternalState::Active(TaskState::Ended(state_struct.clone()));
-        Some(state_struct)
+        TaskInternalState {
+            state: state_struct,
+        }
     }
 
-    /// 检查是否为 Started 状态
-    pub fn is_started(&self) -> bool {
-        matches!(self, TaskInternalState::Active(TaskState::Started(_)))
-    }
-
-    /// 检查是否为 Running 状态
-    pub fn is_running(&self) -> bool {
-        matches!(self, TaskInternalState::Active(TaskState::Running(_)))
+    /// 获取当前状态对应的 TaskState
+    pub fn as_task_state(&self) -> TaskState {
+        match &self.state {
+            Active::Started(s) => TaskState::Started(s.clone()),
+            Active::Running(s) => TaskState::Running(s.clone()),
+        }
     }
 }
 
-impl Default for TaskInternalState {
+impl TaskInternalState<EndedState> {
+    pub fn consumed_time(&self) -> Duration {
+        self.state.consumed_time
+    }
+
+    pub fn into_task_state(self) -> TaskState {
+        TaskState::Ended(self.state)
+    }
+}
+
+impl Default for TaskInternalState<Pending> {
     fn default() -> Self {
         Self::new()
     }

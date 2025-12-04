@@ -4,7 +4,7 @@
 //! 提供单一入口获取下一个待执行任务。
 
 use super::retry_scheduler::RetryScheduler;
-use super::state::TaskInternalState;
+use super::state::{Pending, TaskInternalState};
 use crate::config::RetryConfig;
 use log::debug;
 use ranged_mmap::allocator::concurrent::Allocator as ConcurrentAllocator;
@@ -18,13 +18,13 @@ pub(crate) enum AllocatedTask {
     /// 新分配的任务
     New {
         range: ranged_mmap::AllocatedRange,
-        state: TaskInternalState,
+        state: TaskInternalState<Pending>,
     },
     /// 重试任务
     Retry {
         range: ranged_mmap::AllocatedRange,
         retry_count: usize,
-        state: TaskInternalState,
+        state: TaskInternalState<Pending>,
     },
 }
 

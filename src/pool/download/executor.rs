@@ -25,7 +25,7 @@ use crate::utils::{
 pub(crate) use file_writer::FileWriter;
 use log::{debug, error, info, warn};
 use ranged_mmap::{AllocatedRange, SplitDownResult};
-use state::TaskInternalState;
+use state::{Active, TaskInternalState};
 use std::time::Duration;
 use task_allocator::{AllocatedTask, AllocationResult, TaskAllocator};
 use tokio::sync::oneshot;
@@ -55,9 +55,8 @@ impl ExecutorCumulativeStats {
 pub(crate) struct DownloadChunkRecorder<'a> {
     stats: &'a mut WorkerStatsRecording,
     stats_handle: &'a StatsUpdaterHandle,
-    state: &'a mut TaskInternalState,
+    state: &'a mut TaskInternalState<Active>,
     cumulative_stats: &'a mut ExecutorCumulativeStats,
-    worker_id: WorkerId,
 }
 
 impl ChunkRecorder for DownloadChunkRecorder<'_> {
@@ -68,27 +67,14 @@ impl ChunkRecorder for DownloadChunkRecorder<'_> {
             self.cumulative_stats.total_downloaded_bytes += bytes;
 
             // 更新状态
-            let running = if self.state.is_started() {
-                self.state.transition_to_running(active)
-            } else if self.state.is_running() {
-                self.state.update_stats(active)
-            } else {
-                None
-            };
+            self.state.transition_to_running(active);
 
             // 发送状态更新
-            if let Some(state) = running {
-                self.stats_handle.send_state_update(
-                    state.into_task_state(),
-                    self.cumulative_stats.total_downloaded_bytes,
-                    self.cumulative_stats.total_consumed_time,
-                );
-            } else {
-                warn!(
-                    "Worker {} record_chunk: TaskState 既不是Started也不是Running",
-                    self.worker_id
-                );
-            }
+            self.stats_handle.send_state_update(
+                self.state.as_task_state(),
+                self.cumulative_stats.total_downloaded_bytes,
+                self.cumulative_stats.total_consumed_time,
+            );
         }
     }
 }
@@ -247,7 +233,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             let chunk_size = stats_handle.read_chunk_size();
 
             let action = match context.task_allocator.next_task(chunk_size) {
-                AllocationResult::Task(mut task) => {
+                AllocationResult::Task(task) => {
                     let range = task.range().clone();
                     let retry_count = task.retry_count();
 
@@ -280,7 +266,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                             }
                         }
                         result = self.execute_single_task(
-                            &mut task,
+                            task,
                             &mut runtime,
                             task_cancel_rx,
                         ) => LoopAction::TaskCompleted(result)
@@ -373,27 +359,29 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
     /// 返回任务执行结果，不进行重试循环
     async fn execute_single_task(
         &mut self,
-        task: &mut AllocatedTask,
+        task: AllocatedTask,
         runtime: &mut ExecutorRuntime<'_>,
         cancel_rx: oneshot::Receiver<()>,
     ) -> TaskResult {
-        let range = task.range().clone();
-        let retry_count = task.retry_count();
+        let (range, retry_count, pending_state) = match task {
+            AllocatedTask::New { range, state } => (range, 0, state),
+            AllocatedTask::Retry {
+                range,
+                retry_count,
+                state,
+            } => (range, retry_count, state),
+        };
+
         let (start, end) = range.as_range_tuple();
         debug!(
             "Worker {} 执行 Range 任务: {} (range {}..{}, retry {})",
             self.worker_id, runtime.context.url, start, end, retry_count
         );
 
-        // 任务开始，发送信号到辅助协程
-        let state = match task {
-            AllocatedTask::New { state, .. } | AllocatedTask::Retry { state, .. } => state,
-        };
-
         runtime.stats.clear_samples();
-        let started = state.transition_to_started();
+        let mut active_state = pending_state.transition_to_started();
         runtime.stats_handle.send_state_update(
-            started.into_task_state(),
+            active_state.as_task_state(),
             self.cumulative_stats.total_downloaded_bytes,
             self.cumulative_stats.total_consumed_time,
         );
@@ -402,9 +390,8 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         let mut recorder = DownloadChunkRecorder {
             stats: runtime.stats,
             stats_handle: runtime.stats_handle,
-            state,
+            state: &mut active_state,
             cumulative_stats: &mut self.cumulative_stats,
-            worker_id: self.worker_id,
         };
 
         // Inline fetch_range logic to avoid borrowing self immutably while state is borrowed mutably
@@ -421,9 +408,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         .await;
 
         // 任务结束，发送信号到辅助协程
-        let state = state
-            .transition_to_ended()
-            .expect("逻辑错误，TaskState 转换到 End 状态失败");
+        let state = active_state.transition_to_ended();
 
         self.cumulative_stats.total_consumed_time += state.consumed_time();
 
