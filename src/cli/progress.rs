@@ -197,19 +197,20 @@ impl ProgressManager {
                             let msg = match task_stats {
                                 TaskStats::Started { start_time, .. } => {
                                     let elapsed = start_time.elapsed();
-                                    format!("任务开始: 已运行 {:.1}s", elapsed.as_secs_f64())
+                                    format!("[任务开始] 已运行 {:.1}s, 等待接受下载信息", elapsed.as_secs_f64())
                                 }
                                 TaskStats::Running { data, .. } => {
                                     let speed = data.get_instant_speed()
                                         .to_formatted(self.size_standard).to_string();
                                     format!(
-                                        "下载中: {} {}",
+                                        "[下载中] 当前速度 {}, 已下载 {}, 已写入 {}",
+                                        speed,
+                                        format_bytes(data.downloaded_bytes),
                                         format_bytes(data.written_bytes),
-                                        speed
                                     )
                                 }
                                 TaskStats::Ended { written_bytes, .. } => {
-                                    format!("任务结束: {}", format_bytes(*written_bytes))
+                                    format!("[任务完成] 写入 {}, 等待分配下一任务...", format_bytes(*written_bytes))
                                 }
                             };
                             worker_bar.set_message(msg);
