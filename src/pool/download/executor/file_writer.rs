@@ -131,7 +131,11 @@ impl FileWriter {
     /// 使用 `send().await` 等待通道有空间，提供背压
     /// 当 Writer 协程关闭时返回 Err
     #[inline]
-    pub(crate) async fn write(&self, range: AllocatedRange, data: Bytes) -> Result<(), mpsc::error::SendError<WriteRequest>> {
+    pub(crate) async fn write(
+        &self,
+        range: AllocatedRange,
+        data: Bytes,
+    ) -> Result<(), mpsc::error::SendError<WriteRequest>> {
         if let Some(tx) = &self.write_tx {
             tx.send(WriteRequest { range, data }).await
         } else {
@@ -151,7 +155,10 @@ impl FileWriter {
         // 等待 Actor 任务完成
         if let Some(handle) = self.actor_handle.take() {
             let _ = handle.await;
-            debug!("Worker {} FileWriter actor has fully stopped", self.worker_id);
+            debug!(
+                "Worker {} FileWriter actor has fully stopped",
+                self.worker_id
+            );
         }
     }
 
@@ -165,7 +172,10 @@ impl FileWriter {
         // 等待 Actor 任务完成
         if let Some(handle) = self.actor_handle.take() {
             let _ = handle.await;
-            debug!("Worker {} FileWriter actor drained and stopped", self.worker_id);
+            debug!(
+                "Worker {} FileWriter actor drained and stopped",
+                self.worker_id
+            );
         }
     }
 }
@@ -276,12 +286,12 @@ impl FileWriterActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU64;
-    use tempfile::tempdir;
-    use tokio::sync::broadcast;
     use crate::pool::common::WorkerId;
     use crate::pool::download::stats_updater::{StatsUpdater, WorkerBroadcaster};
     use crate::utils::chunk_strategy::SpeedBasedChunkStrategy;
+    use std::num::NonZeroU64;
+    use tempfile::tempdir;
+    use tokio::sync::broadcast;
 
     #[tokio::test]
     async fn test_file_writer_shutdown() {

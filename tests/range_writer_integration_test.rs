@@ -27,7 +27,9 @@ async fn test_concurrent_writes_simulation() {
     // 预先分配所有 Range
     let mut ranges = Vec::new();
     for i in 0..range_count {
-        let range = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
+        let range = allocator
+            .allocate(NonZeroU64::new(range_size).unwrap())
+            .unwrap();
         ranges.push((i, range));
     }
 
@@ -157,13 +159,25 @@ async fn test_uneven_ranges() {
         MmapWriter::new(file_path.clone(), NonZeroU64::new(total_size).unwrap()).unwrap();
 
     // 分配 3 个 4K Range
-    let range0 = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
-    let range1 = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
-    let range2 = allocator.allocate(NonZeroU64::new(range_size).unwrap()).unwrap();
+    let range0 = allocator
+        .allocate(NonZeroU64::new(range_size).unwrap())
+        .unwrap();
+    let range1 = allocator
+        .allocate(NonZeroU64::new(range_size).unwrap())
+        .unwrap();
+    let range2 = allocator
+        .allocate(NonZeroU64::new(range_size).unwrap())
+        .unwrap();
 
-    writer.write_range(range0, vec![1u8; range_size as usize].as_ref()).unwrap();
-    writer.write_range(range1, vec![2u8; range_size as usize].as_ref()).unwrap();
-    writer.write_range(range2, vec![3u8; range_size as usize].as_ref()).unwrap();
+    writer
+        .write_range(range0, vec![1u8; range_size as usize].as_ref())
+        .unwrap();
+    writer
+        .write_range(range1, vec![2u8; range_size as usize].as_ref())
+        .unwrap();
+    writer
+        .write_range(range2, vec![3u8; range_size as usize].as_ref())
+        .unwrap();
 
     assert!(writer.is_complete());
     writer.finalize().unwrap();
@@ -171,9 +185,18 @@ async fn test_uneven_ranges() {
     // 验证文件内容
     let content = fs::read(&file_path).await.unwrap();
     assert_eq!(content.len(), total_size as usize);
-    assert_eq!(&content[0..range_size as usize], &vec![1u8; range_size as usize][..]);
-    assert_eq!(&content[range_size as usize..range_size as usize * 2], &vec![2u8; range_size as usize][..]);
-    assert_eq!(&content[range_size as usize * 2..total_size as usize], &vec![3u8; range_size as usize][..]);
+    assert_eq!(
+        &content[0..range_size as usize],
+        &vec![1u8; range_size as usize][..]
+    );
+    assert_eq!(
+        &content[range_size as usize..range_size as usize * 2],
+        &vec![2u8; range_size as usize][..]
+    );
+    assert_eq!(
+        &content[range_size as usize * 2..total_size as usize],
+        &vec![3u8; range_size as usize][..]
+    );
 }
 
 /// 测试大量 4K 对齐的 Range

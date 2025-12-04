@@ -10,8 +10,7 @@ pub struct Defaults;
 
 impl Defaults {
     /// 绝对速度阈值：100 KB/s
-    pub const ABSOLUTE_SPEED_THRESHOLD: NonZeroU64 =
-        unsafe { NonZeroU64::new_unchecked(100 * KB) };
+    pub const ABSOLUTE_SPEED_THRESHOLD: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100 * KB) };
     /// 是否启用健康检查
     pub const ENABLED: bool = true;
     /// 相对速度阈值（worker 速度低于健康基准的此比例时被视为显著慢速）
@@ -48,7 +47,8 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         let history_size = Defaults::HISTORY_SIZE;
-        let anomaly_threshold = (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
+        let anomaly_threshold =
+            (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
         Self {
             enabled: Defaults::ENABLED,
             absolute_speed_threshold: Some(Defaults::ABSOLUTE_SPEED_THRESHOLD),
@@ -109,7 +109,8 @@ impl HealthCheckConfigBuilder {
     /// 创建新的健康检查配置构建器（使用默认值）
     pub fn new() -> Self {
         let history_size = Defaults::HISTORY_SIZE;
-        let anomaly_threshold = (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
+        let anomaly_threshold =
+            (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
         Self {
             enabled: Defaults::ENABLED,
             absolute_speed_threshold: Some(Defaults::ABSOLUTE_SPEED_THRESHOLD),

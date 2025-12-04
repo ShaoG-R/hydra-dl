@@ -2,7 +2,6 @@
 //!
 //! 提供下载任务的配置选项，按功能域分类组织
 
-
 // ==================== 子模块 ====================
 
 pub mod chunk;
@@ -16,10 +15,16 @@ pub mod speed;
 // ==================== 重导出 ====================
 
 pub use chunk::{ChunkConfig, ChunkConfigBuilder, Defaults as ChunkDefaults};
-pub use concurrency::{ConcurrencyConfig, ConcurrencyConfigBuilder, Defaults as ConcurrencyDefaults};
-pub use health_check::{Defaults as HealthCheckDefaults, HealthCheckConfig, HealthCheckConfigBuilder};
+pub use concurrency::{
+    ConcurrencyConfig, ConcurrencyConfigBuilder, Defaults as ConcurrencyDefaults,
+};
+pub use health_check::{
+    Defaults as HealthCheckDefaults, HealthCheckConfig, HealthCheckConfigBuilder,
+};
 pub use network::{Defaults as NetworkDefaults, NetworkConfig, NetworkConfigBuilder};
-pub use progressive::{Defaults as ProgressiveDefaults, ProgressiveConfig, ProgressiveConfigBuilder};
+pub use progressive::{
+    Defaults as ProgressiveDefaults, ProgressiveConfig, ProgressiveConfigBuilder,
+};
 pub use retry::{Defaults as RetryDefaults, RetryConfig, RetryConfigBuilder};
 pub use speed::{Defaults as SpeedDefaults, SpeedConfig, SpeedConfigBuilder};
 
@@ -362,11 +367,7 @@ mod tests {
     fn test_download_config_builder() {
         let config = DownloadConfig::builder()
             .concurrency(|c| c.worker_count(8))
-            .chunk(|c| {
-                c.min_size(1 * MB)
-                    .initial_size(10 * MB)
-                    .max_size(100 * MB)
-            })
+            .chunk(|c| c.min_size(1 * MB).initial_size(10 * MB).max_size(100 * MB))
             .build();
 
         assert_eq!(config.concurrency().worker_count(), 8);

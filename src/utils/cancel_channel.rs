@@ -261,10 +261,7 @@ mod tests {
         });
 
         // 新任务的 rx 不应该收到取消信号
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(50),
-            &mut rx,
-        ).await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(50), &mut rx).await;
 
         // 应该超时，因为取消信号没有发送到新 channel
         assert!(result.is_err());

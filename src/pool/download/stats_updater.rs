@@ -18,13 +18,13 @@
 //! `current_chunk_size` 由 `Arc<AtomicU64>` 维护，Executor 通过原子操作读取。
 //! 当 `ChunkSampled` 消息到达时，使用 `ChunkStrategy` 计算新的 chunk size 并更新。
 
+use crate::pool::common::WorkerId;
 use crate::utils::chunk_strategy::ChunkStrategy;
 use crate::utils::stats::{SpeedStats, WorkerStatsActive};
 use log::{debug, warn};
 use net_bytes::DownloadSpeed;
-use crate::pool::common::WorkerId;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -131,7 +131,9 @@ impl TaskStats {
         match self {
             TaskStats::Started { .. } => 0,
             TaskStats::Running { data, .. } => data.downloaded_bytes,
-            TaskStats::Ended { downloaded_bytes, .. } => *downloaded_bytes,
+            TaskStats::Ended {
+                downloaded_bytes, ..
+            } => *downloaded_bytes,
         }
     }
 
@@ -682,7 +684,7 @@ impl StatsUpdater {
 
         self.broadcast_stats();
     }
-    
+
     /// 广播 ExecutorStats
     #[inline]
     fn broadcast_stats(&self) {

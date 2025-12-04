@@ -109,7 +109,6 @@ pub trait WorkerFactory: Send + Sync + 'static {
     ) -> Vec<JoinHandle<()>>;
 }
 
-
 /// 单个 Worker 的槽位
 ///
 /// 封装了与单个 worker 交互所需的所有信息。
@@ -146,16 +145,14 @@ pub struct WorkerPool<F: WorkerFactory> {
 
 impl<F: WorkerFactory> WorkerPool<F> {
     /// 启动单个 worker（内部辅助方法）
-    fn spawn_worker_internal(
-        &self,
-        worker_id: WorkerId,
-        input: F::Input,
-    ) -> WorkerSlot {
+    fn spawn_worker_internal(&self, worker_id: WorkerId, input: F::Input) -> WorkerSlot {
         // 创建关闭通道
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
 
         // 让工厂启动协程组
-        let join_handles = self.factory.spawn_worker(worker_id, shutdown_receiver, input);
+        let join_handles = self
+            .factory
+            .spawn_worker(worker_id, shutdown_receiver, input);
 
         WorkerSlot {
             shutdown_sender,
@@ -268,8 +265,8 @@ impl<F: WorkerFactory> WorkerPool<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{Duration, sleep};
 
     /// 测试用的简单工厂

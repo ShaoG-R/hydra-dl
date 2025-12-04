@@ -15,9 +15,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub(crate) enum AllocatedTask {
     /// 新分配的任务
-    New {
-        range: ranged_mmap::AllocatedRange,
-    },
+    New { range: ranged_mmap::AllocatedRange },
     /// 重试任务
     Retry {
         range: ranged_mmap::AllocatedRange,
@@ -224,7 +222,10 @@ mod tests {
         task_alloc.advance_task_id();
 
         // 没有更多任务
-        assert!(matches!(task_alloc.next_task(PAGE_SIZE), AllocationResult::Done));
+        assert!(matches!(
+            task_alloc.next_task(PAGE_SIZE),
+            AllocationResult::Done
+        ));
     }
 
     #[test]

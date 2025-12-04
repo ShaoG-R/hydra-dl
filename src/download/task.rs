@@ -1,16 +1,14 @@
 use crate::DownloadError;
 use crate::download::DownloadTaskParams;
 use crate::download::download_stats::{DownloadStats, DownloadStatsHandle};
+use crate::download::{
+    progress_reporter::{ProgressReporter, ProgressReporterParams},
+    progressive::{ProgressiveLauncher, ProgressiveLauncherParams, WorkerLaunchRequest},
+    worker_health_checker::{WorkerHealthChecker, WorkerHealthCheckerParams},
+};
 use crate::pool::download::{DownloadWorkerHandle, DownloadWorkerPool, ExecutorResult};
 use crate::utils::io_traits::HttpClient;
 use crate::utils::writer::MmapWriter;
-use crate::{
-    download::{
-        progress_reporter::{ProgressReporter, ProgressReporterParams},
-        progressive::{ProgressiveLauncher, ProgressiveLauncherParams, WorkerLaunchRequest},
-        worker_health_checker::{WorkerHealthChecker, WorkerHealthCheckerParams},
-    },
-};
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::{error, info, warn};
 use ranged_mmap::AllocatedRange;
@@ -142,13 +140,15 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     ///
     /// Worker 自主分配任务并重试，这里只监听结果
     /// 如果有任务达到最大重试次数，将终止下载并返回错误
-    pub(super) async fn wait_for_completion(&mut self) -> crate::Result<Vec<(AllocatedRange, String)>> {
+    pub(super) async fn wait_for_completion(
+        &mut self,
+    ) -> crate::Result<Vec<(AllocatedRange, String)>> {
         // 事件循环：处理 worker 结果和启动请求
         loop {
             tokio::select! {
                 // 处理 worker 启动请求
                 Some(request) = self.launch_request_rx.recv() => {
-                    
+
                     self.handle_launch_request(request).await;
                 },
                 // 处理 worker 结果（从 FuturesUnordered 中获取）
@@ -156,7 +156,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                     match result {
                         Ok(ExecutorResult::Success { worker_id }) => {
                             info!("Worker {} 完成任务", worker_id);
-                            
+
                             // 检查是否所有写入完成
                             if self.writer.is_complete() {
                                 info!("所有写入已完成");
@@ -173,7 +173,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                                 );
                             }
                             self.failed_ranges.extend(failed_ranges);
-                            
+
                             info!("有任务永久失败，终止下载");
                             break;
                         }
@@ -204,7 +204,8 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         if self.failed_ranges.is_empty() {
             Ok(Vec::new())
         } else {
-            let error_details: Vec<String> = self.failed_ranges
+            let error_details: Vec<String> = self
+                .failed_ranges
                 .iter()
                 .map(|(range, error)| {
                     let (start, end) = range.as_range_tuple();

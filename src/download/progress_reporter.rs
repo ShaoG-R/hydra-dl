@@ -340,9 +340,7 @@ impl ProgressReporter {
             ProgressReporterActor::new(params, message_rx).run().await;
         });
 
-        Self {
-            message_tx,
-        }
+        Self { message_tx }
     }
 
     /// 发送开始事件

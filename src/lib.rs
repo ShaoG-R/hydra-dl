@@ -128,13 +128,13 @@ pub mod pool {
     pub mod download;
 }
 pub mod utils {
+    pub mod cancel_channel;
     pub(crate) mod chunk_strategy;
     pub mod fetch;
     pub mod io_traits;
     pub(crate) mod speed_calculator;
     pub(crate) mod stats;
     pub mod writer;
-    pub mod cancel_channel;
 }
 
 /// 常用单位常量

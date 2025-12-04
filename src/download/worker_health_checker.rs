@@ -19,7 +19,9 @@
 mod logic;
 
 use crate::config::DownloadConfig;
-use crate::pool::download::{DownloadWorkerHandle, ExecutorBroadcast, ExecutorStats, TaggedBroadcast};
+use crate::pool::download::{
+    DownloadWorkerHandle, ExecutorBroadcast, ExecutorStats, TaggedBroadcast,
+};
 use crate::utils::cancel_channel::CancelHandle;
 use lite_sync::oneshot::lite;
 use log::{debug, warn};
@@ -28,8 +30,8 @@ use smr_swap::LocalReader;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use logic::{ExecutorHealthTracker, Speed, WorkerHealthCheckerLogic};
 pub use logic::WorkerSpeed;
+use logic::{ExecutorHealthTracker, Speed, WorkerHealthCheckerLogic};
 
 /// 健康检查器参数
 pub(super) struct WorkerHealthCheckerParams {
@@ -190,15 +192,16 @@ impl WorkerHealthCheckerActor {
                     "Worker #{} 相对速度异常次数过多 ({}/{}), 取消当前下载",
                     worker_id, anomaly_count, self.history_size
                 );
-                
+
                 // 使用之前获取的句柄取消
                 if let Some(handle) = cancel_handle {
-                    self.cancel_with_handle(worker_id, handle, format!(
-                        "相对速度异常 ({}/{})",
-                        anomaly_count, self.history_size
-                    ));
+                    self.cancel_with_handle(
+                        worker_id,
+                        handle,
+                        format!("相对速度异常 ({}/{})", anomaly_count, self.history_size),
+                    );
                 }
-                
+
                 // 重置该 worker 的健康追踪器
                 self.reset_worker_tracking(worker_id);
             }
@@ -259,7 +262,10 @@ impl WorkerHealthCheckerActor {
         if handle.cancel() {
             debug!("Worker #{} 已取消: {}", worker_id, reason);
         } else {
-            warn!("Worker #{} 发送取消信号失败 (task_id 不匹配或 channel 已关闭)", worker_id);
+            warn!(
+                "Worker #{} 发送取消信号失败 (task_id 不匹配或 channel 已关闭)",
+                worker_id
+            );
         }
     }
 }
@@ -281,7 +287,9 @@ impl WorkerHealthChecker {
 
         // 启动 actor 任务
         let actor_handle = tokio::spawn(async move {
-            WorkerHealthCheckerActor::new(params, shutdown_rx).run().await;
+            WorkerHealthCheckerActor::new(params, shutdown_rx)
+                .run()
+                .await;
         });
 
         Self {
@@ -302,4 +310,3 @@ impl WorkerHealthChecker {
         }
     }
 }
-

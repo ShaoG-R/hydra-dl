@@ -141,7 +141,7 @@ mod tests {
     fn create_mock_range(size: u64) -> ranged_mmap::AllocatedRange {
         use ranged_mmap::allocator::concurrent::Allocator;
         use std::num::NonZeroU64;
-        
+
         let allocator = Allocator::new(NonZeroU64::new(size).unwrap());
         allocator.allocate(NonZeroU64::new(size).unwrap()).unwrap()
     }
@@ -176,18 +176,18 @@ mod tests {
     #[test]
     fn test_advance_all() {
         let mut scheduler = RetryScheduler::new(create_test_config());
-        
+
         let range1 = create_mock_range(4096);
         let range2 = create_mock_range(4096);
-        
+
         scheduler.schedule(0, range1, 0); // target_task_id = 1
         scheduler.schedule(0, range2, 1); // target_task_id = 2
-        
+
         assert_eq!(scheduler.pending_count(), 2);
 
         // 提前所有任务到 task_id=0
         scheduler.advance_all(0);
-        
+
         // 现在所有任务都应该在 task_id=0 可获取
         assert!(scheduler.get_due_task(0).is_some());
         assert!(scheduler.get_due_task(0).is_some());

@@ -11,12 +11,12 @@
 //! - 提供查询接口获取聚合后的统计数据
 
 use crate::pool::download::{ExecutorBroadcast, ExecutorStats, TaggedBroadcast, TaskStats};
-use std::time::Duration;
 use lite_sync::oneshot::lite;
 use log::debug;
 use net_bytes::DownloadSpeed;
 use rustc_hash::FxHashMap;
 use smr_swap::{LocalReader, SmrSwap};
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 /// 下载统计聚合器句柄
@@ -30,7 +30,6 @@ pub(crate) struct DownloadStatsHandle {
 }
 
 impl DownloadStatsHandle {
-
     /// 关闭聚合器并等待其完全停止
     ///
     /// 这个方法会消耗 self，确保聚合器完全停止并释放所有引用
@@ -240,7 +239,8 @@ impl AggregatedStats {
     pub fn get_total_window_avg_speed(&self) -> Option<DownloadSpeed> {
         match self {
             AggregatedStats::Pending => None,
-            AggregatedStats::Running(s) => s.running_stats_map
+            AggregatedStats::Running(s) => s
+                .running_stats_map
                 .values()
                 .filter_map(|t| t.get_window_avg_speed())
                 .map(|t| t.as_u64())
@@ -253,7 +253,8 @@ impl AggregatedStats {
     pub fn get_total_instant_speed(&self) -> Option<DownloadSpeed> {
         match self {
             AggregatedStats::Pending => None,
-            AggregatedStats::Running(s) => s.running_stats_map
+            AggregatedStats::Running(s) => s
+                .running_stats_map
                 .values()
                 .filter_map(|t| t.get_instant_speed())
                 .map(|t| t.as_u64())
@@ -266,7 +267,8 @@ impl AggregatedStats {
     pub fn get_total_avg_speed(&self) -> Option<DownloadSpeed> {
         match self {
             AggregatedStats::Pending => None,
-            AggregatedStats::Running(s) => s.running_stats_map
+            AggregatedStats::Running(s) => s
+                .running_stats_map
                 .values()
                 .filter_map(|t| t.get_avg_speed())
                 .map(|t| t.as_u64())
@@ -361,7 +363,9 @@ impl DownloadStats {
     /// # Returns
     ///
     /// 返回 `DownloadStatsHandle`（只包含 shutdown 接口）
-    pub(crate) fn spawn(broadcast_rx: broadcast::Receiver<TaggedBroadcast>) -> (DownloadStatsHandle, LocalReader<AggregatedStats>) {
+    pub(crate) fn spawn(
+        broadcast_rx: broadcast::Receiver<TaggedBroadcast>,
+    ) -> (DownloadStatsHandle, LocalReader<AggregatedStats>) {
         let (shutdown_tx, shutdown_rx) = lite::channel();
 
         // 使用 SmrSwap 包装统计数据，初始为 Pending 状态
@@ -377,10 +381,13 @@ impl DownloadStats {
         // 启动 actor 任务
         let actor_handle = tokio::spawn(aggregator.run());
 
-        (DownloadStatsHandle {
-            shutdown_tx,
-            actor_handle: Some(actor_handle),
-        }, stats_reader)
+        (
+            DownloadStatsHandle {
+                shutdown_tx,
+                actor_handle: Some(actor_handle),
+            },
+            stats_reader,
+        )
     }
 
     /// 运行聚合器主循环
@@ -477,7 +484,8 @@ impl DownloadStats {
                     // 从所有状态映射中移除
                     running.pending_stats_map.remove(&worker_id);
                     running.running_stats_map.remove(&worker_id);
-                    running.summary = compute_summary(&running.running_stats_map, &running.completed_stats);
+                    running.summary =
+                        compute_summary(&running.running_stats_map, &running.completed_stats);
                     AggregatedStats::Running(running)
                 }
             }
@@ -489,8 +497,8 @@ impl DownloadStats {
 mod tests {
     use crate::pool::common::WorkerId;
     use crate::pool::download::WorkerBroadcaster;
-    use tokio::sync::broadcast;
     use std::time::Instant;
+    use tokio::sync::broadcast;
 
     use super::*;
 
@@ -498,7 +506,7 @@ mod tests {
     async fn test_aggregator_update() {
         // 创建广播通道
         let (broadcast_tx, broadcast_rx) = broadcast::channel(16);
-        
+
         // 启动聚合器
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
@@ -523,7 +531,7 @@ mod tests {
     async fn test_aggregator_remove() {
         // 创建广播通道
         let (broadcast_tx, broadcast_rx) = broadcast::channel(16);
-        
+
         // 启动聚合器
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
@@ -556,7 +564,7 @@ mod tests {
     async fn test_aggregator_state_transitions() {
         // 创建广播通道
         let (broadcast_tx, broadcast_rx) = broadcast::channel(16);
-        
+
         // 启动聚合器
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 

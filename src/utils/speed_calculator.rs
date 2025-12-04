@@ -5,7 +5,10 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub use core::Sample;
-use core::{theil_sen_regression, two_point_speed, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, MIN_SAMPLES_FOR_REGRESSION};
+use core::{
+    MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, MIN_SAMPLES_FOR_REGRESSION, theil_sen_regression,
+    two_point_speed,
+};
 
 const MIN_DURATION_NS: u128 = 100_000_000; // 100ms
 
@@ -186,17 +189,18 @@ impl SpeedCalculatorActive {
     /// `DownloadSpeed` - 速度值（保证有效，无 Option）
     pub fn get_instant_speed(&self) -> DownloadSpeed {
         let samples = self.read_samples_in_window(self.config.instant_speed_window);
-        
+
         // 优先级 1: Theil-Sen 回归
-        if let Some(speed) = theil_sen_regression(&samples, self.config.min_samples_for_regression) {
+        if let Some(speed) = theil_sen_regression(&samples, self.config.min_samples_for_regression)
+        {
             return speed;
         }
-        
+
         // 优先级 2: 两点差分法（窗口内）
         if let Some(speed) = two_point_speed(&samples) {
             return speed;
         }
-        
+
         // 优先级 3: 全局平均速度
         self.get_global_avg_speed()
     }
@@ -213,21 +217,22 @@ impl SpeedCalculatorActive {
     /// `DownloadSpeed` - 速度值（保证有效，无 Option）
     pub fn get_window_avg_speed(&self) -> DownloadSpeed {
         let samples = self.read_samples_in_window(self.config.window_avg_duration);
-        
+
         // 优先级 1: Theil-Sen 回归
-        if let Some(speed) = theil_sen_regression(&samples, self.config.min_samples_for_regression) {
+        if let Some(speed) = theil_sen_regression(&samples, self.config.min_samples_for_regression)
+        {
             return speed;
         }
-        
+
         // 优先级 2: 两点差分法（窗口内）
         if let Some(speed) = two_point_speed(&samples) {
             return speed;
         }
-        
+
         // 优先级 3: 全局平均速度
         self.get_global_avg_speed()
     }
-    
+
     /// 全局平均速度（从 start_time 到最新采样点）
     ///
     /// 这是最可靠的回退方法，start_time 已保证存在。
@@ -236,8 +241,6 @@ impl SpeedCalculatorActive {
     ///
     /// `DownloadSpeed` - 全局平均速度（保证有效，无 Option）
     pub fn get_global_avg_speed(&self) -> DownloadSpeed {
-        
-        
         if let Some(last) = self.samples.back() {
             let duration = Duration::from_nanos(last.timestamp_ns.get());
             if duration.as_nanos() >= MIN_DURATION_NS {

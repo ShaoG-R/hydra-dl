@@ -6,8 +6,8 @@
 //! - `SpeedCalculatorRecording`: 记录状态，用于采样
 //! - `SpeedCalculatorActive`: 激活状态，用于计算速度
 
+use super::core::{MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, MIN_SAMPLES_FOR_REGRESSION};
 use super::*;
-use super::core::{MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, MIN_SAMPLES_FOR_REGRESSION};
 use crate::config::{SpeedConfig, SpeedConfigBuilder};
 use std::time::Duration;
 
@@ -45,7 +45,7 @@ fn test_record_sample_returns_active() {
     // 第一次采样应该成功，返回 SpeedCalculatorActive
     let active = calculator.record_sample(100);
     assert!(active.is_some());
-    
+
     // 验证 Recording 状态被更新
     assert!(calculator.start_time.is_some());
     assert!(!calculator.samples.is_empty());
@@ -91,12 +91,12 @@ fn test_active_get_instant_speed() {
     assert!(active.is_some());
 
     let active = active.unwrap();
-    
+
     // 激活状态应该能够计算速度（无 Option）
     let instant_speed = active.get_instant_speed();
     let window_avg_speed = active.get_window_avg_speed();
     let global_avg_speed = active.get_global_avg_speed();
-    
+
     // 验证速度值是有效的（非零，因为有数据传输）
     assert!(instant_speed.as_u64() > 0 || global_avg_speed.as_u64() > 0);
     assert!(window_avg_speed.as_u64() > 0 || global_avg_speed.as_u64() > 0);

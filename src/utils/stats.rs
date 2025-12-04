@@ -1,4 +1,4 @@
-use super::speed_calculator::{SpeedCalculatorRecording, SpeedCalculatorActive};
+use super::speed_calculator::{SpeedCalculatorActive, SpeedCalculatorRecording};
 use net_bytes::DownloadSpeed;
 use std::time::Instant;
 
@@ -100,17 +100,16 @@ impl WorkerStatsRecording {
         let worker_start_time = *self.worker_start_time.get_or_insert_with(Instant::now);
 
         self.total_bytes += bytes;
-        
+
         // 尝试采样，如果成功则返回激活状态
         let speed_calculator_active = self.speed_calculator.record_sample(self.total_bytes)?;
-        
+
         Some(WorkerStatsActive {
             total_bytes: self.total_bytes,
             speed_calculator: speed_calculator_active,
             worker_start_time,
         })
     }
-    
 
     /// 清空采样点缓冲区
     ///
@@ -184,7 +183,6 @@ impl WorkerStatsActive {
     pub(crate) fn get_total_bytes(&self) -> u64 {
         self.total_bytes
     }
-    
 }
 
 impl std::fmt::Debug for WorkerStatsRecording {

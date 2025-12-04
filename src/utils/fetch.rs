@@ -1,10 +1,10 @@
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use log::{debug, info};
-use tokio::sync::oneshot;
 use ranged_mmap::AllocatedRange;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 use crate::constants::KB;
 use crate::task::FileTask;
@@ -423,12 +423,7 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
     /// * `url` - 下载 URL
     /// * `range` - 已分配的 Range，定义要下载的字节范围
     /// * `recorder` - Chunk 记录器，用于记录下载进度
-    pub(crate) fn new(
-        client: &'a C,
-        url: &'a str,
-        range: FetchRange,
-        recorder: &'a mut R,
-    ) -> Self {
+    pub(crate) fn new(client: &'a C, url: &'a str, range: FetchRange, recorder: &'a mut R) -> Self {
         Self {
             client,
             url,
@@ -943,7 +938,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
         let (_file, mut allocator) =
-            MmapFile::create_default(path, NonZeroU64::new(full_data.len() as u64).unwrap()).unwrap();
+            MmapFile::create_default(path, NonZeroU64::new(full_data.len() as u64).unwrap())
+                .unwrap();
         let range = allocator.allocate(NonZeroU64::new(4096).unwrap()).unwrap(); // 分配整个 4K
 
         let expected_data = &full_data[0..4096];
@@ -1004,7 +1000,8 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
-        let (_file, mut allocator) = MmapFile::create_default(path, NonZeroU64::new(100).unwrap()).unwrap();
+        let (_file, mut allocator) =
+            MmapFile::create_default(path, NonZeroU64::new(100).unwrap()).unwrap();
         let range = allocator.allocate(NonZeroU64::new(10).unwrap()).unwrap();
 
         // 设置错误响应
@@ -1114,7 +1111,8 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
-        let (_file, mut allocator) = MmapFile::create_default(path, NonZeroU64::new(end).unwrap()).unwrap();
+        let (_file, mut allocator) =
+            MmapFile::create_default(path, NonZeroU64::new(end).unwrap()).unwrap();
         let range = allocator.allocate(NonZeroU64::new(end).unwrap()).unwrap();
 
         // 设置 Range 响应
@@ -1157,7 +1155,11 @@ mod tests {
         }
 
         // 验证统计信息（应该记录了多个 chunk）
-        assert_eq!(recorder.total_bytes(), large_data.len() as u64, "统计的字节数应该匹配");
+        assert_eq!(
+            recorder.total_bytes(),
+            large_data.len() as u64,
+            "统计的字节数应该匹配"
+        );
     }
 
     #[tokio::test]
@@ -1175,7 +1177,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
         let (_file, mut allocator) =
-            MmapFile::create_default(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+            MmapFile::create_default(path, NonZeroU64::new(test_data.len() as u64).unwrap())
+                .unwrap();
         let range = allocator
             .allocate(NonZeroU64::new(test_data.len() as u64).unwrap())
             .unwrap();
@@ -1251,7 +1254,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.bin");
         let (_file, mut allocator) =
-            MmapFile::create_default(path, NonZeroU64::new(test_data.len() as u64).unwrap()).unwrap();
+            MmapFile::create_default(path, NonZeroU64::new(test_data.len() as u64).unwrap())
+                .unwrap();
         let range = allocator
             .allocate(NonZeroU64::new(test_data.len() as u64).unwrap())
             .unwrap();

@@ -156,7 +156,7 @@ impl LocalHealthChecker {
     ) -> Self {
         let watch_rx = broadcaster.subscribe_local();
         let anomaly_tracker = AnomalyTracker::new(config.history_size, config.anomaly_threshold);
-        
+
         Self {
             worker_id,
             config,
@@ -195,7 +195,10 @@ impl LocalHealthChecker {
                 }
                 // watch 通道关闭
                 Ok(Err(_)) => {
-                    debug!("Worker {} LocalHealthChecker watch 通道已关闭", self.worker_id);
+                    debug!(
+                        "Worker {} LocalHealthChecker watch 通道已关闭",
+                        self.worker_id
+                    );
                     break;
                 }
             }
@@ -210,7 +213,7 @@ impl LocalHealthChecker {
             "Worker {} stats 更新超时 (>{:?}), 取消当前任务",
             self.worker_id, self.config.stale_timeout
         );
-        
+
         // 使用之前获取的句柄发送取消信号（take 已将 cancel_handle 置为 None）
         if let Some(handle) = self.cancel_handle.take() {
             if handle.cancel() {
@@ -317,16 +320,16 @@ mod tests {
     #[test]
     fn test_anomaly_tracker_basic() {
         let mut tracker = AnomalyTracker::new(5, 3);
-        
+
         // 初始状态
         assert_eq!(tracker.anomaly_count(), 0);
         assert!(!tracker.exceeds_threshold());
-        
+
         // 记录 3 次异常
         tracker.record(true);
         tracker.record(true);
         tracker.record(true);
-        
+
         assert_eq!(tracker.anomaly_count(), 3);
         assert!(tracker.exceeds_threshold());
     }
@@ -334,15 +337,15 @@ mod tests {
     #[test]
     fn test_anomaly_tracker_sliding_window() {
         let mut tracker = AnomalyTracker::new(3, 2);
-        
+
         // 记录: [true, true, false]
         tracker.record(true);
         tracker.record(true);
         tracker.record(false);
-        
+
         assert_eq!(tracker.anomaly_count(), 2);
         assert!(tracker.exceeds_threshold());
-        
+
         // 滑动: [true, false, false] -> [false, false]
         tracker.record(false);
         assert_eq!(tracker.anomaly_count(), 1);
@@ -352,15 +355,15 @@ mod tests {
     #[test]
     fn test_anomaly_tracker_reset() {
         let mut tracker = AnomalyTracker::new(5, 3);
-        
+
         tracker.record(true);
         tracker.record(true);
         tracker.record(true);
-        
+
         assert_eq!(tracker.anomaly_count(), 3);
-        
+
         tracker.reset();
-        
+
         assert_eq!(tracker.anomaly_count(), 0);
         assert!(!tracker.exceeds_threshold());
     }

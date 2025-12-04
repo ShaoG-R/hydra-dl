@@ -181,9 +181,7 @@ mod tests {
 
     #[test]
     fn test_retry_task_counts_empty_uses_default() {
-        let config = RetryConfigBuilder::new()
-            .retry_task_counts(vec![])
-            .build();
+        let config = RetryConfigBuilder::new().retry_task_counts(vec![]).build();
         assert_eq!(config.retry_task_counts().len(), 3);
         assert_eq!(config.retry_task_counts()[0], 1);
     }

@@ -347,14 +347,7 @@ pub async fn download_ranged(
 
     // 启动后台下载任务
     let completion_handle = tokio::spawn(async move {
-        download_ranged_generic(
-            client,
-            &url,
-            save_path_clone,
-            &config,
-            Some(progress_tx),
-        )
-        .await
+        download_ranged_generic(client, &url, save_path_clone, &config, Some(progress_tx)).await
     });
 
     Ok((
@@ -375,7 +368,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_ranged_basic() {
-
         let test_url = "http://example.com/file.bin";
         // 使用 12KB 文件以适应 4K 对齐的分配器
         let test_data: Vec<u8> = (0..12288u32).map(|i| (i % 256) as u8).collect();
@@ -626,14 +618,9 @@ mod tests {
             }) // 2 MB
             .build();
 
-        let result = download_ranged_generic(
-            client.clone(),
-            test_url,
-            save_path.clone(),
-            &config,
-            None,
-        )
-        .await;
+        let result =
+            download_ranged_generic(client.clone(), test_url, save_path.clone(), &config, None)
+                .await;
 
         assert!(result.is_ok(), "小文件下载应该成功: {:?}", result);
     }
@@ -695,14 +682,9 @@ mod tests {
             }) // 固定 2 MB 分块
             .build();
 
-        let result = download_ranged_generic(
-            client.clone(),
-            test_url,
-            save_path.clone(),
-            &config,
-            None,
-        )
-        .await;
+        let result =
+            download_ranged_generic(client.clone(), test_url, save_path.clone(), &config, None)
+                .await;
 
         assert!(result.is_ok(), "中等文件下载应该成功: {:?}", result);
     }
@@ -763,14 +745,9 @@ mod tests {
             }) // 固定 10 MB 分块
             .build();
 
-        let result = download_ranged_generic(
-            client.clone(),
-            test_url,
-            save_path.clone(),
-            &config,
-            None,
-        )
-        .await;
+        let result =
+            download_ranged_generic(client.clone(), test_url, save_path.clone(), &config, None)
+                .await;
 
         assert!(result.is_ok(), "大文件下载应该成功: {:?}", result);
     }
@@ -833,14 +810,9 @@ mod tests {
             .progressive(|p| p.worker_ratios(vec![0.5, 1.0]).min_speed_threshold(None)) // 设置为0以便立即启动下一批
             .build();
 
-        let result = download_ranged_generic(
-            client.clone(),
-            test_url,
-            save_path.clone(),
-            &config,
-            None,
-        )
-        .await;
+        let result =
+            download_ranged_generic(client.clone(), test_url, save_path.clone(), &config, None)
+                .await;
 
         assert!(result.is_ok(), "渐进式启动下载应该成功: {:?}", result);
     }
@@ -882,7 +854,10 @@ mod tests {
         assert_eq!(config.retry().retry_task_counts()[0], 1);
         assert_eq!(config.retry().retry_task_counts()[1], 3);
         assert_eq!(config.retry().retry_task_counts()[2], 5);
-        assert_eq!(config.retry().retry_delay(), std::time::Duration::from_secs(2));
+        assert_eq!(
+            config.retry().retry_delay(),
+            std::time::Duration::from_secs(2)
+        );
     }
 
     #[test]
@@ -895,7 +870,10 @@ mod tests {
         assert_eq!(config.retry().retry_task_counts()[0], 1);
         assert_eq!(config.retry().retry_task_counts()[1], 2);
         assert_eq!(config.retry().retry_task_counts()[2], 4);
-        assert_eq!(config.retry().retry_delay(), std::time::Duration::from_millis(1000));
+        assert_eq!(
+            config.retry().retry_delay(),
+            std::time::Duration::from_millis(1000)
+        );
     }
 
     #[test]
@@ -992,14 +970,9 @@ mod tests {
             })
             .build();
 
-        let result = download_ranged_generic(
-            client.clone(),
-            test_url,
-            save_path.clone(),
-            &config,
-            None,
-        )
-        .await;
+        let result =
+            download_ranged_generic(client.clone(), test_url, save_path.clone(), &config, None)
+                .await;
 
         assert!(result.is_ok(), "下载应该成功（经过重试）: {:?}", result);
     }
@@ -1081,14 +1054,9 @@ mod tests {
             })
             .build();
 
-        let result = download_ranged_generic(
-            client.clone(),
-            test_url,
-            save_path.clone(),
-            &config,
-            None,
-        )
-        .await;
+        let result =
+            download_ranged_generic(client.clone(), test_url, save_path.clone(), &config, None)
+                .await;
 
         // 应该失败，因为达到最大重试次数
         assert!(result.is_err(), "下载应该失败（达到最大重试次数）");

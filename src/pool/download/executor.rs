@@ -8,25 +8,24 @@
 //!
 //! 这个模块独立于协程池，方便单元测试。
 
+mod file_writer;
 mod retry_scheduler;
 pub(super) mod task_allocator;
-mod file_writer;
 
-use task_allocator::{AllocationResult, TaskAllocator};
-pub(crate) use file_writer::FileWriter;
 use super::stats_updater::StatsUpdaterHandle;
 use crate::pool::common::WorkerId;
+use crate::utils::cancel_channel::CancelReceiver;
 use crate::utils::writer::MmapWriter;
 use crate::utils::{
     fetch::{ChunkRecorder, FetchRangeResult, RangeFetcher},
     io_traits::HttpClient,
     stats::WorkerStatsRecording,
 };
-use crate::utils::cancel_channel::CancelReceiver;
+pub(crate) use file_writer::FileWriter;
 use log::{debug, error, info, warn};
 use ranged_mmap::{AllocatedRange, SplitDownResult};
+use task_allocator::{AllocationResult, TaskAllocator};
 use tokio::sync::oneshot;
-
 
 /// 下载 Chunk 记录器
 ///
@@ -39,9 +38,12 @@ pub(crate) struct DownloadChunkRecorder<'a> {
 
 impl<'a> DownloadChunkRecorder<'a> {
     /// 创建新的下载 Chunk 记录器
-    pub(crate) fn new(stats: &'a mut WorkerStatsRecording, stats_handle: &'a StatsUpdaterHandle) -> Self {
-        Self { 
-            stats, 
+    pub(crate) fn new(
+        stats: &'a mut WorkerStatsRecording,
+        stats_handle: &'a StatsUpdaterHandle,
+    ) -> Self {
+        Self {
+            stats,
             stats_handle,
         }
     }
@@ -199,12 +201,8 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         } = input;
 
         // 在 Executor 内部创建 FileWriter
-        let (file_writer, mut write_failure_rx) = FileWriter::new(
-            worker_id,
-            self.writer.clone(),
-            stats_handle.clone(),
-            None,
-        );
+        let (file_writer, mut write_failure_rx) =
+            FileWriter::new(worker_id, self.writer.clone(), stats_handle.clone(), None);
 
         loop {
             // 通过 TaskAllocator 统一获取下一个任务
@@ -218,7 +216,10 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
                     debug!(
                         "Worker {} 执行任务 (range {}..{}, retry={})",
-                        worker_id, range.start(), range.end(), retry_count
+                        worker_id,
+                        range.start(),
+                        range.end(),
+                        retry_count
                     );
 
                     // 为当前任务创建新的 cancel oneshot channel
@@ -249,7 +250,10 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                         ) => LoopAction::TaskCompleted(result)
                     }
                 }
-                AllocationResult::WaitForRetry { delay, pending_count } => {
+                AllocationResult::WaitForRetry {
+                    delay,
+                    pending_count,
+                } => {
                     debug!(
                         "Worker {} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
                         worker_id, delay, pending_count
@@ -288,20 +292,18 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     debug!("Worker {} 收到写入失败信号，主循环退出", worker_id);
                     return;
                 }
-                LoopAction::TaskCompleted(task_result) => {
-                    match task_result {
-                        TaskResult::Success => {
-                            context.task_allocator.advance_task_id();
-                        }
-                        TaskResult::NeedRetry { range, retry_count } => {
-                            context.task_allocator.schedule_retry(range, retry_count);
-                            context.task_allocator.advance_task_id();
-                        }
-                        TaskResult::PermanentFailure => {
-                            context.task_allocator.advance_task_id();
-                        }
+                LoopAction::TaskCompleted(task_result) => match task_result {
+                    TaskResult::Success => {
+                        context.task_allocator.advance_task_id();
                     }
-                }
+                    TaskResult::NeedRetry { range, retry_count } => {
+                        context.task_allocator.schedule_retry(range, retry_count);
+                        context.task_allocator.advance_task_id();
+                    }
+                    TaskResult::PermanentFailure => {
+                        context.task_allocator.advance_task_id();
+                    }
+                },
                 LoopAction::RetryWaitCompleted => {
                     context.task_allocator.advance_all_retries();
                 }
@@ -352,7 +354,9 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
         // 创建 Chunk 记录器
         let mut recorder = DownloadChunkRecorder::new(runtime.stats, runtime.stats_handle);
-        let fetch_result = self.fetch_range(&runtime.context.url, &range, &mut recorder, cancel_rx).await;
+        let fetch_result = self
+            .fetch_range(&runtime.context.url, &range, &mut recorder, cancel_rx)
+            .await;
 
         // 任务结束，发送信号到辅助协程
         runtime.stats_handle.send_task_ended();
@@ -370,19 +374,20 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
                 TaskResult::Success
             }
-            Ok(FetchRangeResult::Cancelled { data, bytes_downloaded }) => {
+            Ok(FetchRangeResult::Cancelled {
+                data,
+                bytes_downloaded,
+            }) => {
                 // 下载被取消（健康检查触发）
                 warn!(
                     "Worker {} Range {}..{} 被取消 (已下载 {} bytes)",
                     self.worker_id, start, end, bytes_downloaded
                 );
 
-                let remaining_range = match self.handle_partial_download(
-                    range,
-                    data,
-                    bytes_downloaded,
-                    runtime.file_writer,
-                ).await {
+                let remaining_range = match self
+                    .handle_partial_download(range, data, bytes_downloaded, runtime.file_writer)
+                    .await
+                {
                     Some(r) => r,
                     None => return TaskResult::Success, // remaining_range不存在，返回成功
                 };
@@ -417,7 +422,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             SplitDownResult::OutOfBounds(low) => {
                 error!("split_at_align_down 拆分失败");
                 (Some(low), None)
-            },
+            }
         };
 
         if let Some(low) = low {
@@ -427,7 +432,11 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 error!("Worker {} 发送部分写入请求失败: {:?}", self.worker_id, e);
                 return Some(range);
             }
-            debug!("Worker {} 发送部分写入请求 {} bytes", self.worker_id, low.len());
+            debug!(
+                "Worker {} 发送部分写入请求 {} bytes",
+                self.worker_id,
+                low.len()
+            );
         }
 
         remaining
@@ -441,12 +450,9 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         context: &DownloadWorkerContext,
     ) -> TaskResult {
         let max_retries = context.task_allocator.max_retry_count();
-        
+
         if retry_count > max_retries {
-            let error_msg = format!(
-                "达到最大重试次数 ({}) 后仍然失败",
-                max_retries
-            );
+            let error_msg = format!("达到最大重试次数 ({}) 后仍然失败", max_retries);
             error!(
                 "Worker {} Range {}..{} {}",
                 self.worker_id,
@@ -473,7 +479,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
         let fetch_range =
             FetchRange::from_allocated_range(range).expect("AllocatedRange 应该总是有效的");
-        
+
         RangeFetcher::new(&self.client, url, fetch_range, recorder)
             .fetch_with_cancel(cancel_rx)
             .await

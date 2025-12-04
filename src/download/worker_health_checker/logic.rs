@@ -264,9 +264,7 @@ impl WorkerHealthCheckerLogic {
         slow_indices
             .iter()
             .map(|&idx| &worker_speeds[idx])
-            .filter(|w| {
-                *w.speed < threshold_speed && abs_threshold.map_or(true, |t| w.speed < t)
-            })
+            .filter(|w| *w.speed < threshold_speed && abs_threshold.map_or(true, |t| w.speed < t))
             .map(|w| (w.worker_id, w.speed))
             .collect()
     }
@@ -320,11 +318,11 @@ mod tests {
     fn test_tracker_mixed_records() {
         let mut tracker = ExecutorHealthTracker::new(5);
 
-        tracker.record(true);  // 异常
+        tracker.record(true); // 异常
         tracker.record(false); // 正常
-        tracker.record(true);  // 异常
+        tracker.record(true); // 异常
         tracker.record(false); // 正常
-        tracker.record(true);  // 异常
+        tracker.record(true); // 异常
 
         assert_eq!(tracker.anomaly_count(), 3);
         assert_eq!(tracker.history_len(), 5);

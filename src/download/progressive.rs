@@ -67,10 +67,7 @@ impl ProgressiveLauncherLogic {
     ///
     /// 将 `Vec<DownloadSpeed>` 转换为格式化的速度字符串
     /// 例如: "1.2 MB/s, 1.5 MB/s"
-    fn format_speeds(
-        speeds: &[DownloadSpeed],
-        size_standard: net_bytes::SizeStandard,
-    ) -> String {
+    fn format_speeds(speeds: &[DownloadSpeed], size_standard: net_bytes::SizeStandard) -> String {
         speeds
             .iter()
             .map(|speed| speed.to_formatted(size_standard).to_string())
@@ -355,7 +352,7 @@ impl ProgressiveLauncherActor {
     }
 
     /// 检查并尝试启动下一批 worker
-    /// 
+    ///
     /// 返回 `true` 表示应继续运行，`false` 表示应终止
     async fn check_and_launch(&mut self) -> bool {
         // 检查是否还有下一批待启动

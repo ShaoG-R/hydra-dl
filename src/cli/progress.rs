@@ -1,7 +1,5 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use net_bytes::{
-    FileSizeFormat, SizeStandard,
-};
+use net_bytes::{FileSizeFormat, SizeStandard};
 use std::time::Duration;
 
 use super::utils::{format_bytes, format_duration};
@@ -195,11 +193,16 @@ impl ProgressManager {
                             let msg = match task_stats {
                                 TaskStats::Started { start_time, .. } => {
                                     let elapsed = start_time.elapsed();
-                                    format!("[任务开始] 已运行 {:.1}s, 等待接受下载信息", elapsed.as_secs_f64())
+                                    format!(
+                                        "[任务开始] 已运行 {:.1}s, 等待接受下载信息",
+                                        elapsed.as_secs_f64()
+                                    )
                                 }
                                 TaskStats::Running { data, .. } => {
-                                    let speed = data.get_instant_speed()
-                                        .to_formatted(self.size_standard).to_string();
+                                    let speed = data
+                                        .get_instant_speed()
+                                        .to_formatted(self.size_standard)
+                                        .to_string();
                                     format!(
                                         "[下载中] 当前速度 {}, 已下载 {}, 已写入 {}",
                                         speed,
@@ -208,7 +211,10 @@ impl ProgressManager {
                                     )
                                 }
                                 TaskStats::Ended { written_bytes, .. } => {
-                                    format!("[任务完成] 写入 {}, 等待分配下一任务...", format_bytes(*written_bytes))
+                                    format!(
+                                        "[任务完成] 写入 {}, 等待分配下一任务...",
+                                        format_bytes(*written_bytes)
+                                    )
                                 }
                             };
                             worker_bar.set_message(msg);
@@ -259,7 +265,8 @@ impl ProgressManager {
                     // 显示仍在运行的 worker 统计
                     for (idx, (_, task_stats)) in executor_stats.iter_running().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
-                            let avg_speed_str = task_stats.get_avg_speed()
+                            let avg_speed_str = task_stats
+                                .get_avg_speed()
                                 .map(|s| s.to_formatted(self.size_standard).to_string())
                                 .unwrap_or_else(|| "N/A".to_string());
                             worker_bar.finish_with_message(format!(

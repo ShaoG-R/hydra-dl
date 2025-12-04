@@ -36,8 +36,7 @@ pub async fn execute_download(
     );
 
     // 启动下载任务（会自动检测文件名）
-    let (mut handle, save_path) =
-        download_ranged(&cli.url, save_dir, config).await?;
+    let (mut handle, save_path) = download_ranged(&cli.url, save_dir, config).await?;
 
     match logger_ctrl {
         Some(logger_ctrl) if !cli.quiet => {
