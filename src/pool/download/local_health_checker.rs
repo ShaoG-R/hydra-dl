@@ -16,7 +16,7 @@
 //! 3. 超时时触发取消信号
 //! 4. 收到 Stats 更新时检查绝对速度阈值
 
-use super::stats_updater::{ExecutorBroadcast, ExecutorStats, WorkerBroadcaster};
+use super::stats_updater::{ExecutorBroadcast, ExecutorStats, TaskStats, WorkerBroadcaster};
 use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::{CancelHandle, CancelSender};
 use log::{debug, warn};
@@ -133,12 +133,10 @@ pub(crate) struct LocalHealthChecker {
     watch_rx: watch::Receiver<ExecutorBroadcast>,
     /// 取消信号发送器
     cancel_tx: CancelSender,
-    /// 当前任务的取消句柄（在任务开始时获取）
+    /// 当前任务的取消句柄（在任务开始时获取，Some 表示任务运行中）
     cancel_handle: Option<CancelHandle>,
     /// 异常追踪器
     anomaly_tracker: AnomalyTracker,
-    /// 是否有任务在运行
-    task_running: bool,
 }
 
 impl LocalHealthChecker {
@@ -166,7 +164,6 @@ impl LocalHealthChecker {
             cancel_tx,
             cancel_handle: None,
             anomaly_tracker,
-            task_running: false,
         }
     }
 
@@ -176,12 +173,9 @@ impl LocalHealthChecker {
 
         loop {
             // 根据任务状态决定是否使用超时
-            let result = if self.task_running {
+            let result = if self.cancel_handle.is_some() {
                 // 任务运行中，使用超时监听
-                tokio::time::timeout(
-                    self.config.stale_timeout,
-                    self.watch_rx.changed()
-                ).await
+                tokio::time::timeout(self.config.stale_timeout, self.watch_rx.changed()).await
             } else {
                 // 任务未运行，无限等待
                 Ok(self.watch_rx.changed().await)
@@ -217,15 +211,14 @@ impl LocalHealthChecker {
             self.worker_id, self.config.stale_timeout
         );
         
-        // 使用之前获取的句柄发送取消信号
+        // 使用之前获取的句柄发送取消信号（take 已将 cancel_handle 置为 None）
         if let Some(handle) = self.cancel_handle.take() {
             if handle.cancel() {
                 debug!("Worker {} 取消信号已发送 (超时)", self.worker_id);
             }
         }
-        
-        // 重置状态
-        self.task_running = false;
+
+        // 重置异常追踪器
         self.anomaly_tracker.reset();
     }
 
@@ -248,20 +241,25 @@ impl LocalHealthChecker {
     /// 处理 Stats 更新
     fn handle_stats_update(&mut self, stats: &ExecutorStats) {
         match stats {
-            ExecutorStats::Pending | ExecutorStats::TaskStarted { .. } => {
-                // 待命/已启动状态，无需处理
+            ExecutorStats::Pending => {
+                // 待命状态，无需处理
             }
-            ExecutorStats::Running { stats: running_stats, .. } => {
-                // 任务刚开始时获取取消句柄
-                if !self.task_running {
+            ExecutorStats::Running(TaskStats::Started { .. }) => {
+                // 任务刚启动，获取取消句柄
+                if self.cancel_handle.is_none() {
                     self.cancel_handle = Some(self.cancel_tx.get_handle());
-                    self.task_running = true;
                 }
-                
+            }
+            ExecutorStats::Running(TaskStats::Running { data, .. }) => {
+                // 任务运行中，检查速度
+                if self.cancel_handle.is_none() {
+                    self.cancel_handle = Some(self.cancel_tx.get_handle());
+                }
+
                 // 检查绝对速度阈值
-                let is_anomaly = self.check_absolute_speed(running_stats.get_instant_speed());
+                let is_anomaly = self.check_absolute_speed(data.get_instant_speed());
                 self.anomaly_tracker.record(is_anomaly);
-                
+
                 // 检查是否超过异常阈值
                 if self.anomaly_tracker.exceeds_threshold() {
                     let anomaly_count = self.anomaly_tracker.anomaly_count();
@@ -269,22 +267,21 @@ impl LocalHealthChecker {
                         "Worker {} 速度异常次数过多 ({}/{}), 取消当前任务",
                         self.worker_id, anomaly_count, self.config.history_size
                     );
-                    
+
                     // 使用之前获取的句柄发送取消信号
                     if let Some(handle) = self.cancel_handle.take() {
                         if handle.cancel() {
                             debug!("Worker {} 取消信号已发送 (速度异常)", self.worker_id);
                         }
                     }
-                    
+
                     // 重置状态
-                    self.task_running = false;
+                    self.cancel_handle = None;
                     self.anomaly_tracker.reset();
                 }
             }
-            ExecutorStats::Stopped(_) => {
-                // 任务停止，重置状态
-                self.task_running = false;
+            ExecutorStats::Running(TaskStats::Ended { .. }) | ExecutorStats::Stopped(_) => {
+                // 任务结束或 Executor 停止，重置状态
                 self.cancel_handle = None;
                 self.anomaly_tracker.reset();
             }

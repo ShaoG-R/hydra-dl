@@ -24,7 +24,7 @@ mod executor;
 mod local_health_checker;
 mod stats_updater;
 
-pub use stats_updater::{ExecutorBroadcast, ExecutorStats, RunningExecutorStats, StoppedExecutorStats, TaggedBroadcast, WorkerBroadcaster};
+pub use stats_updater::{ExecutorBroadcast, ExecutorStats, RunningTaskData, StoppedExecutorStats, TaggedBroadcast, TaskStats, WorkerBroadcaster};
 use local_health_checker::{LocalHealthChecker, LocalHealthCheckerConfig};
 use stats_updater::StatsUpdater;
 
