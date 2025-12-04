@@ -4,6 +4,7 @@
 //! 提供单一入口获取下一个待执行任务。
 
 use super::retry_scheduler::RetryScheduler;
+use super::state_machine::TaskInternalState;
 use crate::config::RetryConfig;
 use log::debug;
 use ranged_mmap::allocator::concurrent::Allocator as ConcurrentAllocator;
@@ -15,11 +16,15 @@ use std::time::Duration;
 #[derive(Debug)]
 pub(crate) enum AllocatedTask {
     /// 新分配的任务
-    New { range: ranged_mmap::AllocatedRange },
+    New {
+        range: ranged_mmap::AllocatedRange,
+        state: TaskInternalState,
+    },
     /// 重试任务
     Retry {
         range: ranged_mmap::AllocatedRange,
         retry_count: usize,
+        state: TaskInternalState,
     },
 }
 
@@ -28,7 +33,7 @@ impl AllocatedTask {
     #[inline]
     pub fn range(&self) -> &ranged_mmap::AllocatedRange {
         match self {
-            AllocatedTask::New { range } | AllocatedTask::Retry { range, .. } => range,
+            AllocatedTask::New { range, .. } | AllocatedTask::Retry { range, .. } => range,
         }
     }
 
@@ -46,7 +51,7 @@ impl AllocatedTask {
     #[allow(unused)]
     pub fn into_range(self) -> ranged_mmap::AllocatedRange {
         match self {
-            AllocatedTask::New { range } | AllocatedTask::Retry { range, .. } => range,
+            AllocatedTask::New { range, .. } | AllocatedTask::Retry { range, .. } => range,
         }
     }
 }
@@ -105,6 +110,7 @@ impl TaskAllocator {
             return AllocationResult::Task(AllocatedTask::Retry {
                 range: retry.range,
                 retry_count: retry.retry_count,
+                state: TaskInternalState::new(),
             });
         }
 
@@ -119,7 +125,10 @@ impl TaskAllocator {
                 range.start(),
                 range.end()
             );
-            return AllocationResult::Task(AllocatedTask::New { range });
+            return AllocationResult::Task(AllocatedTask::New {
+                range,
+                state: TaskInternalState::new(),
+            });
         }
 
         // 3. 没有新任务，检查是否有待重试任务

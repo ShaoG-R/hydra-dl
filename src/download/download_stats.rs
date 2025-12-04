@@ -10,7 +10,9 @@
 //! - `completed_stats`: 累计已完成 Executor 的统计数据（只累加数值，不存储 ExecutorStats）
 //! - 提供查询接口获取聚合后的统计数据
 
-use crate::pool::download::{ExecutorBroadcast, ExecutorStats, TaggedBroadcast, TaskStats};
+use crate::pool::download::{
+    ExecutorBroadcast, ExecutorStats, RunningExecutorStats, TaggedBroadcast,
+};
 use lite_sync::oneshot::lite;
 use log::debug;
 use net_bytes::DownloadSpeed;
@@ -84,8 +86,8 @@ pub enum AggregatedStats {
 pub struct RunningStats {
     /// 待命中的 Executor 映射（Pending 状态）
     pub pending_stats_map: FxHashMap<u64, ()>,
-    /// 运行中的 Executor 映射（Running 状态，存储 TaskStats）
-    pub running_stats_map: FxHashMap<u64, TaskStats>,
+    /// 运行中的 Executor 映射（Running 状态，存储 RunningExecutorStats）
+    pub running_stats_map: FxHashMap<u64, RunningExecutorStats>,
     /// 已完成 Executor 的累计统计（Stopped 状态）
     pub completed_stats: CompletedStats,
     /// 预计算的下载摘要
@@ -149,7 +151,7 @@ impl AggregatedStats {
     }
 
     /// 获取指定运行中的 Executor 的任务统计
-    pub fn get_running(&self, worker_id: u64) -> Option<&TaskStats> {
+    pub fn get_running(&self, worker_id: u64) -> Option<&RunningExecutorStats> {
         match self {
             AggregatedStats::Pending => None,
             AggregatedStats::Running(s) => s.running_stats_map.get(&worker_id),
@@ -213,7 +215,7 @@ impl AggregatedStats {
     }
 
     /// 迭代所有运行中的 Executor 统计
-    pub fn iter_running(&self) -> Box<dyn Iterator<Item = (&u64, &TaskStats)> + '_> {
+    pub fn iter_running(&self) -> Box<dyn Iterator<Item = (&u64, &RunningExecutorStats)> + '_> {
         match self {
             AggregatedStats::Pending => Box::new(std::iter::empty()),
             AggregatedStats::Running(s) => Box::new(s.running_stats_map.iter()),
@@ -305,7 +307,7 @@ impl AggregatedStats {
 
 /// 从 running_stats_map 和 completed_stats 计算 DownloadSummary
 fn compute_summary(
-    running_stats_map: &FxHashMap<u64, TaskStats>,
+    running_stats_map: &FxHashMap<u64, RunningExecutorStats>,
     completed_stats: &CompletedStats,
 ) -> DownloadSummary {
     let mut avg_speed: u64 = 0;
@@ -316,12 +318,12 @@ fn compute_summary(
     let mut written_bytes: u64 = 0;
     let mut downloaded_bytes: u64 = 0;
 
-    for task_stats in running_stats_map.values() {
-        written_bytes += task_stats.written_bytes();
-        downloaded_bytes += task_stats.downloaded_bytes();
+    for stats in running_stats_map.values() {
+        written_bytes += stats.written_bytes;
+        downloaded_bytes += stats.total_downloaded_bytes;
 
-        // 速度统计仅从 TaskStats::Running 获取
-        if let Some(speed_stats) = task_stats.get_speed_stats() {
+        // 速度统计仅从 TaskState::Running 获取
+        if let Some(speed_stats) = stats.get_speed_stats() {
             avg_speed += speed_stats.avg_speed.as_u64();
             instant_speed += speed_stats.instant_speed.as_u64();
             window_avg_speed += speed_stats.window_avg_speed.as_u64();
@@ -452,10 +454,10 @@ impl DownloadStats {
                     // 待命状态，添加到 pending_stats_map
                     running.pending_stats_map.insert(worker_id, ());
                 }
-                ExecutorStats::Running(task_stats) => {
+                ExecutorStats::Running(stats) => {
                     // Running 状态，从 pending 移除，更新到 running_stats_map
                     running.pending_stats_map.remove(&worker_id);
-                    running.running_stats_map.insert(worker_id, task_stats);
+                    running.running_stats_map.insert(worker_id, stats);
                 }
                 ExecutorStats::Stopped(stopped_stats) => {
                     // Executor 已停止，从所有映射移除并累加到 completed_stats
@@ -497,7 +499,6 @@ impl DownloadStats {
 mod tests {
     use crate::pool::common::WorkerId;
     use crate::pool::download::WorkerBroadcaster;
-    use std::time::Instant;
     use tokio::sync::broadcast;
 
     use super::*;
@@ -516,10 +517,14 @@ mod tests {
 
         // 发送更新（通过广播）- 使用 Pending 和 Running(Started) 状态
         broadcaster1.send_stats(ExecutorStats::Pending);
-        broadcaster2.send_stats(ExecutorStats::Running(TaskStats::Started {
-            start_time: Instant::now(),
-            written_bytes: 0,
-        }));
+        broadcaster2.send_stats(ExecutorStats::Running(
+            crate::pool::download::RunningExecutorStats {
+                state: crate::pool::download::TaskState::new(),
+                written_bytes: 0,
+                total_downloaded_bytes: 0,
+                total_consumed_time: std::time::Duration::ZERO,
+            },
+        ));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -540,14 +545,22 @@ mod tests {
         let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
 
         // 添加两个 executor - 使用 Running(Started) 状态
-        broadcaster1.send_stats(ExecutorStats::Running(TaskStats::Started {
-            start_time: Instant::now(),
-            written_bytes: 0,
-        }));
-        broadcaster2.send_stats(ExecutorStats::Running(TaskStats::Started {
-            start_time: Instant::now(),
-            written_bytes: 0,
-        }));
+        broadcaster1.send_stats(ExecutorStats::Running(
+            crate::pool::download::RunningExecutorStats {
+                state: crate::pool::download::TaskState::new(),
+                written_bytes: 0,
+                total_downloaded_bytes: 0,
+                total_consumed_time: std::time::Duration::ZERO,
+            },
+        ));
+        broadcaster2.send_stats(ExecutorStats::Running(
+            crate::pool::download::RunningExecutorStats {
+                state: crate::pool::download::TaskState::new(),
+                written_bytes: 0,
+                total_downloaded_bytes: 0,
+                total_consumed_time: std::time::Duration::ZERO,
+            },
+        ));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -575,10 +588,14 @@ mod tests {
         broadcaster.send_stats(ExecutorStats::Pending);
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
-        broadcaster.send_stats(ExecutorStats::Running(TaskStats::Started {
-            start_time: Instant::now(),
-            written_bytes: 0,
-        }));
+        broadcaster.send_stats(ExecutorStats::Running(
+            crate::pool::download::RunningExecutorStats {
+                state: crate::pool::download::TaskState::new(),
+                written_bytes: 0,
+                total_downloaded_bytes: 0,
+                total_consumed_time: std::time::Duration::ZERO,
+            },
+        ));
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
         // 关闭并等待

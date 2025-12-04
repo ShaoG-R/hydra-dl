@@ -24,11 +24,12 @@ mod executor;
 mod local_health_checker;
 mod stats_updater;
 
+pub use executor::state_machine::TaskState;
 use local_health_checker::{LocalHealthChecker, LocalHealthCheckerConfig};
 use stats_updater::StatsUpdater;
 pub use stats_updater::{
-    ExecutorBroadcast, ExecutorStats, RunningTaskData, StoppedExecutorStats, TaggedBroadcast,
-    TaskStats, WorkerBroadcaster,
+    ExecutorBroadcast, ExecutorStats, RunningExecutorStats, StoppedExecutorStats, TaggedBroadcast,
+    WorkerBroadcaster,
 };
 
 use super::common::{WorkerFactory, WorkerId, WorkerPool};

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::utils::{format_bytes, format_duration};
 use crate::download::DownloadProgress;
-use crate::pool::download::TaskStats;
+use crate::pool::download::TaskState;
 
 /// 进度条管理器
 pub struct ProgressManager {
@@ -137,12 +137,12 @@ impl ProgressManager {
                 // 计算分块大小范围（只统计 TaskStats::Running 的 Executor）
                 let chunk_sizes: Vec<u64> = executor_stats
                     .iter_running()
-                    .filter_map(|(_, task)| {
-                        if let TaskStats::Running { data, .. } = task {
-                            Some(data.speed_stats.current_chunk_size)
-                        } else {
-                            None
+                    .filter_map(|(_, stats)| {
+                        let task_state = stats.as_task_state();
+                        if let Some(active_stats) = task_state.stats() {
+                            return Some(active_stats.get_speed_stats(0).current_chunk_size);
                         }
+                        None
                     })
                     .collect();
                 let chunk_info = if !chunk_sizes.is_empty() {
@@ -188,32 +188,34 @@ impl ProgressManager {
                     }
 
                     // 按照 TaskStats 状态更新 worker 进度条
-                    for (&worker_id, task_stats) in executor_stats.iter_running() {
+                    for (&worker_id, executor_stats) in executor_stats.iter_running() {
                         if let Some(worker_bar) = self.worker_bars.get(worker_id as usize) {
-                            let msg = match task_stats {
-                                TaskStats::Started { start_time, .. } => {
-                                    let elapsed = start_time.elapsed();
+                            let state = executor_stats.as_task_state();
+                            let msg = match state {
+                                TaskState::Started(started) => {
+                                    let elapsed = started.start_time().elapsed();
                                     format!(
                                         "[任务开始] 已运行 {:.1}s, 等待接受下载信息",
                                         elapsed.as_secs_f64()
                                     )
                                 }
-                                TaskStats::Running { data, .. } => {
-                                    let speed = data
+                                TaskState::Running(running) => {
+                                    let speed = running
+                                        .stats()
                                         .get_instant_speed()
                                         .to_formatted(self.size_standard)
                                         .to_string();
                                     format!(
                                         "[下载中] 当前速度 {}, 已下载 {}, 已写入 {}",
                                         speed,
-                                        format_bytes(data.downloaded_bytes),
-                                        format_bytes(data.written_bytes),
+                                        format_bytes(executor_stats.total_downloaded_bytes),
+                                        format_bytes(executor_stats.written_bytes),
                                     )
                                 }
-                                TaskStats::Ended { written_bytes, .. } => {
+                                TaskState::Ended { .. } => {
                                     format!(
                                         "[任务完成] 写入 {}, 等待分配下一任务...",
-                                        format_bytes(*written_bytes)
+                                        format_bytes(executor_stats.written_bytes)
                                     )
                                 }
                             };
@@ -263,15 +265,15 @@ impl ProgressManager {
                     }
 
                     // 显示仍在运行的 worker 统计
-                    for (idx, (_, task_stats)) in executor_stats.iter_running().enumerate() {
+                    for (idx, (_, executor_stats)) in executor_stats.iter_running().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
-                            let avg_speed_str = task_stats
+                            let avg_speed_str = executor_stats
                                 .get_avg_speed()
                                 .map(|s| s.to_formatted(self.size_standard).to_string())
                                 .unwrap_or_else(|| "N/A".to_string());
                             worker_bar.finish_with_message(format!(
                                 "完成：{}, 平均: {}",
-                                format_bytes(task_stats.written_bytes()),
+                                format_bytes(executor_stats.written_bytes),
                                 avg_speed_str
                             ));
                         }

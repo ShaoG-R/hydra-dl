@@ -52,7 +52,7 @@ pub(crate) struct WorkerStatsRecording {
 ///
 /// 激活状态保证 `worker_start_time` 存在，因此速度计算一定有效。
 #[derive(Clone)]
-pub(crate) struct WorkerStatsActive {
+pub struct WorkerStatsActive {
     /// 总下载字节数（包括重试的重复字节，用于速度计算）
     total_bytes: u64,
     /// 速度计算器（激活状态）
@@ -130,7 +130,7 @@ impl WorkerStatsActive {
     ///
     /// `DownloadSpeed` - 速度值（保证有效，无 Option）
     #[inline]
-    pub(crate) fn get_speed(&self) -> DownloadSpeed {
+    pub fn get_speed(&self) -> DownloadSpeed {
         let elapsed = self.worker_start_time.elapsed();
         DownloadSpeed::new(self.total_bytes, elapsed)
     }
@@ -142,7 +142,7 @@ impl WorkerStatsActive {
     /// # Returns
     ///
     /// `DownloadSpeed` - 速度值（保证有效，无 Option）
-    pub(crate) fn get_instant_speed(&self) -> DownloadSpeed {
+    pub fn get_instant_speed(&self) -> DownloadSpeed {
         self.speed_calculator.get_instant_speed()
     }
 
@@ -153,7 +153,7 @@ impl WorkerStatsActive {
     /// # Returns
     ///
     /// `DownloadSpeed` - 速度值（保证有效，无 Option）
-    pub(crate) fn get_window_avg_speed(&self) -> DownloadSpeed {
+    pub fn get_window_avg_speed(&self) -> DownloadSpeed {
         self.speed_calculator.get_window_avg_speed()
     }
 
@@ -165,7 +165,7 @@ impl WorkerStatsActive {
     ///
     /// `SpeedStats` - 速度统计快照（所有字段保证有效，无 Option）
     #[inline]
-    pub(crate) fn get_speed_stats(&self, current_chunk_size: u64) -> SpeedStats {
+    pub fn get_speed_stats(&self, current_chunk_size: u64) -> SpeedStats {
         SpeedStats {
             current_chunk_size,
             avg_speed: self.get_speed(),
@@ -180,7 +180,7 @@ impl WorkerStatsActive {
     ///
     /// 总传输字节数（用于速度计算）
     #[inline]
-    pub(crate) fn get_total_bytes(&self) -> u64 {
+    pub fn get_total_bytes(&self) -> u64 {
         self.total_bytes
     }
 }
