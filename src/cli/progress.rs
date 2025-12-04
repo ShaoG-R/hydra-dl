@@ -139,7 +139,7 @@ impl ProgressManager {
 
                 // 计算分块大小范围（只统计运行中的 Executor）
                 let chunk_sizes: Vec<u64> = executor_stats
-                    .iter()
+                    .iter_running()
                     .map(|(_, s)| s.speed_stats.current_chunk_size)
                     .collect();
                 let chunk_info = if !chunk_sizes.is_empty() {
@@ -184,7 +184,7 @@ impl ProgressManager {
                     }
 
                     // 更新所有运行中 worker 的进度条
-                    for (idx, (_, running_stats)) in executor_stats.iter().enumerate() {
+                    for (idx, (_, running_stats)) in executor_stats.iter_running().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
                             let speed = running_stats.get_instant_speed()
                                 .to_formatted(self.size_standard).to_string();
@@ -234,7 +234,7 @@ impl ProgressManager {
                     }
 
                     // 显示仍在运行的 worker 统计
-                    for (idx, (_, running_stats)) in executor_stats.iter().enumerate() {
+                    for (idx, (_, running_stats)) in executor_stats.iter_running().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
                             let avg_speed_str = running_stats.get_avg_speed()
                                 .to_formatted(self.size_standard).to_string();
