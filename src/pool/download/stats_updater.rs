@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use super::executor::state_machine::TaskState;
+use super::executor::state::TaskState;
 
 /// 已停止的 Executor 统计信息
 ///

@@ -24,7 +24,7 @@ mod executor;
 mod local_health_checker;
 mod stats_updater;
 
-pub use executor::state_machine::TaskState;
+pub use executor::state::TaskState;
 use local_health_checker::{LocalHealthChecker, LocalHealthCheckerConfig};
 use stats_updater::StatsUpdater;
 pub use stats_updater::{

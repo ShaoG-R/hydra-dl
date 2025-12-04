@@ -4,7 +4,7 @@
 //! 提供单一入口获取下一个待执行任务。
 
 use super::retry_scheduler::RetryScheduler;
-use super::state_machine::TaskInternalState;
+use super::state::TaskInternalState;
 use crate::config::RetryConfig;
 use log::debug;
 use ranged_mmap::allocator::concurrent::Allocator as ConcurrentAllocator;

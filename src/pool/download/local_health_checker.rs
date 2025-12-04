@@ -16,7 +16,7 @@
 //! 3. 超时时触发取消信号
 //! 4. 收到 Stats 更新时检查绝对速度阈值
 
-use super::executor::state_machine::TaskState;
+use super::executor::state::TaskState;
 use super::stats_updater::{ExecutorBroadcast, ExecutorStats, WorkerBroadcaster};
 use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::{CancelHandle, CancelSender};

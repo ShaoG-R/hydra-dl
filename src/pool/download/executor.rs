@@ -10,7 +10,7 @@
 
 mod file_writer;
 mod retry_scheduler;
-pub(super) mod state_machine;
+pub(super) mod state;
 pub(super) mod task_allocator;
 
 use super::stats_updater::StatsUpdaterHandle;
@@ -25,7 +25,7 @@ use crate::utils::{
 pub(crate) use file_writer::FileWriter;
 use log::{debug, error, info, warn};
 use ranged_mmap::{AllocatedRange, SplitDownResult};
-use state_machine::TaskInternalState;
+use state::TaskInternalState;
 use std::time::Duration;
 use task_allocator::{AllocatedTask, AllocationResult, TaskAllocator};
 use tokio::sync::oneshot;
