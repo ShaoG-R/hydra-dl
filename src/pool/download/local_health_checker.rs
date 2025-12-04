@@ -16,7 +16,7 @@
 //! 3. 超时时触发取消信号
 //! 4. 收到 Stats 更新时检查绝对速度阈值
 
-use super::stats_updater::{ExecutorBroadcast, ExecutorCurrentStats, WorkerBroadcaster};
+use super::stats_updater::{ExecutorBroadcast, ExecutorStats, WorkerBroadcaster};
 use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::{CancelHandle, CancelSender};
 use log::{debug, warn};
@@ -246,9 +246,12 @@ impl LocalHealthChecker {
     }
 
     /// 处理 Stats 更新
-    fn handle_stats_update(&mut self, stats: &super::stats_updater::ExecutorStats) {
-        match &stats.current_stats {
-            ExecutorCurrentStats::Running(stats) => {
+    fn handle_stats_update(&mut self, stats: &ExecutorStats) {
+        match stats {
+            ExecutorStats::Pending | ExecutorStats::TaskStarted(_) => {
+                // 待命/已启动状态，无需处理
+            }
+            ExecutorStats::Running { stats: running_stats, .. } => {
                 // 任务刚开始时获取取消句柄
                 if !self.task_running {
                     self.cancel_handle = Some(self.cancel_tx.get_handle());
@@ -256,7 +259,7 @@ impl LocalHealthChecker {
                 }
                 
                 // 检查绝对速度阈值
-                let is_anomaly = self.check_absolute_speed(stats.instant_speed);
+                let is_anomaly = self.check_absolute_speed(running_stats.get_instant_speed());
                 self.anomaly_tracker.record(is_anomaly);
                 
                 // 检查是否超过异常阈值
@@ -279,7 +282,7 @@ impl LocalHealthChecker {
                     self.anomaly_tracker.reset();
                 }
             }
-            ExecutorCurrentStats::Stopped => {
+            ExecutorStats::Stopped(_) => {
                 // 任务停止，重置状态
                 self.task_running = false;
                 self.cancel_handle = None;

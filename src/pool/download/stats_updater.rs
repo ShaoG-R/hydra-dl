@@ -20,7 +20,7 @@
 
 use crate::utils::chunk_strategy::ChunkStrategy;
 use crate::utils::stats::{SpeedStats, WorkerStatsActive};
-use log::debug;
+use log::{debug, warn};
 use net_bytes::DownloadSpeed;
 use crate::pool::common::WorkerId;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,113 +28,173 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, watch};
 
-/// Executor 当前运行状态统计
+/// 运行中的 Executor 统计信息
 ///
-/// 表示 Executor 的两种状态：停止或运行中
-#[derive(Debug, Clone, Default)]
-pub enum ExecutorCurrentStats {
-    /// Executor 已停止
-    #[default]
-    Stopped,
-    /// Executor 运行中，包含实时统计数据
-    Running(SpeedStats),
+/// 记录正在运行的 Executor 的当前运行时长、下载字节数和速度统计
+#[derive(Debug, Clone)]
+pub struct RunningExecutorStats {
+    /// 当前运行时长（从本次启动到现在）
+    pub current_duration: Duration,
+    /// 当前下载字节数（包括重试的重复字节，用于速度计算）
+    pub downloaded_bytes: u64,
+    /// 已写入磁盘的有效字节数（不包含重试的重复字节，用于进度计算）
+    pub written_bytes: u64,
+    /// 实时速度统计
+    pub speed_stats: SpeedStats,
 }
 
-/// Executor 统计信息
+impl RunningExecutorStats {
+    /// 获取速度统计
+    #[inline]
+    pub fn get_speed_stats(&self) -> SpeedStats {
+        self.speed_stats
+    }
+
+    /// 获取实时速度
+    #[inline]
+    pub fn get_instant_speed(&self) -> DownloadSpeed {
+        self.speed_stats.instant_speed
+    }
+
+    /// 获取窗口平均速度
+    #[inline]
+    pub fn get_window_avg_speed(&self) -> DownloadSpeed {
+        self.speed_stats.window_avg_speed
+    }
+
+    /// 获取平均速度
+    #[inline]
+    pub fn get_avg_speed(&self) -> DownloadSpeed {
+        self.speed_stats.avg_speed
+    }
+}
+
+/// 已停止的 Executor 统计信息
 ///
-/// 记录 Executor 的总运行时长、总下载字节数，以及当前运行状态的详细统计
+/// 记录已停止的 Executor 的总运行时长和总下载字节数
 #[derive(Debug, Clone)]
-pub struct ExecutorStats {
+pub struct StoppedExecutorStats {
     /// 总运行时长
     pub total_duration: Duration,
     /// 总下载字节数（包括重试的重复字节，用于速度计算）
     pub downloaded_bytes: u64,
     /// 已写入磁盘的有效字节数（不包含重试的重复字节，用于进度计算）
     pub written_bytes: u64,
-    /// 当前运行状态统计
-    pub current_stats: ExecutorCurrentStats,
-    /// 内部：运行开始时间（用于计算总运行时长）
-    pub run_start_time: Option<Instant>,
 }
 
-impl Default for ExecutorStats {
-    fn default() -> Self {
-        Self {
-            total_duration: Duration::ZERO,
-            downloaded_bytes: 0,
-            written_bytes: 0,
-            current_stats: ExecutorCurrentStats::Stopped,
-            run_start_time: None,
-        }
-    }
+/// Executor 统计信息（枚举）
+///
+/// 明确区分待命、已启动、运行中和已停止的状态
+/// 状态转换是单向的：Pending -> TaskStarted -> Running -> Stopped
+#[derive(Debug, Clone)]
+pub enum ExecutorStats {
+    /// Executor 待命中（尚未开始运行）
+    Pending,
+    /// Executor 已启动（收到 TaskStarted，等待第一个 ChunkSampled）
+    /// 携带启动时间
+    TaskStarted(Instant),
+    /// Executor 运行中，携带启动时间和统计数据
+    Running {
+        start_time: Instant,
+        stats: RunningExecutorStats,
+    },
+    /// Executor 已停止，包含总运行时长和总字节数
+    Stopped(StoppedExecutorStats),
 }
 
 impl ExecutorStats {
-    /// 创建新的 ExecutorStats
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 标记 Executor 开始运行
-    /// 
-    /// 只设置运行开始时间，`current_stats` 会在首次采样成功时更新为 `Running`
-    pub(crate) fn start_running(&mut self) {
-        if self.run_start_time.is_none() {
-            self.run_start_time = Some(Instant::now());
+    /// 获取启动时间（TaskStarted 或 Running 状态）
+    pub fn start_time(&self) -> Option<Instant> {
+        match self {
+            ExecutorStats::TaskStarted(t) => Some(*t),
+            ExecutorStats::Running { start_time, .. } => Some(*start_time),
+            _ => None,
         }
     }
 
-    /// 标记 Executor 停止运行
-    pub(crate) fn stop_running(&mut self) {
-        // 累加运行时长
-        if let Some(start) = self.run_start_time.take() {
-            self.total_duration += start.elapsed();
+    /// 获取已下载字节数
+    pub fn downloaded_bytes(&self) -> u64 {
+        match self {
+            ExecutorStats::Pending | ExecutorStats::TaskStarted(_) => 0,
+            ExecutorStats::Running { stats, .. } => stats.downloaded_bytes,
+            ExecutorStats::Stopped(stats) => stats.downloaded_bytes,
         }
-        self.current_stats = ExecutorCurrentStats::Stopped;
     }
 
-    /// 更新统计数据（从 WorkerStatsActive 同步）
-    pub(crate) fn update_from_worker_stats(&mut self, current_chunk_size: u64, worker_stats: &WorkerStatsActive) {
-        self.downloaded_bytes = worker_stats.get_total_bytes();
-        
-        // 激活状态的 WorkerStats 保证速度数据有效
-        self.current_stats = ExecutorCurrentStats::Running(worker_stats.get_speed_stats(current_chunk_size));
+    /// 获取已写入字节数
+    pub fn written_bytes(&self) -> u64 {
+        match self {
+            ExecutorStats::Pending | ExecutorStats::TaskStarted(_) => 0,
+            ExecutorStats::Running { stats, .. } => stats.written_bytes,
+            ExecutorStats::Stopped(stats) => stats.written_bytes,
+        }
     }
 
-    /// 添加已写入的字节数
-    pub(crate) fn add_written_bytes(&mut self, bytes: u64) {
-        self.written_bytes += bytes;
+    /// 检查是否待命
+    pub fn is_pending(&self) -> bool {
+        matches!(self, ExecutorStats::Pending)
     }
 
-    /// 获取速度统计（如果正在运行）
+    /// 检查是否已启动
+    pub fn is_task_started(&self) -> bool {
+        matches!(self, ExecutorStats::TaskStarted(_))
+    }
+
+    /// 检查是否正在运行
+    pub fn is_running(&self) -> bool {
+        matches!(self, ExecutorStats::Running { .. })
+    }
+
+    /// 检查是否已停止
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, ExecutorStats::Stopped(_))
+    }
+
+    /// 获取运行中的统计（如果正在运行）
+    pub fn as_running(&self) -> Option<&RunningExecutorStats> {
+        match self {
+            ExecutorStats::Running { stats, .. } => Some(stats),
+            _ => None,
+        }
+    }
+
+    /// 获取已停止的统计（如果已停止）
+    pub fn as_stopped(&self) -> Option<&StoppedExecutorStats> {
+        match self {
+            ExecutorStats::Stopped(stats) => Some(stats),
+            _ => None,
+        }
+    }
+
+    /// 获取速度统计（仅运行中有效）
     pub fn get_speed_stats(&self) -> Option<SpeedStats> {
-        match &self.current_stats {
-            ExecutorCurrentStats::Running(stats) => Some(*stats),
-            ExecutorCurrentStats::Stopped => None,
+        match self {
+            ExecutorStats::Running { stats, .. } => Some(stats.speed_stats),
+            _ => None,
         }
     }
 
-    /// 获取实时速度
+    /// 获取实时速度（仅运行中有效）
     pub fn get_instant_speed(&self) -> Option<DownloadSpeed> {
-        match &self.current_stats {
-            ExecutorCurrentStats::Running(stats) => Some(stats.instant_speed),
-            ExecutorCurrentStats::Stopped => None,
+        match self {
+            ExecutorStats::Running { stats, .. } => Some(stats.speed_stats.instant_speed),
+            _ => None,
         }
     }
 
-    /// 获取窗口平均速度
+    /// 获取窗口平均速度（仅运行中有效）
     pub fn get_window_avg_speed(&self) -> Option<DownloadSpeed> {
-        match &self.current_stats {
-            ExecutorCurrentStats::Running(stats) => Some(stats.window_avg_speed),
-            ExecutorCurrentStats::Stopped => None,
+        match self {
+            ExecutorStats::Running { stats, .. } => Some(stats.speed_stats.window_avg_speed),
+            _ => None,
         }
     }
 
-    /// 获取平均速度
+    /// 获取平均速度（仅运行中有效）
     pub fn get_avg_speed(&self) -> Option<DownloadSpeed> {
-        match &self.current_stats {
-            ExecutorCurrentStats::Running(stats) => Some(stats.avg_speed),
-            ExecutorCurrentStats::Stopped => None,
+        match self {
+            ExecutorStats::Running { stats, .. } => Some(stats.speed_stats.avg_speed),
+            _ => None,
         }
     }
 }
@@ -302,8 +362,8 @@ impl StatsUpdaterHandle {
 /// Stats Updater 辅助协程
 ///
 /// 根据接收到的消息实时更新统计数据。
-/// 内部维护 `ExecutorStats` 用于记录总运行时长和总下载字节数。
-/// 通过 broadcast channel 广播 `ExecutorStats` 更新和关闭信号。
+/// 直接维护 `ExecutorStats` 状态，状态转换只在消息到达时发生。
+/// 状态转换是单向的：Pending -> TaskStarted -> Running -> Stopped
 ///
 /// # chunk_size 维护
 ///
@@ -311,8 +371,8 @@ impl StatsUpdaterHandle {
 pub(crate) struct StatsUpdater {
     /// Worker ID（用于日志）
     worker_id: WorkerId,
-    /// Executor 统计数据（内部维护）
-    executor_stats: ExecutorStats,
+    /// 当前状态（包含所有统计数据和启动时间）
+    state: ExecutorStats,
     /// 消息接收通道
     rx: mpsc::Receiver<StatsMessage>,
     /// Worker 广播器（封装外部和本地广播）
@@ -325,18 +385,6 @@ pub(crate) struct StatsUpdater {
 
 impl StatsUpdater {
     /// 创建新的 Stats Updater 和对应的句柄
-    ///
-    /// # Arguments
-    ///
-    /// - `worker_id`: Worker ID
-    /// - `broadcaster`: Worker 广播器，用于发送 ExecutorStats 更新和关闭信号
-    /// - `chunk_strategy`: 分块策略，用于计算 chunk size
-    /// - `initial_chunk_size`: 初始 chunk size
-    /// - `config`: 配置（可选，使用默认配置）
-    ///
-    /// # Returns
-    ///
-    /// 返回 `(StatsUpdater, StatsUpdaterHandle)`
     pub(crate) fn new(
         worker_id: WorkerId,
         broadcaster: WorkerBroadcaster,
@@ -352,7 +400,7 @@ impl StatsUpdater {
 
         let updater = Self {
             worker_id,
-            executor_stats: ExecutorStats::new(),
+            state: ExecutorStats::Pending,
             rx,
             broadcaster,
             chunk_strategy,
@@ -365,53 +413,46 @@ impl StatsUpdater {
     }
 
     /// 运行 Stats Updater 主循环
-    ///
-    /// 持续接收消息并更新统计数据，直到通道关闭
     pub(crate) async fn run(mut self) {
         debug!("Worker {} Stats Updater 启动", self.worker_id);
 
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                StatsMessage::TaskStarted => {
-                    self.handle_task_started();
-                }
-                StatsMessage::ChunkSampled(worker_stats) => {
-                    self.handle_chunk_sampled(worker_stats);
-                }
-                StatsMessage::BytesWritten(bytes) => {
-                    self.handle_bytes_written(bytes);
-                }
-                StatsMessage::TaskEnded => {
-                    self.handle_task_ended();
-                }
-                StatsMessage::ExecutorShutdown => {
-                    self.handle_executor_shutdown();
-                }
+                StatsMessage::TaskStarted => self.handle_task_started(),
+                StatsMessage::ChunkSampled(worker_stats) => self.handle_chunk_sampled(worker_stats),
+                StatsMessage::BytesWritten(bytes) => self.handle_bytes_written(bytes),
+                StatsMessage::TaskEnded => self.handle_task_ended(),
+                StatsMessage::ExecutorShutdown => self.handle_executor_shutdown(),
             }
         }
 
         debug!("Worker {} Stats Updater 退出", self.worker_id);
     }
 
-    /// 处理任务开始
+    /// 处理任务开始（Pending -> TaskStarted）
     fn handle_task_started(&mut self) {
+        if !self.state.is_pending() {
+            return;
+        }
+        
         debug!("Worker {} 任务开始", self.worker_id);
-        
-        // 更新 ExecutorStats：标记开始运行
-        self.executor_stats.start_running();
-        
-        // 广播到订阅者
+        self.state = ExecutorStats::TaskStarted(Instant::now());
         self.broadcast_stats();
     }
 
-    /// 处理采样成功
+    /// 处理采样成功（TaskStarted -> Running 或更新 Running 状态）
     fn handle_chunk_sampled(&mut self, worker_stats: WorkerStatsActive) {
+        // 获取启动时间（从 TaskStarted 或 Running 状态）
+        let Some(start_time) = self.state.start_time() else {
+            return;
+        };
+        
         let current_chunk_size = self.chunk_size.load(Ordering::Relaxed);
-        // 更新 ExecutorStats：同步速度数据（WorkerStatsActive 保证有效）
-        self.executor_stats.update_from_worker_stats(current_chunk_size, &worker_stats);
+        let speed_stats = worker_stats.get_speed_stats(current_chunk_size);
+        let downloaded_bytes = worker_stats.get_total_bytes();
+        let written_bytes = self.state.written_bytes();
 
         // 使用 ChunkStrategy 计算新的 chunk size
-        let current_chunk_size = self.chunk_size.load(Ordering::Relaxed);
         let instant_speed = worker_stats.get_instant_speed();
         let window_avg_speed = worker_stats.get_window_avg_speed();
         let new_chunk_size = self.chunk_strategy.calculate_chunk_size(
@@ -429,34 +470,61 @@ impl StatsUpdater {
             );
         }
 
-        // 广播到订阅者
+        // 更新状态并广播
+        self.state = ExecutorStats::Running {
+            start_time,
+            stats: RunningExecutorStats {
+                current_duration: start_time.elapsed(),
+                downloaded_bytes,
+                written_bytes,
+                speed_stats,
+            },
+        };
         self.broadcast_stats();
     }
 
-    /// 处理写入成功
+    /// 处理写入成功（仅 Running 状态有效）
     fn handle_bytes_written(&mut self, bytes: u64) {
-        // 更新 ExecutorStats：累加已写入字节数
-        self.executor_stats.add_written_bytes(bytes);
+        // 只有在 Running 状态才处理
+        let ExecutorStats::Running { start_time, stats } = &self.state else {
+            warn!("Worker {} 非Running状态时接收到写入成功信号", self.worker_id);
+            return;
+        };
         
-        // 广播到订阅者
+        self.state = ExecutorStats::Running {
+            start_time: *start_time,
+            stats: RunningExecutorStats {
+                current_duration: start_time.elapsed(),
+                downloaded_bytes: stats.downloaded_bytes,
+                written_bytes: stats.written_bytes + bytes,
+                speed_stats: stats.speed_stats,
+            },
+        };
         self.broadcast_stats();
     }
 
-    /// 处理任务结束
+    /// 处理任务结束（TaskStarted/Running -> Stopped）
     fn handle_task_ended(&mut self) {
+        // 获取启动时间
+        let Some(start_time) = self.state.start_time() else {
+            return;
+        };
+        
         debug!("Worker {} 任务结束", self.worker_id);
         
-        // 更新 ExecutorStats：标记停止运行
-        self.executor_stats.stop_running();
+        self.state = ExecutorStats::Stopped(StoppedExecutorStats {
+            total_duration: start_time.elapsed(),
+            downloaded_bytes: self.state.downloaded_bytes(),
+            written_bytes: self.state.written_bytes(),
+        });
         
-        // 广播到订阅者
         self.broadcast_stats();
     }
     
     /// 广播 ExecutorStats
     #[inline]
     fn broadcast_stats(&self) {
-        self.broadcaster.send_stats(self.executor_stats.clone());
+        self.broadcaster.send_stats(self.state.clone());
     }
 
     /// 处理 Executor 关闭

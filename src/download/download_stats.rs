@@ -6,10 +6,12 @@
 //!
 //! - 每个 StatsUpdater 通过 broadcast channel 广播 `ExecutorBroadcast` 消息
 //! - 聚合器订阅 broadcast channel，接收所有 Executor 的统计更新和关闭信号
-//! - 内部使用 `HashMap<u64, ExecutorStats>` 存储所有 Worker 的统计
+//! - `running_stats_map`: 只存储正在运行的 Executor 统计
+//! - `completed_stats`: 累计已完成 Executor 的统计数据（只累加数值，不存储 ExecutorStats）
 //! - 提供查询接口获取聚合后的统计数据
 
-use crate::pool::download::{ExecutorBroadcast, ExecutorStats, TaggedBroadcast};
+use crate::pool::download::{ExecutorBroadcast, ExecutorStats, RunningExecutorStats, TaggedBroadcast};
+use std::time::Duration;
 use lite_sync::oneshot::lite;
 use log::debug;
 use net_bytes::DownloadSpeed;
@@ -44,11 +46,38 @@ impl DownloadStatsHandle {
     }
 }
 
+/// 已完成 Executor 的累计统计
+///
+/// 只累加数值，不存储单独的 ExecutorStats
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompletedStats {
+    /// 已完成的 Executor 数量
+    pub count: u64,
+    /// 总运行时长（所有已完成 Executor 的累计）
+    pub total_duration: Duration,
+    /// 总下载字节数（包括重试的重复字节）
+    pub downloaded_bytes: u64,
+    /// 已写入磁盘的有效字节数
+    pub written_bytes: u64,
+}
+
+impl CompletedStats {
+    /// 累加一个已完成 Executor 的统计
+    pub fn accumulate(&mut self, duration: Duration, downloaded: u64, written: u64) {
+        self.count += 1;
+        self.total_duration += duration;
+        self.downloaded_bytes += downloaded;
+        self.written_bytes += written;
+    }
+}
+
 /// 聚合后的统计数据
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedStats {
-    /// 所有 Executor 的统计映射
-    pub stats_map: FxHashMap<u64, ExecutorStats>,
+    /// 正在运行的 Executor 统计映射（只包含 Running 状态的 Executor）
+    pub running_stats_map: FxHashMap<u64, RunningExecutorStats>,
+    /// 已完成 Executor 的累计统计
+    pub completed_stats: CompletedStats,
     /// 预计算的下载摘要
     summary: DownloadSummary,
 }
@@ -82,51 +111,71 @@ pub struct DownloadSummary {
 }
 
 impl AggregatedStats {
-    /// 获取指定 Executor 的统计
-    pub fn get(&self, worker_id: u64) -> Option<&ExecutorStats> {
-        self.stats_map.get(&worker_id)
+    /// 获取指定正在运行的 Executor 的统计
+    pub fn get_running(&self, worker_id: u64) -> Option<&RunningExecutorStats> {
+        self.running_stats_map.get(&worker_id)
     }
 
-    /// 获取 Executor 数量
-    pub fn len(&self) -> usize {
-        self.stats_map.len()
+    /// 获取正在运行的 Executor 数量
+    pub fn running_count(&self) -> usize {
+        self.running_stats_map.len()
     }
 
-    /// 检查是否为空
+    /// 获取已完成的 Executor 数量
+    pub fn completed_count(&self) -> u64 {
+        self.completed_stats.count
+    }
+
+    /// 获取总 Executor 数量（运行中 + 已完成）
+    pub fn total_count(&self) -> u64 {
+        self.running_stats_map.len() as u64 + self.completed_stats.count
+    }
+
+    /// 检查是否没有任何 Executor
     pub fn is_empty(&self) -> bool {
-        self.stats_map.is_empty()
+        self.running_stats_map.is_empty() && self.completed_stats.count == 0
     }
 
-    /// 迭代所有 Executor 统计
-    pub fn iter(&self) -> impl Iterator<Item = (&u64, &ExecutorStats)> {
-        self.stats_map.iter()
+    /// 迭代所有正在运行的 Executor 统计
+    pub fn iter_running(&self) -> impl Iterator<Item = (&u64, &RunningExecutorStats)> {
+        self.running_stats_map.iter()
     }
 
-    /// 获取所有 Worker 的总窗口平均速度
+    /// 获取正在运行的 Executor 数量（别名，用于兼容旧 API）
+    pub fn len(&self) -> usize {
+        self.running_stats_map.len()
+    }
+
+    /// 获取已完成 Executor 的累计统计
+    pub fn get_completed_stats(&self) -> &CompletedStats {
+        &self.completed_stats
+    }
+
+    /// 获取所有运行中 Worker 的总窗口平均速度
     ///
-    /// 将所有 Worker 的窗口平均速度相加
+    /// 将所有运行中 Worker 的窗口平均速度相加
     pub fn get_total_window_avg_speed(&self) -> Option<DownloadSpeed> {
-        self.stats_map
+        self.running_stats_map
             .values()
-            .filter_map(|s| s.get_window_avg_speed().map(|v| v.as_u64()))
+            .map(|s| s.get_window_avg_speed().as_u64())
             .reduce(|a, b| a + b)
             .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取所有 Worker 的总实时速度
+    /// 获取所有运行中 Worker 的总实时速度
     pub fn get_total_instant_speed(&self) -> Option<DownloadSpeed> {
-        self.stats_map
+        self.running_stats_map
             .values()
-            .filter_map(|s| s.get_instant_speed().map(|v| v.as_u64()))
+            .map(|s| s.get_instant_speed().as_u64())
             .reduce(|a, b| a + b)
             .map(DownloadSpeed::from_raw)
     }
 
-    /// 获取所有 Worker 的总平均速度
+    /// 获取所有运行中 Worker 的总平均速度
     pub fn get_total_avg_speed(&self) -> Option<DownloadSpeed> {
-        self.stats_map
+        self.running_stats_map
             .values()
-            .filter_map(|s| s.get_avg_speed().map(|v| v.as_u64()))
+            .map(|s| s.get_avg_speed().as_u64())
             .reduce(|a, b| a + b)
             .map(DownloadSpeed::from_raw)
     }
@@ -145,26 +194,33 @@ impl AggregatedStats {
     }
 }
 
-/// 从 stats_map 计算 DownloadSummary
-fn compute_summary(stats_map: &FxHashMap<u64, ExecutorStats>) -> DownloadSummary {
+/// 从 running_stats_map 和 completed_stats 计算 DownloadSummary
+fn compute_summary(
+    running_stats_map: &FxHashMap<u64, RunningExecutorStats>,
+    completed_stats: &CompletedStats,
+) -> DownloadSummary {
     let mut avg_speed: u64 = 0;
     let mut instant_speed: u64 = 0;
     let mut window_avg_speed: u64 = 0;
+    
+    // 从运行中的 Executor 累加
     let mut written_bytes: u64 = 0;
     let mut downloaded_bytes: u64 = 0;
-
-    for stats in stats_map.values() {
-        // 直接从 ExecutorStats 累加（包括已停止的 Executor）
+    
+    for stats in running_stats_map.values() {
         written_bytes += stats.written_bytes;
         downloaded_bytes += stats.downloaded_bytes;
-
-        // 速度统计只从运行中的 Executor 获取
-        if let Some(speed_stats) = stats.get_speed_stats() {
-            avg_speed += speed_stats.avg_speed.as_u64();
-            instant_speed += speed_stats.instant_speed.as_u64();
-            window_avg_speed += speed_stats.window_avg_speed.as_u64();
-        }
+        
+        // 速度统计从运行中的 Executor 获取
+        let speed_stats = stats.get_speed_stats();
+        avg_speed += speed_stats.avg_speed.as_u64();
+        instant_speed += speed_stats.instant_speed.as_u64();
+        window_avg_speed += speed_stats.window_avg_speed.as_u64();
     }
+    
+    // 加上已完成 Executor 的累计字节数
+    written_bytes += completed_stats.written_bytes;
+    downloaded_bytes += completed_stats.downloaded_bytes;
 
     DownloadSummary {
         written_bytes,
@@ -234,7 +290,7 @@ impl DownloadStats {
                             self.handle_update(worker_id.pool_id(), stats);
                         }
                         Ok((worker_id, ExecutorBroadcast::Shutdown)) => {
-                            self.handle_remove(worker_id.pool_id());
+                            self.handle_shutdown(worker_id.pool_id());
                         }
                         Err(broadcast::error::RecvError::Lagged(count)) => {
                             // 消息丢失，记录日志但继续运行
@@ -271,18 +327,46 @@ impl DownloadStats {
     fn handle_update(&mut self, worker_id: u64, stats: ExecutorStats) {
         self.stats.update(|s| {
             let mut s = s.clone();
-            s.stats_map.insert(worker_id, stats.clone());
-            s.summary = compute_summary(&s.stats_map);
+            
+            match stats {
+                ExecutorStats::Pending | ExecutorStats::TaskStarted(_) => {
+                    // 待命/已启动状态，无需更新
+                }
+                ExecutorStats::Running { stats: running_stats, .. } => {
+                    // 运行中的 Executor，更新到 running_stats_map
+                    s.running_stats_map.insert(worker_id, running_stats);
+                }
+                ExecutorStats::Stopped(stopped_stats) => {
+                    // 已停止的 Executor，从 running_stats_map 移除并累加到 completed_stats
+                    s.running_stats_map.remove(&worker_id);
+                    s.completed_stats.accumulate(
+                        stopped_stats.total_duration,
+                        stopped_stats.downloaded_bytes,
+                        stopped_stats.written_bytes,
+                    );
+                }
+            }
+            
+            s.summary = compute_summary(&s.running_stats_map, &s.completed_stats);
             s
         });
     }
 
-    /// 处理移除
-    fn handle_remove(&mut self, worker_id: u64) {
+    /// 处理 Executor 关闭（Shutdown 信号）
+    fn handle_shutdown(&mut self, worker_id: u64) {
         self.stats.update(|s| {
             let mut s = s.clone();
-            s.stats_map.remove(&worker_id);
-            s.summary = compute_summary(&s.stats_map);
+            
+            // 如果 Executor 还在 running_stats_map 中，累加到 completed_stats
+            if let Some(running_stats) = s.running_stats_map.remove(&worker_id) {
+                s.completed_stats.accumulate(
+                    running_stats.current_duration,
+                    running_stats.downloaded_bytes,
+                    running_stats.written_bytes,
+                );
+            }
+            
+            s.summary = compute_summary(&s.running_stats_map, &s.completed_stats);
             s
         });
     }
@@ -293,6 +377,7 @@ mod tests {
     use crate::pool::common::WorkerId;
     use crate::pool::download::WorkerBroadcaster;
     use tokio::sync::broadcast;
+    use std::time::Instant;
 
     use super::*;
 
@@ -308,10 +393,9 @@ mod tests {
         let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx.clone());
         let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
 
-        // 发送更新（通过广播）
-        let executor_stats = ExecutorStats::default();
-        broadcaster1.send_stats(executor_stats.clone());
-        broadcaster2.send_stats(executor_stats);
+        // 发送更新（通过广播）- 使用 Pending 状态
+        broadcaster1.send_stats(ExecutorStats::Pending);
+        broadcaster2.send_stats(ExecutorStats::TaskStarted(Instant::now()));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -331,10 +415,9 @@ mod tests {
         let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx.clone());
         let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
 
-        // 添加两个 executor
-        let executor_stats = ExecutorStats::default();
-        broadcaster1.send_stats(executor_stats.clone());
-        broadcaster2.send_stats(executor_stats);
+        // 添加两个 executor - 使用 TaskStarted 状态
+        broadcaster1.send_stats(ExecutorStats::TaskStarted(Instant::now()));
+        broadcaster2.send_stats(ExecutorStats::TaskStarted(Instant::now()));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -358,13 +441,14 @@ mod tests {
         // 创建 WorkerBroadcaster 用于发送消息
         let broadcaster = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx);
 
-        // 发送一些消息确保 actor 在运行
-        let executor_stats = ExecutorStats::default();
-        broadcaster.send_stats(executor_stats);
+        // 测试状态转换：Pending -> TaskStarted -> Running -> Stopped
+        broadcaster.send_stats(ExecutorStats::Pending);
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        
+        broadcaster.send_stats(ExecutorStats::TaskStarted(Instant::now()));
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // 关闭并等待 - 这会触发 Stopped 状态
+        // 关闭并等待
         handle.shutdown_and_wait().await;
     }
 }

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use super::utils::{format_bytes, format_duration};
 use crate::download::DownloadProgress;
-use crate::pool::download::ExecutorCurrentStats;
 
 /// 进度条管理器
 pub struct ProgressManager {
@@ -141,10 +140,7 @@ impl ProgressManager {
                 // 计算分块大小范围（只统计运行中的 Executor）
                 let chunk_sizes: Vec<u64> = executor_stats
                     .iter()
-                    .filter_map(|(_, s)| match &s.current_stats {
-                        ExecutorCurrentStats::Running(stats) => Some(stats.current_chunk_size),
-                        ExecutorCurrentStats::Stopped => None,
-                    })
+                    .map(|(_, s)| s.speed_stats.current_chunk_size)
                     .collect();
                 let chunk_info = if !chunk_sizes.is_empty() {
                     let min_chunk = chunk_sizes.iter().min().copied().unwrap_or(0);
@@ -187,27 +183,16 @@ impl ProgressManager {
                         }
                     }
 
-                    // 更新所有 worker 的进度条
-                    for (idx, (_, stats)) in executor_stats.iter().enumerate() {
+                    // 更新所有运行中 worker 的进度条
+                    for (idx, (_, running_stats)) in executor_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
-                            // 根据 current_stats 状态显示不同信息
-                            let msg = match &stats.current_stats {
-                                ExecutorCurrentStats::Running(speed_stats) => {
-                                    let speed = speed_stats.instant_speed
-                                        .to_formatted(self.size_standard).to_string();
-                                    format!(
-                                        "{} {}",
-                                        format_bytes(stats.written_bytes),
-                                        speed
-                                    )
-                                }
-                                ExecutorCurrentStats::Stopped => {
-                                    format!(
-                                        "{} [已停止]",
-                                        format_bytes(stats.written_bytes),
-                                    )
-                                }
-                            };
+                            let speed = running_stats.get_instant_speed()
+                                .to_formatted(self.size_standard).to_string();
+                            let msg = format!(
+                                "{} {}",
+                                format_bytes(running_stats.written_bytes),
+                                speed
+                            );
                             worker_bar.set_message(msg);
                         }
                     }
@@ -234,8 +219,9 @@ impl ProgressManager {
                 // 详细模式：显示每个 worker 的最终统计
                 if self.verbose {
                     // 确保所有 worker 都有进度条（处理渐进式启动的情况）
+                    let total_workers = executor_stats.total_count() as usize;
                     if let Some(ref multi) = self.multi {
-                        while self.worker_bars.len() < executor_stats.len() {
+                        while self.worker_bars.len() < total_workers {
                             let worker_id = self.worker_bars.len();
                             let worker_bar = multi.add(ProgressBar::new(0));
                             worker_bar.set_style(
@@ -247,22 +233,26 @@ impl ProgressManager {
                         }
                     }
 
-                    // 显示所有 worker 的最终统计
-                    for (idx, (_, stats)) in executor_stats.iter().enumerate() {
+                    // 显示仍在运行的 worker 统计
+                    for (idx, (_, running_stats)) in executor_stats.iter().enumerate() {
                         if let Some(worker_bar) = self.worker_bars.get(idx) {
-                            // 从 current_stats 提取平均速度
-                            let avg_speed_str = match &stats.current_stats {
-                                ExecutorCurrentStats::Running(speed_stats) => {
-                                    speed_stats.avg_speed
-                                        .to_formatted(self.size_standard).to_string()
-                                }
-                                ExecutorCurrentStats::Stopped => "N/A".to_string(),
-                            };
+                            let avg_speed_str = running_stats.get_avg_speed()
+                                .to_formatted(self.size_standard).to_string();
                             worker_bar.finish_with_message(format!(
                                 "完成：{}, 平均: {}",
-                                format_bytes(stats.written_bytes),
+                                format_bytes(running_stats.written_bytes),
                                 avg_speed_str
                             ));
+                        }
+                    }
+
+                    // 其余 worker 已完成（从 completed_stats 获取总计）
+                    let completed = executor_stats.get_completed_stats();
+                    if completed.count > 0 {
+                        for idx in executor_stats.len()..self.worker_bars.len() {
+                            if let Some(worker_bar) = self.worker_bars.get(idx) {
+                                worker_bar.finish_with_message("已完成".to_string());
+                            }
                         }
                     }
                 }

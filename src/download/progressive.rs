@@ -28,8 +28,8 @@ enum LaunchDecision {
     Launch {
         /// 要启动的 worker 数量
         workers_to_add: u64,
-        /// 当前所有 worker 的速度
-        speeds: Vec<Option<DownloadSpeed>>,
+        /// 当前所有运行中 worker 的速度
+        speeds: Vec<DownloadSpeed>,
     },
     /// 等待条件满足
     Wait(WaitReason),
@@ -42,7 +42,7 @@ enum LaunchDecision {
 enum WaitReason {
     /// Worker 速度未达标
     InsufficientSpeed {
-        speeds: Vec<Option<DownloadSpeed>>,
+        speeds: Vec<DownloadSpeed>,
         threshold: Option<u64>,
     },
     /// 预期剩余时间过短
@@ -65,18 +65,15 @@ struct ProgressiveLauncherLogic {
 impl ProgressiveLauncherLogic {
     /// 格式化速度列表为可读的字符串
     ///
-    /// 将 `Vec<Option<DownloadSpeed>>` 转换为格式化的速度字符串
-    /// 例如: "1.2 MB/s, 1.5 MB/s, N/A"
+    /// 将 `Vec<DownloadSpeed>` 转换为格式化的速度字符串
+    /// 例如: "1.2 MB/s, 1.5 MB/s"
     fn format_speeds(
-        speeds: &[Option<DownloadSpeed>],
+        speeds: &[DownloadSpeed],
         size_standard: net_bytes::SizeStandard,
     ) -> String {
         speeds
             .iter()
-            .map(|speed| match speed {
-                Some(s) => s.to_formatted(size_standard).to_string(),
-                None => "N/A".to_string(),
-            })
+            .map(|speed| speed.to_formatted(size_standard).to_string())
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -114,21 +111,21 @@ impl ProgressiveLauncherLogic {
         self.next_launch_stage < self.worker_launch_stages.len()
     }
 
-    /// 检查所有已启动 Worker 的速度是否达到阈值
+    /// 检查所有运行中 Worker 的速度是否达到阈值
     fn check_worker_speeds(
         &self,
         aggregated_stats: &AggregatedStats,
         config: &DownloadConfig,
-    ) -> Result<Vec<Option<DownloadSpeed>>, WaitReason> {
+    ) -> Result<Vec<DownloadSpeed>, WaitReason> {
         let mut speeds = Vec::with_capacity(aggregated_stats.len());
         let threshold = config.progressive().min_speed_threshold();
 
-        for (_, executor_stats) in aggregated_stats.iter() {
-            let instant_speed = executor_stats.get_instant_speed();
+        for (_, running_stats) in aggregated_stats.iter_running() {
+            let instant_speed = running_stats.get_instant_speed();
 
             // 检查速度是否达标
             if let Some(threshold) = threshold {
-                if instant_speed.is_none() || instant_speed.unwrap().as_u64() < threshold.get() {
+                if instant_speed.as_u64() < threshold.get() {
                     speeds.push(instant_speed);
                     return Err(WaitReason::InsufficientSpeed {
                         speeds,
@@ -374,7 +371,7 @@ impl ProgressiveLauncherActor {
             }
 
             // 检测并调整启动阶段（应对 worker 数量变化）
-            let current_worker_count = aggregated_stats.len() as u64;
+            let current_worker_count = aggregated_stats.running_count() as u64;
             self.logic
                 .adjust_stage_for_worker_count(current_worker_count);
 
