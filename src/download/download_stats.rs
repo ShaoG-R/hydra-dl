@@ -364,7 +364,7 @@ impl DownloadStats {
                     // 待命状态，添加到 pending_stats_map
                     s.pending_stats_map.insert(worker_id, ());
                 }
-                ExecutorStats::TaskStarted(start_time) => {
+                ExecutorStats::TaskStarted { start_time, .. } => {
                     // 已启动状态，从 pending 移除，添加到 task_started
                     s.pending_stats_map.remove(&worker_id);
                     s.task_started_stats_map.insert(worker_id, start_time);
@@ -437,7 +437,7 @@ mod tests {
 
         // 发送更新（通过广播）- 使用 Pending 状态
         broadcaster1.send_stats(ExecutorStats::Pending);
-        broadcaster2.send_stats(ExecutorStats::TaskStarted(Instant::now()));
+        broadcaster2.send_stats(ExecutorStats::TaskStarted { start_time: Instant::now(), written_bytes: 0 });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -458,8 +458,8 @@ mod tests {
         let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
 
         // 添加两个 executor - 使用 TaskStarted 状态
-        broadcaster1.send_stats(ExecutorStats::TaskStarted(Instant::now()));
-        broadcaster2.send_stats(ExecutorStats::TaskStarted(Instant::now()));
+        broadcaster1.send_stats(ExecutorStats::TaskStarted { start_time: Instant::now(), written_bytes: 0 });
+        broadcaster2.send_stats(ExecutorStats::TaskStarted { start_time: Instant::now(), written_bytes: 0 });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -487,7 +487,7 @@ mod tests {
         broadcaster.send_stats(ExecutorStats::Pending);
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
         
-        broadcaster.send_stats(ExecutorStats::TaskStarted(Instant::now()));
+        broadcaster.send_stats(ExecutorStats::TaskStarted { start_time: Instant::now(), written_bytes: 0 });
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
         // 关闭并等待

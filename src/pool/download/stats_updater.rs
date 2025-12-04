@@ -91,8 +91,8 @@ pub enum ExecutorStats {
     /// Executor 待命中（尚未开始运行）
     Pending,
     /// Executor 已启动（收到 TaskStarted，等待第一个 ChunkSampled）
-    /// 携带启动时间
-    TaskStarted(Instant),
+    /// 携带启动时间和已写入字节数
+    TaskStarted { start_time: Instant, written_bytes: u64 },
     /// Executor 运行中，携带启动时间和统计数据
     Running {
         start_time: Instant,
@@ -106,7 +106,7 @@ impl ExecutorStats {
     /// 获取启动时间（TaskStarted 或 Running 状态）
     pub fn start_time(&self) -> Option<Instant> {
         match self {
-            ExecutorStats::TaskStarted(t) => Some(*t),
+            ExecutorStats::TaskStarted { start_time, .. } => Some(*start_time),
             ExecutorStats::Running { start_time, .. } => Some(*start_time),
             _ => None,
         }
@@ -115,7 +115,7 @@ impl ExecutorStats {
     /// 获取已下载字节数
     pub fn downloaded_bytes(&self) -> u64 {
         match self {
-            ExecutorStats::Pending | ExecutorStats::TaskStarted(_) => 0,
+            ExecutorStats::Pending | ExecutorStats::TaskStarted { .. } => 0,
             ExecutorStats::Running { stats, .. } => stats.downloaded_bytes,
             ExecutorStats::Stopped(stats) => stats.downloaded_bytes,
         }
@@ -124,7 +124,8 @@ impl ExecutorStats {
     /// 获取已写入字节数
     pub fn written_bytes(&self) -> u64 {
         match self {
-            ExecutorStats::Pending | ExecutorStats::TaskStarted(_) => 0,
+            ExecutorStats::Pending => 0,
+            ExecutorStats::TaskStarted { written_bytes, .. } => *written_bytes,
             ExecutorStats::Running { stats, .. } => stats.written_bytes,
             ExecutorStats::Stopped(stats) => stats.written_bytes,
         }
@@ -137,7 +138,7 @@ impl ExecutorStats {
 
     /// 检查是否已启动
     pub fn is_task_started(&self) -> bool {
-        matches!(self, ExecutorStats::TaskStarted(_))
+        matches!(self, ExecutorStats::TaskStarted { .. })
     }
 
     /// 检查是否正在运行
@@ -436,7 +437,10 @@ impl StatsUpdater {
         }
         
         debug!("Worker {} 任务开始", self.worker_id);
-        self.state = ExecutorStats::TaskStarted(Instant::now());
+        self.state = ExecutorStats::TaskStarted {
+            start_time: Instant::now(),
+            written_bytes: 0,
+        };
         self.broadcast_stats();
     }
 
@@ -483,24 +487,32 @@ impl StatsUpdater {
         self.broadcast_stats();
     }
 
-    /// 处理写入成功（仅 Running 状态有效）
+    /// 处理写入成功（TaskStarted 或 Running 状态有效）
     fn handle_bytes_written(&mut self, bytes: u64) {
-        // 只有在 Running 状态才处理
-        let ExecutorStats::Running { start_time, stats } = &self.state else {
-            warn!("Worker {} 非Running状态时接收到写入成功信号", self.worker_id);
-            return;
-        };
-        
-        self.state = ExecutorStats::Running {
-            start_time: *start_time,
-            stats: RunningExecutorStats {
-                current_duration: start_time.elapsed(),
-                downloaded_bytes: stats.downloaded_bytes,
-                written_bytes: stats.written_bytes + bytes,
-                speed_stats: stats.speed_stats,
-            },
-        };
-        self.broadcast_stats();
+        match &self.state {
+            ExecutorStats::TaskStarted { start_time, written_bytes } => {
+                self.state = ExecutorStats::TaskStarted {
+                    start_time: *start_time,
+                    written_bytes: written_bytes + bytes,
+                };
+                self.broadcast_stats();
+            }
+            ExecutorStats::Running { start_time, stats } => {
+                self.state = ExecutorStats::Running {
+                    start_time: *start_time,
+                    stats: RunningExecutorStats {
+                        current_duration: start_time.elapsed(),
+                        downloaded_bytes: stats.downloaded_bytes,
+                        written_bytes: stats.written_bytes + bytes,
+                        speed_stats: stats.speed_stats,
+                    },
+                };
+                self.broadcast_stats();
+            }
+            _ => {
+                warn!("Worker {} 非TaskStarted/Running状态时接收到写入成功信号", self.worker_id);
+            }
+        }
     }
 
     /// 处理任务结束（TaskStarted/Running -> Stopped）
