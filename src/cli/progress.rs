@@ -1,7 +1,6 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use net_bytes::{
     FileSizeFormat, SizeStandard,
-    rust_decimal::{Decimal, prelude::ToPrimitive},
 };
 use std::time::Duration;
 
@@ -126,12 +125,11 @@ impl ProgressManager {
                         // 使用加速度改进 ETA 预测
                         let eta_secs = instant_acceleration
                             .and_then(|accel| {
-                                accel.predict_eta(instant_speed.as_decimal(), remaining_bytes)
+                                accel.predict_eta(instant_speed.as_u64(), remaining_bytes)
                             })
-                            .and_then(|d| Decimal::to_u64(&d))
-                            .unwrap_or_else(|| remaining_bytes / instant_speed.as_u64());
+                            .unwrap_or_else(|| remaining_bytes as f64 / instant_speed.as_f64());
 
-                        format!(", ETA: {}", format_duration(eta_secs as f64))
+                        format!(", ETA: {}", format_duration(eta_secs))
                     };
                     (speed_display, eta_display)
                 } else {
