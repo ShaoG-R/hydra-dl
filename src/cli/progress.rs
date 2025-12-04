@@ -169,8 +169,9 @@ impl ProgressManager {
                 // 详细模式：更新每个 worker 的进度条
                 if self.verbose {
                     // 动态添加新的 worker 进度条（处理渐进式启动）
+                    let total_workers = executor_stats.total_count() as usize;
                     if let Some(ref multi) = self.multi {
-                        while self.worker_bars.len() < executor_stats.len() {
+                        while self.worker_bars.len() < total_workers {
                             let worker_id = self.worker_bars.len();
                             let worker_bar = multi.add(ProgressBar::new(0));
                             worker_bar.set_style(
@@ -183,17 +184,35 @@ impl ProgressManager {
                         }
                     }
 
-                    // 更新所有运行中 worker 的进度条
-                    for (idx, (_, running_stats)) in executor_stats.iter_running().enumerate() {
-                        if let Some(worker_bar) = self.worker_bars.get(idx) {
+                    // 按照三个分组更新 worker 进度条：下载中、任务开始、准备中
+                    
+                    // 组 1: 下载中 (Running)
+                    for (&worker_id, running_stats) in executor_stats.iter_running() {
+                        if let Some(worker_bar) = self.worker_bars.get(worker_id as usize) {
                             let speed = running_stats.get_instant_speed()
                                 .to_formatted(self.size_standard).to_string();
                             let msg = format!(
-                                "{} {}",
+                                "下载中: {} {}",
                                 format_bytes(running_stats.written_bytes),
                                 speed
                             );
                             worker_bar.set_message(msg);
+                        }
+                    }
+
+                    // 组 2: 任务开始 (TaskStarted)
+                    for (&worker_id, start_time) in executor_stats.iter_task_started() {
+                        if let Some(worker_bar) = self.worker_bars.get(worker_id as usize) {
+                            let elapsed = start_time.elapsed();
+                            let msg = format!("任务开始: 已运行 {:.1}s", elapsed.as_secs_f64());
+                            worker_bar.set_message(msg);
+                        }
+                    }
+
+                    // 组 3: 准备中 (Pending)
+                    for &worker_id in executor_stats.iter_pending() {
+                        if let Some(worker_bar) = self.worker_bars.get(worker_id as usize) {
+                            worker_bar.set_message("准备中...".to_string());
                         }
                     }
                 }

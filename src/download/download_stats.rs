@@ -11,6 +11,7 @@
 //! - 提供查询接口获取聚合后的统计数据
 
 use crate::pool::download::{ExecutorBroadcast, ExecutorStats, RunningExecutorStats, TaggedBroadcast};
+use std::time::Instant;
 use std::time::Duration;
 use lite_sync::oneshot::lite;
 use log::debug;
@@ -74,6 +75,10 @@ impl CompletedStats {
 /// 聚合后的统计数据
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedStats {
+    /// 待命中的 Executor 映射（Pending 状态）
+    pub pending_stats_map: FxHashMap<u64, ()>,
+    /// 已启动的 Executor 映射（TaskStarted 状态，记录启动时间）
+    pub task_started_stats_map: FxHashMap<u64, Instant>,
     /// 正在运行的 Executor 统计映射（只包含 Running 状态的 Executor）
     pub running_stats_map: FxHashMap<u64, RunningExecutorStats>,
     /// 已完成 Executor 的累计统计
@@ -116,6 +121,16 @@ impl AggregatedStats {
         self.running_stats_map.get(&worker_id)
     }
 
+    /// 获取待命中的 Executor 数量
+    pub fn pending_count(&self) -> usize {
+        self.pending_stats_map.len()
+    }
+
+    /// 获取已启动的 Executor 数量
+    pub fn task_started_count(&self) -> usize {
+        self.task_started_stats_map.len()
+    }
+
     /// 获取正在运行的 Executor 数量
     pub fn running_count(&self) -> usize {
         self.running_stats_map.len()
@@ -126,14 +141,30 @@ impl AggregatedStats {
         self.completed_stats.count
     }
 
-    /// 获取总 Executor 数量（运行中 + 已完成）
+    /// 获取总 Executor 数量（待命 + 已启动 + 运行中 + 已完成）
     pub fn total_count(&self) -> u64 {
-        self.running_stats_map.len() as u64 + self.completed_stats.count
+        self.pending_stats_map.len() as u64 
+            + self.task_started_stats_map.len() as u64 
+            + self.running_stats_map.len() as u64 
+            + self.completed_stats.count
     }
 
     /// 检查是否没有任何 Executor
     pub fn is_empty(&self) -> bool {
-        self.running_stats_map.is_empty() && self.completed_stats.count == 0
+        self.pending_stats_map.is_empty() 
+            && self.task_started_stats_map.is_empty()
+            && self.running_stats_map.is_empty() 
+            && self.completed_stats.count == 0
+    }
+
+    /// 迭代所有待命中的 Executor
+    pub fn iter_pending(&self) -> impl Iterator<Item = &u64> {
+        self.pending_stats_map.keys()
+    }
+
+    /// 迭代所有已启动的 Executor（返回 worker_id 和启动时间）
+    pub fn iter_task_started(&self) -> impl Iterator<Item = (&u64, &Instant)> {
+        self.task_started_stats_map.iter()
     }
 
     /// 迭代所有正在运行的 Executor 统计
@@ -329,11 +360,18 @@ impl DownloadStats {
             let mut s = s.clone();
             
             match stats {
-                ExecutorStats::Pending | ExecutorStats::TaskStarted(_) => {
-                    // 待命/已启动状态，无需更新
+                ExecutorStats::Pending => {
+                    // 待命状态，添加到 pending_stats_map
+                    s.pending_stats_map.insert(worker_id, ());
+                }
+                ExecutorStats::TaskStarted(start_time) => {
+                    // 已启动状态，从 pending 移除，添加到 task_started
+                    s.pending_stats_map.remove(&worker_id);
+                    s.task_started_stats_map.insert(worker_id, start_time);
                 }
                 ExecutorStats::Running { stats: running_stats, .. } => {
-                    // 运行中的 Executor，更新到 running_stats_map
+                    // 运行中的 Executor，从 task_started 移除，更新到 running_stats_map
+                    s.task_started_stats_map.remove(&worker_id);
                     s.running_stats_map.insert(worker_id, running_stats);
                 }
                 ExecutorStats::Stopped(stopped_stats) => {
@@ -356,6 +394,10 @@ impl DownloadStats {
     fn handle_shutdown(&mut self, worker_id: u64) {
         self.stats.update(|s| {
             let mut s = s.clone();
+            
+            // 从所有状态映射中移除
+            s.pending_stats_map.remove(&worker_id);
+            s.task_started_stats_map.remove(&worker_id);
             
             // 如果 Executor 还在 running_stats_map 中，累加到 completed_stats
             if let Some(running_stats) = s.running_stats_map.remove(&worker_id) {
