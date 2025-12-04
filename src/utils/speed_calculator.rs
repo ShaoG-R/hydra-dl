@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 pub use core::Sample;
 use core::{theil_sen_regression, two_point_speed, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, MIN_SAMPLES_FOR_REGRESSION};
 
+const MIN_DURATION_NS: u128 = 100_000_000; // 100ms
+
 /// 速度计算器配置参数
 ///
 /// 内部共享的配置参数，用于 Recording 和 Active 状态
@@ -234,13 +236,16 @@ impl SpeedCalculatorActive {
     ///
     /// `DownloadSpeed` - 全局平均速度（保证有效，无 Option）
     pub fn get_global_avg_speed(&self) -> DownloadSpeed {
-        let elapsed = self.start_time.elapsed();
         
-        // 如果有采样点，使用最后一个采样点的字节数
-        let bytes = self.samples.back().map(|s| s.bytes).unwrap_or(0);
         
-        // 即使 elapsed 很小，DownloadSpeed::new 也能处理
-        DownloadSpeed::new(bytes, elapsed)
+        if let Some(last) = self.samples.back() {
+            let duration = Duration::from_nanos(last.timestamp_ns.get());
+            if duration.as_nanos() >= MIN_DURATION_NS {
+                return DownloadSpeed::new(last.bytes, duration);
+            }
+        }
+        // 回退：返回零速度
+        DownloadSpeed::new(0, Duration::from_secs(1))
     }
 }
 
