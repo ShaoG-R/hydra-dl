@@ -66,33 +66,43 @@ impl Default for FileWriterConfig {
 /// Executor 持有此接收器，在主 select! 中监听写入失败
 pub(crate) type WriteFailureReceiver = oneshot::Receiver<WriteFailure>;
 
-/// File Writer Handle
+/// 负责 Actor 生命周期的守卫
 ///
-/// 提供写入和关闭功能的句柄
-pub(crate) struct FileWriter {
-    /// 写入请求发送通道
-    write_tx: Option<mpsc::Sender<WriteRequest>>,
-    /// 关闭信号发送器
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    /// Actor 任务句柄
-    actor_handle: Option<JoinHandle<()>>,
-    /// Worker ID（用于日志）
+/// 当此结构体被 Drop 时，如果 handle 还在，说明没有正常关闭，
+/// 它会负责 abort 掉后台任务。
+struct ActorGuard {
+    /// 任务句柄（仍然需要 Option，因为要在 Drop 中 take）
+    handle: Option<JoinHandle<()>>,
     worker_id: WorkerId,
 }
 
+impl Drop for ActorGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            debug!("Worker {} FileWriter actor aborted on drop", self.worker_id);
+        }
+    }
+}
+
+/// File Writer Handle
+pub(crate) struct FileWriter {
+    /// 写入请求发送通道 (不再需要 Option)
+    write_tx: mpsc::Sender<WriteRequest>,
+
+    /// 关闭信号发送器 (不再需要 Option)
+    shutdown_tx: oneshot::Sender<()>,
+
+    /// 包含 JoinHandle 的守卫
+    actor_guard: ActorGuard,
+
+    /// Worker ID
+    worker_id: WorkerId,
+}
+
+// 移除 impl Drop for FileWriter，逻辑移动到了 ActorGuard
+
 impl FileWriter {
-    /// 创建并启动新的 File Writer
-    ///
-    /// # Arguments
-    ///
-    /// - `worker_id`: Worker ID
-    /// - `writer`: 共享的文件写入器
-    /// - `stats_handle`: Stats Updater 句柄
-    /// - `config`: 配置（可选，使用默认配置）
-    ///
-    /// # Returns
-    ///
-    /// 返回 `(FileWriter, WriteFailureReceiver)`
     pub(crate) fn new(
         worker_id: WorkerId,
         writer: MmapWriter,
@@ -113,13 +123,15 @@ impl FileWriter {
             stats_handle,
         };
 
-        // 启动 Actor 任务
         let actor_handle = tokio::spawn(actor.run());
 
         let file_writer = Self {
-            write_tx: Some(write_tx),
-            shutdown_tx: Some(shutdown_tx),
-            actor_handle: Some(actor_handle),
+            write_tx,    // 直接持有
+            shutdown_tx, // 直接持有
+            actor_guard: ActorGuard {
+                handle: Some(actor_handle),
+                worker_id,
+            },
             worker_id,
         };
 
@@ -128,65 +140,62 @@ impl FileWriter {
 
     /// 发送写入请求
     ///
-    /// 使用 `send().await` 等待通道有空间，提供背压
-    /// 当 Writer 协程关闭时返回 Err
+    /// 现在不需要 unwrap 或 if let，直接调用，性能更高且代码更简洁
     #[inline]
     pub(crate) async fn write(
         &self,
         range: AllocatedRange,
         data: Bytes,
     ) -> Result<(), mpsc::error::SendError<WriteRequest>> {
-        if let Some(tx) = &self.write_tx {
-            tx.send(WriteRequest { range, data }).await
-        } else {
-            Err(mpsc::error::SendError(WriteRequest { range, data }))
-        }
+        self.write_tx.send(WriteRequest { range, data }).await
     }
 
     /// 关闭 Writer 并等待其完全停止
     ///
-    /// 发送关闭信号并等待 Actor 任务完成
-    pub(crate) async fn shutdown_and_wait(mut self) {
-        // 发送关闭信号
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+    /// 消费 self，直接解构字段
+    pub(crate) async fn shutdown_and_wait(self) {
+        // 解构 self
+        let Self {
+            shutdown_tx,
+            mut actor_guard,
+            worker_id,
+            ..
+        } = self;
+
+        // 1. 发送关闭信号 (直接使用，无需 unwrap)
+        let _ = shutdown_tx.send(());
+
+        // 2. 等待 Actor 完成
+        // 从 guard 中 take 走 handle，这样 guard drop 时就不会触发 abort
+        if let Some(handle) = actor_guard.handle.take() {
+            let _ = handle.await;
+            debug!("Worker {} FileWriter actor has fully stopped", worker_id);
         }
 
-        // 等待 Actor 任务完成
-        if let Some(handle) = self.actor_handle.take() {
-            let _ = handle.await;
-            debug!(
-                "Worker {} FileWriter actor has fully stopped",
-                self.worker_id
-            );
-        }
+        // 函数结束，shutdown_tx 和 write_tx 被 drop，actor_guard 被 drop (但 handle 为空)
     }
 
     /// 等待所有待处理写入完成后退出
-    ///
-    /// 不发送关闭信号，让 Actor 处理完所有队列中的写入请求后自然退出
-    pub(crate) async fn drain_and_wait(mut self) {
-        // Drop write_tx 会关闭通道，Actor 会处理完剩余请求后退出
-        drop(self.write_tx.take());
+    pub(crate) async fn drain_and_wait(self) {
+        // 解构 self
+        let Self {
+            write_tx,
+            shutdown_tx, // 保持持有，避免 drop 导致 Actor 收到 closed 信号
+            mut actor_guard,
+            worker_id,
+        } = self;
 
-        // 等待 Actor 任务完成
-        if let Some(handle) = self.actor_handle.take() {
+        // 1. 显式 drop write_tx，关闭通道，让 Actor 处理完剩余数据后退出
+        drop(write_tx);
+
+        // 2. 等待 Actor 完成
+        if let Some(handle) = actor_guard.handle.take() {
             let _ = handle.await;
-            debug!(
-                "Worker {} FileWriter actor drained and stopped",
-                self.worker_id
-            );
+            debug!("Worker {} FileWriter actor drained and stopped", worker_id);
         }
-    }
-}
 
-impl Drop for FileWriter {
-    fn drop(&mut self) {
-        // 如果没有调用 shutdown_and_wait，则 abort actor
-        if let Some(handle) = self.actor_handle.take() {
-            handle.abort();
-            debug!("Worker {} FileWriter actor aborted on drop", self.worker_id);
-        }
+        // 3. shutdown_tx 在这里随作用域结束被 drop，但此时 Actor 已经退出了，无所谓
+        let _ = shutdown_tx;
     }
 }
 
