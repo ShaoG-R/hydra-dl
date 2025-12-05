@@ -829,10 +829,7 @@ mod tests {
             .build();
 
         assert_eq!(config.progressive().worker_count(), 12);
-        assert_eq!(
-            config.progressive().worker_ratios(),
-            &[0.25, 0.5, 0.75, 1.0]
-        );
+        assert_eq!(config.progressive().worker_launch_stages(), &[3, 6, 9, 12]);
         assert_eq!(
             config.progressive().min_speed_threshold(),
             Some(NonZeroU64::new(5 * 1024 * 1024).unwrap())

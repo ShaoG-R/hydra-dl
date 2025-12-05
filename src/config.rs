@@ -225,7 +225,7 @@ impl DownloadConfigBuilder {
     {
         let builder = ProgressiveConfigBuilder {
             worker_count: self.progressive.worker_count,
-            worker_ratios: self.progressive.worker_ratios.clone(),
+            worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: self.progressive.min_speed_threshold,
             min_time_before_finish: self.progressive.min_time_before_finish,
         };
@@ -335,6 +335,7 @@ mod tests {
             .build();
 
         assert_eq!(config.progressive().worker_count(), 2);
+        assert_eq!(config.progressive().worker_launch_stages(), &[1, 1, 2, 2]);
         assert_eq!(config.chunk().min_size(), 1 * MB);
         assert_eq!(config.chunk().initial_size(), 10 * MB);
         assert_eq!(config.chunk().max_size(), 100 * MB);
@@ -369,6 +370,6 @@ mod tests {
         assert_eq!(config.chunk.min_size, 1 * MB);
         assert_eq!(config.chunk.initial_size, 5 * MB);
         assert_eq!(config.chunk.max_size, 20 * MB);
-        assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
+        assert_eq!(config.progressive().worker_launch_stages(), &[1, 2]);
     }
 }

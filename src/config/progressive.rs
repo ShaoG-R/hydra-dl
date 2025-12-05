@@ -27,8 +27,8 @@ impl Defaults {
 #[derive(Debug, Clone)]
 pub struct ProgressiveConfig {
     pub worker_count: u64,
-    /// 渐进式启动比例序列
-    pub worker_ratios: Vec<f64>,
+    /// 渐进式启动阶段目标 worker 数（根据比例预计算）
+    pub worker_launch_stages: Vec<u64>,
     /// 最小速度阈值（bytes/s）
     pub min_speed_threshold: Option<NonZeroU64>,
     /// 预期下载结束前最小时间（在此时间内不启动新 worker）
@@ -37,9 +37,11 @@ pub struct ProgressiveConfig {
 
 impl Default for ProgressiveConfig {
     fn default() -> Self {
+        let worker_count = Defaults::WORKER_COUNT;
+        let worker_ratios = Defaults::WORKER_RATIOS.to_vec();
         Self {
-            worker_count: Defaults::WORKER_COUNT,
-            worker_ratios: Defaults::WORKER_RATIOS.to_vec(),
+            worker_count,
+            worker_launch_stages: Self::compute_worker_launch_stages(worker_count, &worker_ratios),
             min_speed_threshold: Defaults::MIN_SPEED_THRESHOLD,
             min_time_before_finish: Duration::from_secs(Defaults::MIN_TIME_BEFORE_FINISH_SECS),
         }
@@ -53,8 +55,8 @@ impl ProgressiveConfig {
     }
 
     #[inline]
-    pub fn worker_ratios(&self) -> &[f64] {
-        &self.worker_ratios
+    pub fn worker_launch_stages(&self) -> &[u64] {
+        &self.worker_launch_stages
     }
 
     #[inline]
@@ -65,6 +67,35 @@ impl ProgressiveConfig {
     #[inline]
     pub fn min_time_before_finish(&self) -> Duration {
         self.min_time_before_finish
+    }
+
+    /// 根据 worker 数量与比例序列计算各阶段目标 worker 数
+    fn compute_worker_launch_stages(worker_count: u64, worker_ratios: &[f64]) -> Vec<u64> {
+        worker_ratios
+            .iter()
+            .map(|&ratio| {
+                let stage_count = ((worker_count as f64 * ratio).ceil() as u64).min(worker_count);
+                // 确保至少启动 1 个 worker
+                stage_count.max(1)
+            })
+            .collect()
+    }
+
+    /// 校验并整理比例序列：过滤 (0,1] 之外的值、排序、去重、回落默认
+    fn sanitize_ratios(ratios: Vec<f64>) -> Vec<f64> {
+        let mut valid_ratios: Vec<f64> = ratios
+            .into_iter()
+            .filter(|&r| r > 0.0 && r <= 1.0)
+            .collect();
+
+        valid_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        valid_ratios.dedup();
+
+        if valid_ratios.is_empty() {
+            Defaults::WORKER_RATIOS.to_vec()
+        } else {
+            valid_ratios
+        }
     }
 }
 
@@ -98,23 +129,7 @@ impl ProgressiveConfigBuilder {
 
     /// 设置渐进式启动比例序列
     pub fn worker_ratios(mut self, ratios: Vec<f64>) -> Self {
-        // 过滤掉无效的比例值（必须在 0.0 < ratio <= 1.0 范围内）
-        let mut valid_ratios: Vec<f64> = ratios
-            .into_iter()
-            .filter(|&r| r > 0.0 && r <= 1.0)
-            .collect();
-
-        // 排序并去重
-        valid_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        valid_ratios.dedup();
-
-        // 如果没有有效比例，使用默认值
-        if valid_ratios.is_empty() {
-            self.worker_ratios = Defaults::WORKER_RATIOS.to_vec();
-        } else {
-            self.worker_ratios = valid_ratios;
-        }
-
+        self.worker_ratios = ProgressiveConfig::sanitize_ratios(ratios);
         self
     }
 
@@ -134,7 +149,10 @@ impl ProgressiveConfigBuilder {
     pub fn build(self) -> ProgressiveConfig {
         ProgressiveConfig {
             worker_count: self.worker_count,
-            worker_ratios: self.worker_ratios,
+            worker_launch_stages: ProgressiveConfig::compute_worker_launch_stages(
+                self.worker_count,
+                &self.worker_ratios,
+            ),
             min_speed_threshold: self.min_speed_threshold,
             min_time_before_finish: self.min_time_before_finish,
         }
@@ -157,7 +175,7 @@ mod tests {
     fn test_default_config() {
         let config = ProgressiveConfig::default();
         assert_eq!(config.worker_count(), Defaults::WORKER_COUNT);
-        assert_eq!(config.worker_ratios(), Defaults::WORKER_RATIOS);
+        assert_eq!(config.worker_launch_stages(), &[1, 2, 3, 4]);
         assert_eq!(config.min_speed_threshold(), Defaults::MIN_SPEED_THRESHOLD);
     }
 
@@ -165,7 +183,7 @@ mod tests {
     fn test_builder_default() {
         let config = ProgressiveConfigBuilder::new().build();
         assert_eq!(config.worker_count(), Defaults::WORKER_COUNT);
-        assert_eq!(config.worker_ratios(), Defaults::WORKER_RATIOS);
+        assert_eq!(config.worker_launch_stages(), &[1, 2, 3, 4]);
         assert_eq!(config.min_speed_threshold(), Defaults::MIN_SPEED_THRESHOLD);
     }
 
@@ -175,7 +193,7 @@ mod tests {
             .worker_count(2)
             .worker_ratios(vec![0.5, 1.0])
             .build();
-        assert_eq!(config.worker_ratios(), &[0.5, 1.0]);
+        assert_eq!(config.worker_launch_stages(), &[1, 2]);
     }
 
     #[test]
@@ -185,7 +203,7 @@ mod tests {
             .worker_count(4)
             .worker_ratios(vec![1.0, 0.25, 0.75, 0.5])
             .build();
-        assert_eq!(config.worker_ratios(), &[0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(config.worker_launch_stages(), &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -196,7 +214,7 @@ mod tests {
             .worker_ratios(vec![0.0, 0.5, 1.0, 1.5, -0.1])
             .build();
         // 0.0, 1.5, -0.1 应该被过滤掉
-        assert_eq!(config.worker_ratios(), &[0.5, 1.0]);
+        assert_eq!(config.worker_launch_stages(), &[2, 4]);
     }
 
     #[test]
@@ -206,7 +224,7 @@ mod tests {
             .worker_count(4)
             .worker_ratios(vec![0.5, 0.5, 1.0, 1.0, 0.25])
             .build();
-        assert_eq!(config.worker_ratios(), &[0.25, 0.5, 1.0]);
+        assert_eq!(config.worker_launch_stages(), &[1, 2, 4]);
     }
 
     #[test]
@@ -216,14 +234,24 @@ mod tests {
             .worker_count(4)
             .worker_ratios(vec![])
             .build();
-        assert_eq!(config.worker_ratios(), Defaults::WORKER_RATIOS);
+        assert_eq!(config.worker_launch_stages(), &[1, 2, 3, 4]);
 
         // 测试全部无效值时使用默认值
         let config2 = ProgressiveConfigBuilder::new()
             .worker_count(4)
             .worker_ratios(vec![0.0, -1.0, 2.0])
             .build();
-        assert_eq!(config2.worker_ratios(), Defaults::WORKER_RATIOS);
+        assert_eq!(config2.worker_launch_stages(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_worker_launch_stages_minimum_one() {
+        // 比例非常小也至少返回 1
+        let config = ProgressiveConfigBuilder::new()
+            .worker_count(3)
+            .worker_ratios(vec![0.01, 0.5, 1.0])
+            .build();
+        assert_eq!(config.worker_launch_stages(), &[1, 2, 3]);
     }
 
     #[test]

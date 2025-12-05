@@ -77,20 +77,11 @@ impl ProgressiveLauncherLogic {
 
     /// 创建新的渐进式启动逻辑管理器
     fn new(config: &DownloadConfig) -> Self {
-        let total_worker_count = config.progressive().worker_count();
-
-        // 根据配置的比例序列计算渐进式启动阶段
-        let worker_launch_stages: Vec<u64> = config
-            .progressive()
-            .worker_ratios()
-            .iter()
-            .map(|&ratio| {
-                let stage_count =
-                    ((total_worker_count as f64 * ratio).ceil() as u64).min(total_worker_count);
-                // 确保至少启动1个worker
-                stage_count.max(1)
-            })
-            .collect();
+        let worker_launch_stages = config.progressive().worker_launch_stages().to_vec();
+        debug_assert!(
+            !worker_launch_stages.is_empty(),
+            "worker_launch_stages 应至少包含一个阶段"
+        );
 
         Self {
             worker_launch_stages,
