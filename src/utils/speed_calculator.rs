@@ -2,6 +2,7 @@ mod core;
 
 use net_bytes::DownloadSpeed;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use core::Sample;
@@ -71,7 +72,7 @@ pub(crate) struct SpeedCalculatorRecording {
     /// 采样点缓冲区
     samples: VecDeque<Sample>,
     /// 配置参数
-    config: SpeedCalculatorConfig,
+    config: Arc<SpeedCalculatorConfig>,
     /// 下载开始时间（尚未初始化）
     start_time: Option<Instant>,
 }
@@ -89,7 +90,7 @@ pub(crate) struct SpeedCalculatorActive {
     /// 采样点缓冲区
     samples: VecDeque<Sample>,
     /// 配置参数
-    config: SpeedCalculatorConfig,
+    config: Arc<SpeedCalculatorConfig>,
     /// 下载开始时间（已初始化，无 Option）
     start_time: Instant,
 }
@@ -100,7 +101,7 @@ impl SpeedCalculatorRecording {
         let calc_config = SpeedCalculatorConfig::from_config(config);
         Self {
             samples: VecDeque::with_capacity(calc_config.max_samples),
-            config: calc_config,
+            config: Arc::new(calc_config),
             start_time: None,
         }
     }

@@ -20,11 +20,6 @@ impl StartedState {
     pub fn start_time(&self) -> Instant {
         self.start_time
     }
-
-    /// 转换为通用 TaskState
-    pub fn into_task_state(self) -> TaskState {
-        TaskState::Started(self)
-    }
 }
 
 /// Running 状态数据封装
@@ -35,19 +30,9 @@ pub struct RunningState {
 }
 
 impl RunningState {
-    /// 获取任务启动时间
-    pub fn start_time(&self) -> Instant {
-        self.start_time
-    }
-
     /// 获取统计数据
     pub fn stats(&self) -> &WorkerStatsActive {
         &self.stats
-    }
-
-    /// 转换为通用 TaskState
-    pub fn into_task_state(self) -> TaskState {
-        TaskState::Running(self)
     }
 
     /// 设置统计数据
@@ -66,11 +51,6 @@ impl EndedState {
     /// 获取消耗时间
     pub fn consumed_time(&self) -> Duration {
         self.consumed_time
-    }
-
-    /// 转换为通用 TaskState
-    pub fn into_task_state(self) -> TaskState {
-        TaskState::Ended(self)
     }
 }
 
@@ -94,15 +74,6 @@ impl TaskState {
         Self::Started(StartedState {
             start_time: Instant::now(),
         })
-    }
-
-    /// 获取任务启动时间（Started 或 Running 状态）
-    pub fn start_time(&self) -> Option<Instant> {
-        match self {
-            TaskState::Started(s) => Some(s.start_time),
-            TaskState::Running(s) => Some(s.start_time),
-            _ => None,
-        }
     }
 
     /// 获取运行中的统计数据（Running 状态）
