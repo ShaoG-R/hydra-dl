@@ -19,14 +19,11 @@
 mod logic;
 
 use crate::config::DownloadConfig;
-use crate::pool::download::{
-    DownloadWorkerHandle, ExecutorBroadcast, ExecutorStats, TaggedBroadcast,
-};
+use crate::pool::download::{ExecutorBroadcast, ExecutorStats, TaggedBroadcast};
 use crate::utils::cancel_channel::CancelHandle;
 use lite_sync::oneshot::lite;
 use log::{debug, warn};
 use rustc_hash::FxHashMap;
-use smr_swap::LocalReader;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -37,8 +34,6 @@ use logic::{ExecutorHealthTracker, Speed, WorkerHealthCheckerLogic};
 pub(super) struct WorkerHealthCheckerParams {
     /// 配置
     pub config: Arc<DownloadConfig>,
-    /// 共享的 worker handles（用于发送取消信号）
-    pub worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 广播接收器
     pub broadcast_rx: broadcast::Receiver<TaggedBroadcast>,
 }
@@ -54,8 +49,6 @@ struct WorkerHealthCheckerActor {
     config: Arc<DownloadConfig>,
     /// 关闭信号接收器
     shutdown_rx: lite::Receiver<()>,
-    /// 共享的 worker handles（用于发送取消信号）
-    worker_handles: LocalReader<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 广播接收器
     broadcast_rx: broadcast::Receiver<TaggedBroadcast>,
     /// 每个 Executor 的健康追踪器（相对速度异常）
@@ -73,7 +66,6 @@ impl WorkerHealthCheckerActor {
     fn new(params: WorkerHealthCheckerParams, shutdown_rx: lite::Receiver<()>) -> Self {
         let WorkerHealthCheckerParams {
             config,
-            worker_handles,
             broadcast_rx,
         } = params;
 
@@ -103,7 +95,6 @@ impl WorkerHealthCheckerActor {
             logic,
             config,
             shutdown_rx,
-            worker_handles,
             broadcast_rx,
             health_trackers: FxHashMap::default(),
             current_stats: FxHashMap::default(),
@@ -253,8 +244,13 @@ impl WorkerHealthCheckerActor {
 
     /// 获取指定 worker 的取消句柄
     fn get_cancel_handle(&self, worker_id: u64) -> Option<CancelHandle> {
-        let handles = self.worker_handles.load();
-        handles.get(&worker_id).map(|h| h.cancel_handle())
+        self.current_stats
+            .get(&worker_id)
+            .and_then(|stats| match stats {
+                ExecutorStats::Pending(p) => Some(p.cancel_tx.get_handle()),
+                ExecutorStats::Running(r) => Some(r.cancel_tx.get_handle()),
+                ExecutorStats::Stopped(_) => None,
+            })
     }
 
     /// 使用指定句柄取消 worker 的当前下载

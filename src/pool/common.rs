@@ -169,8 +169,8 @@ impl<F: WorkerFactory> WorkerPool<F> {
     ///
     /// # Returns
     ///
-    /// 返回 (WorkerPool, 所有 worker 的 ID 列表)
-    pub fn new(factory: F, inputs: Vec<F::Input>) -> (Self, Vec<WorkerId>) {
+    /// 返回 WorkerPool
+    pub fn new(factory: F, inputs: Vec<F::Input>) -> Self {
         let worker_count = inputs.len();
         let slots = DeferredMap::with_capacity(worker_count);
 
@@ -180,7 +180,6 @@ impl<F: WorkerFactory> WorkerPool<F> {
             next_worker_id: AtomicU64::new(0),
         };
 
-        let mut worker_ids = Vec::with_capacity(worker_count);
         for input in inputs {
             let deferred_handle = pool.slots.allocate_handle();
             let slot_id = deferred_handle.key();
@@ -189,11 +188,9 @@ impl<F: WorkerFactory> WorkerPool<F> {
 
             let slot = pool.spawn_worker_internal(worker_id, input);
             pool.slots.insert(deferred_handle, slot);
-
-            worker_ids.push(worker_id);
         }
 
-        (pool, worker_ids)
+        pool
     }
 
     /// 动态添加新的 worker
@@ -303,9 +300,8 @@ mod tests {
         let factory = TestFactory;
         let inputs: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
 
-        let (mut pool, worker_ids) = WorkerPool::new(factory, inputs);
+        let mut pool = WorkerPool::new(factory, inputs);
         assert_eq!(pool.worker_count(), 4);
-        assert_eq!(worker_ids.len(), 4);
 
         pool.shutdown().await;
     }
@@ -313,10 +309,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_empty_pool() {
         let factory = TestFactory;
-        let (mut pool, worker_ids) = WorkerPool::new(factory, vec![]);
+        let mut pool = WorkerPool::new(factory, vec![]);
 
         assert_eq!(pool.worker_count(), 0);
-        assert_eq!(worker_ids.len(), 0);
 
         pool.shutdown().await;
     }
@@ -325,7 +320,7 @@ mod tests {
     async fn test_add_workers() {
         let factory = TestFactory;
         let inputs: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
-        let (mut pool, _) = WorkerPool::new(factory, inputs);
+        let mut pool = WorkerPool::new(factory, inputs);
 
         assert_eq!(pool.worker_count(), 2);
 
@@ -339,27 +334,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_ids_unique() {
-        let factory = TestFactory;
-        let inputs: Vec<_> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
-        let (mut pool, worker_ids) = WorkerPool::new(factory, inputs);
-
-        // 验证 ID 是唯一的
-        for i in 0..worker_ids.len() {
-            for j in (i + 1)..worker_ids.len() {
-                assert_ne!(worker_ids[i], worker_ids[j]);
-            }
-        }
-
-        pool.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn test_graceful_shutdown() {
         let factory = TestFactory;
         let counters: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let inputs = counters.clone();
-        let (mut pool, _) = WorkerPool::new(factory, inputs);
+        let mut pool = WorkerPool::new(factory, inputs);
 
         // 让 workers 运行一段时间
         sleep(Duration::from_millis(50)).await;

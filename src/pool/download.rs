@@ -28,14 +28,13 @@ pub use executor::state::TaskState;
 use local_health_checker::{LocalHealthChecker, LocalHealthCheckerConfig};
 use stats_updater::StatsUpdater;
 pub use stats_updater::{
-    ExecutorBroadcast, ExecutorStats, RunningExecutorStats, StoppedExecutorStats, TaggedBroadcast,
-    WorkerBroadcaster,
+    ExecutorBroadcast, ExecutorStats, PendingExecutorStats, RunningExecutorStats,
+    StoppedExecutorStats, TaggedBroadcast, WorkerBroadcaster,
 };
 
 use super::common::{WorkerFactory, WorkerId, WorkerPool};
-use crate::utils::cancel_channel::{CancelReceiver, CancelSender, cancel_channel};
+use crate::utils::cancel_channel::cancel_channel;
 use crate::utils::{
-    cancel_channel::CancelHandle,
     chunk_strategy::{ChunkStrategy, SpeedBasedChunkStrategy},
     io_traits::HttpClient,
     stats::WorkerStatsRecording,
@@ -68,10 +67,6 @@ pub(crate) struct DownloadWorkerInput {
     pub(crate) initial_chunk_size: u64,
     /// 结果发送通道（oneshot，仅在 worker 完成时发送一次）
     pub(crate) result_tx: tokio::sync::oneshot::Sender<ExecutorResult>,
-    /// 取消信号接收器（用于健康检查触发的重试）
-    pub(crate) cancel_rx: CancelReceiver,
-    /// 取消信号发送器（用于本地健康检查器）
-    pub(crate) cancel_tx: CancelSender,
     /// 外部广播发送器（spawn_worker 中创建 WorkerBroadcaster）
     pub(crate) broadcast_tx: broadcast::Sender<TaggedBroadcast>,
     /// 本地健康检查器配置
@@ -125,11 +120,13 @@ where
             chunk_strategy,
             initial_chunk_size,
             result_tx,
-            cancel_rx,
-            cancel_tx,
             broadcast_tx,
             local_health_config,
         } = input;
+
+        // --- 创建取消通道 ---
+        // 在 spawn_worker 内创建，确保每个 worker 实例有独立的取消通道
+        let (cancel_tx, cancel_rx) = cancel_channel();
 
         // --- 创建 WorkerBroadcaster ---
         // 在此处创建，因为这里才知道真正的 worker_id
@@ -142,6 +139,7 @@ where
             broadcaster.clone(),
             chunk_strategy,
             initial_chunk_size,
+            cancel_tx.clone(),
             None,
         );
         let stats_updater_handle = tokio::spawn(stats_updater.run());
@@ -167,40 +165,6 @@ where
         let main_handle = tokio::spawn(executor.run_loop(executor_input));
 
         vec![main_handle, stats_updater_handle, local_health_handle]
-    }
-}
-
-// ==================== 下载 Worker 句柄 ====================
-
-/// 下载 Worker 句柄
-///
-/// 封装单个下载 worker 的操作接口，提供下载特定的便捷方法
-///
-/// # 示例
-///
-/// ```ignore
-/// let handle = pool.get_worker(0).ok_or(...)?;
-/// handle.send_task(range_task).await?;
-/// let speed = handle.instant_speed();
-/// ```
-#[derive(Clone)]
-pub(crate) struct DownloadWorkerHandle {
-    /// Worker ID
-    worker_id: WorkerId,
-    /// 取消信号发送器（用于健康检查触发的重试）
-    cancel_tx: CancelSender,
-}
-
-impl DownloadWorkerHandle {
-    /// 获取池内唯一 worker ID
-    #[inline]
-    pub fn pool_id(&self) -> u64 {
-        self.worker_id.pool_id()
-    }
-
-    // 获取用于取消的句柄
-    pub fn cancel_handle(&self) -> CancelHandle {
-        self.cancel_tx.get_handle()
     }
 }
 
@@ -244,7 +208,7 @@ where
     ///
     /// # Returns
     ///
-    /// 返回新创建的 DownloadWorkerPool、所有初始 worker 的句柄以及结果接收器
+    /// 返回新创建的 DownloadWorkerPool、所有初始 worker 的结果接收器
     pub(crate) fn new(
         client: C,
         initial_worker_count: u64,
@@ -253,11 +217,7 @@ where
         url: String,
         config: Arc<crate::config::DownloadConfig>,
         broadcast_tx: broadcast::Sender<TaggedBroadcast>,
-    ) -> (
-        Self,
-        Vec<DownloadWorkerHandle>,
-        Vec<tokio::sync::oneshot::Receiver<ExecutorResult>>,
-    ) {
+    ) -> (Self, Vec<tokio::sync::oneshot::Receiver<ExecutorResult>>) {
         let allocator = Arc::new(allocator);
 
         // 创建工厂
@@ -265,33 +225,21 @@ where
 
         // 为每个 worker 创建输入参数
         let mut inputs = Vec::with_capacity(initial_worker_count as usize);
-        let mut cancel_txs = Vec::with_capacity(initial_worker_count as usize);
         let mut result_rxs = Vec::with_capacity(initial_worker_count as usize);
 
         for _ in 0..initial_worker_count {
-            let (input, cancel_tx, result_rx) = Self::create_worker_input(
+            let (input, result_rx) = Self::create_worker_input(
                 &config,
                 allocator.clone(),
                 url.clone(),
                 broadcast_tx.clone(),
             );
             inputs.push(input);
-            cancel_txs.push(cancel_tx);
             result_rxs.push(result_rx);
         }
 
         // 创建通用协程池
-        let (pool, worker_ids) = WorkerPool::new(factory, inputs);
-
-        // 使用实际的 worker_id 创建句柄
-        let handles: Vec<_> = worker_ids
-            .into_iter()
-            .zip(cancel_txs)
-            .map(|(worker_id, cancel_tx)| DownloadWorkerHandle {
-                worker_id,
-                cancel_tx,
-            })
-            .collect();
+        let pool = WorkerPool::new(factory, inputs);
 
         info!("创建下载协程池，{} 个初始 workers", initial_worker_count);
 
@@ -303,7 +251,6 @@ where
                 url,
                 broadcast_tx,
             },
-            handles,
             result_rxs,
         )
     }
@@ -318,7 +265,6 @@ where
         broadcast_tx: broadcast::Sender<TaggedBroadcast>,
     ) -> (
         DownloadWorkerInput,
-        CancelSender,
         tokio::sync::oneshot::Receiver<ExecutorResult>,
     ) {
         // 创建统计数据
@@ -338,9 +284,6 @@ where
             Box::new(SpeedBasedChunkStrategy::from_config(config)) as Box<dyn ChunkStrategy + Send>;
         let initial_chunk_size = config.chunk().initial_size();
 
-        // 创建取消通道（用于健康检查触发重试）
-        let (cancel_tx, cancel_rx) = cancel_channel();
-
         // 创建结果通道（oneshot）
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
@@ -353,13 +296,11 @@ where
             chunk_strategy,
             initial_chunk_size,
             result_tx,
-            cancel_rx,
-            cancel_tx: cancel_tx.clone(),
             broadcast_tx,
             local_health_config,
         };
 
-        (input, cancel_tx, result_rx)
+        (input, result_rx)
     }
 
     /// 动态添加新的 worker
@@ -370,43 +311,26 @@ where
     ///
     /// # Returns
     ///
-    /// 成功时返回新添加的所有 worker 的句柄和结果接收器
+    /// 成功时返回新添加的所有 worker 的结果接收器
     pub(crate) fn add_workers(
         &mut self,
         count: u64,
-    ) -> (
-        Vec<DownloadWorkerHandle>,
-        Vec<tokio::sync::oneshot::Receiver<ExecutorResult>>,
-    ) {
+    ) -> Vec<tokio::sync::oneshot::Receiver<ExecutorResult>> {
         let mut inputs = Vec::with_capacity(count as usize);
-        let mut cancel_txs = Vec::with_capacity(count as usize);
         let mut result_rxs = Vec::with_capacity(count as usize);
 
         for _ in 0..count {
-            let (input, cancel_tx, result_rx) = Self::create_worker_input(
+            let (input, result_rx) = Self::create_worker_input(
                 &self.config,
                 self.allocator.clone(),
                 self.url.clone(),
                 self.broadcast_tx.clone(),
             );
             inputs.push(input);
-            cancel_txs.push(cancel_tx);
             result_rxs.push(result_rx);
         }
 
-        let worker_ids = self.pool.add_workers(inputs);
-
-        // 使用实际的 worker_id 创建句柄
-        let handles: Vec<_> = worker_ids
-            .into_iter()
-            .zip(cancel_txs)
-            .map(|(worker_id, cancel_tx)| DownloadWorkerHandle {
-                worker_id,
-                cancel_tx,
-            })
-            .collect();
-
-        (handles, result_rxs)
+        result_rxs
     }
 
     /// 获取当前活跃 worker 总数
@@ -446,7 +370,7 @@ mod tests {
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
-        let (pool, _handles, _result_receiver) = DownloadWorkerPool::new(
+        let (pool, _result_rx) = DownloadWorkerPool::new(
             client,
             worker_count,
             writer,
@@ -473,7 +397,7 @@ mod tests {
 
         let config = Arc::new(crate::config::DownloadConfig::default());
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
-        let (mut pool, _handles, _result_receiver) = DownloadWorkerPool::new(
+        let (mut pool, _result_rx) = DownloadWorkerPool::new(
             client.clone(),
             2,
             writer,

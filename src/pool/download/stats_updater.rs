@@ -19,8 +19,8 @@
 //! 当 `ChunkSampled` 消息到达时，使用 `ChunkStrategy` 计算新的 chunk size 并更新。
 
 use crate::pool::common::WorkerId;
+use crate::utils::cancel_channel::CancelSender;
 use crate::utils::chunk_strategy::ChunkStrategy;
-use crate::utils::stats::SpeedStats;
 use log::{debug, warn};
 use net_bytes::DownloadSpeed;
 use std::sync::Arc;
@@ -29,6 +29,13 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use super::executor::state::TaskState;
+
+/// 等待中的 Executor 统计信息
+#[derive(Debug, Clone)]
+pub struct PendingExecutorStats {
+    /// 取消信号发送器
+    pub cancel_tx: CancelSender,
+}
 
 /// 已停止的 Executor 统计信息
 ///
@@ -57,6 +64,8 @@ pub struct RunningExecutorStats {
     pub total_downloaded_bytes: u64,
     /// 所有任务总耗时
     pub total_consumed_time: Duration,
+    /// 取消信号发送器
+    pub cancel_tx: CancelSender,
 }
 
 impl RunningExecutorStats {
@@ -96,7 +105,7 @@ impl RunningExecutorStats {
 #[derive(Debug, Clone)]
 pub enum ExecutorStats {
     /// 等待任务中
-    Pending,
+    Pending(PendingExecutorStats),
     /// 正在执行任务
     Running(RunningExecutorStats),
     /// 已停止（包含最终统计）
@@ -104,92 +113,10 @@ pub enum ExecutorStats {
 }
 
 impl ExecutorStats {
-    /// 获取统计信息的字符串表示
-    pub fn stats_str(&self) -> &'static str {
-        match self {
-            ExecutorStats::Pending => "Pending",
-            ExecutorStats::Running(_) => "Running",
-            ExecutorStats::Stopped(_) => "Stopped",
-        }
-    }
-
-    /// 获取已下载字节数
-    pub fn downloaded_bytes(&self) -> u64 {
-        match self {
-            ExecutorStats::Pending => 0,
-            ExecutorStats::Running(stats) => stats.total_downloaded_bytes,
-            ExecutorStats::Stopped(stats) => stats.downloaded_bytes,
-        }
-    }
-
-    /// 获取已写入字节数
-    pub fn written_bytes(&self) -> u64 {
-        match self {
-            ExecutorStats::Pending => 0,
-            ExecutorStats::Running(stats) => stats.written_bytes,
-            ExecutorStats::Stopped(stats) => stats.written_bytes,
-        }
-    }
-
-    /// 检查是否待命
-    pub fn is_pending(&self) -> bool {
-        matches!(self, ExecutorStats::Pending)
-    }
-
-    /// 检查是否正在运行
-    pub fn is_running(&self) -> bool {
-        matches!(self, ExecutorStats::Running { .. })
-    }
-
-    /// 检查是否已停止
-    pub fn is_stopped(&self) -> bool {
-        matches!(self, ExecutorStats::Stopped(_))
-    }
-
-    /// 获取任务状态（如果正在运行）
-    pub fn as_task_state(&self) -> Option<&TaskState> {
-        match self {
-            ExecutorStats::Running(stats) => Some(&stats.state),
-            _ => None,
-        }
-    }
-
-    /// 获取已停止的统计（如果已停止）
-    pub fn as_stopped(&self) -> Option<&StoppedExecutorStats> {
-        match self {
-            ExecutorStats::Stopped(stats) => Some(stats),
-            _ => None,
-        }
-    }
-
-    /// 获取速度统计（仅 Running 且 TaskState::Running 有效）
-    pub fn get_speed_stats(&self) -> Option<SpeedStats> {
-        match self {
-            ExecutorStats::Running(stats) => stats.get_speed_stats(),
-            _ => None,
-        }
-    }
-
     /// 获取实时速度（仅 Running 且 TaskState::Running 有效）
     pub fn get_instant_speed(&self) -> Option<DownloadSpeed> {
         match self {
             ExecutorStats::Running(stats) => stats.get_instant_speed(),
-            _ => None,
-        }
-    }
-
-    /// 获取窗口平均速度（仅 Running 且 TaskState::Running 有效）
-    pub fn get_window_avg_speed(&self) -> Option<DownloadSpeed> {
-        match self {
-            ExecutorStats::Running(stats) => stats.get_window_avg_speed(),
-            _ => None,
-        }
-    }
-
-    /// 获取平均速度（仅 Running 且 TaskState::Running 有效）
-    pub fn get_avg_speed(&self) -> Option<DownloadSpeed> {
-        match self {
-            ExecutorStats::Running(stats) => stats.get_avg_speed(),
             _ => None,
         }
     }
@@ -381,6 +308,7 @@ impl StatsUpdater {
         broadcaster: WorkerBroadcaster,
         chunk_strategy: Box<dyn ChunkStrategy + Send>,
         initial_chunk_size: u64,
+        cancel_tx: CancelSender,
         config: Option<StatsUpdaterConfig>,
     ) -> (Self, StatsUpdaterHandle) {
         let config = config.unwrap_or_default();
@@ -391,7 +319,7 @@ impl StatsUpdater {
 
         let updater = Self {
             worker_id,
-            state: ExecutorStats::Pending,
+            state: ExecutorStats::Pending(PendingExecutorStats { cancel_tx }),
             rx,
             broadcaster,
             chunk_strategy,
@@ -446,13 +374,14 @@ impl StatsUpdater {
 
         // 更新 ExecutorStats
         match &mut self.state {
-            ExecutorStats::Pending => {
+            ExecutorStats::Pending(pending) => {
                 // Pending -> Running
                 self.state = ExecutorStats::Running(RunningExecutorStats {
                     state: new_state,
                     written_bytes: 0,
                     total_downloaded_bytes,
                     total_consumed_time,
+                    cancel_tx: pending.cancel_tx.clone(),
                 });
             }
             ExecutorStats::Running(stats) => {

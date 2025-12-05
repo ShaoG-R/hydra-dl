@@ -6,14 +6,12 @@ use crate::download::{
     progressive::{ProgressiveLauncher, ProgressiveLauncherParams, WorkerLaunchRequest},
     worker_health_checker::{WorkerHealthChecker, WorkerHealthCheckerParams},
 };
-use crate::pool::download::{DownloadWorkerHandle, DownloadWorkerPool, ExecutorResult};
+use crate::pool::download::{DownloadWorkerPool, ExecutorResult};
 use crate::utils::io_traits::HttpClient;
 use crate::utils::writer::MmapWriter;
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::{error, info, warn};
 use ranged_mmap::AllocatedRange;
-use rustc_hash::FxHashMap;
-use smr_swap::SmrSwap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -34,8 +32,6 @@ pub struct DownloadTask<C: HttpClient> {
     launch_request_rx: mpsc::Receiver<WorkerLaunchRequest>,
     /// Worker 结果接收器集合（每个 worker 一个 oneshot）
     result_futures: FuturesUnordered<tokio::sync::oneshot::Receiver<ExecutorResult>>,
-    /// Worker 句柄缓存（worker_id -> handle）
-    worker_handles: SmrSwap<FxHashMap<u64, DownloadWorkerHandle>>,
     /// 健康检查器（actor 模式）
     health_checker: WorkerHealthChecker,
     /// 下载统计聚合器句柄（包含 actor 任务和关闭接口）
@@ -57,9 +53,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             total_size,
             config,
         } = params;
-
-        // worker_handles 占位，稍后填充
-        let mut swap = SmrSwap::new(FxHashMap::default());
 
         // 基准时间间隔：50ms
         let base_offset = std::time::Duration::from_millis(50);
@@ -87,12 +80,11 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 创建健康检查器（actor 模式，订阅广播）
         let health_checker = WorkerHealthChecker::new(WorkerHealthCheckerParams {
             config: Arc::clone(&config),
-            worker_handles: swap.local(),
             broadcast_rx: broadcast_tx.subscribe(),
         });
 
         // 创建 DownloadWorkerPool（只启动第一批 worker）
-        let (pool, initial_handles, initial_result_rxs) = DownloadWorkerPool::new(
+        let (pool, initial_result_rxs) = DownloadWorkerPool::new(
             client.clone(),
             initial_worker_count,
             writer.clone(),
@@ -111,14 +103,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             start_offset: base_offset * 2,
         });
 
-        // 使用实际的 worker_id（从 handle 获取）填充 worker_handles
-        // 使用 pool_id 作为 HashMap 的 key
-        let initial_worker_handles: FxHashMap<u64, _> = initial_handles
-            .into_iter()
-            .map(|handle| (handle.pool_id(), handle))
-            .collect();
-        swap.store(initial_worker_handles);
-
         // 初始化 result_futures
         let result_futures: FuturesUnordered<_> = initial_result_rxs.into_iter().collect();
 
@@ -129,7 +113,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             progressive_launcher,
             launch_request_rx,
             result_futures,
-            worker_handles: swap,
             health_checker,
             stats_handle,
             failed_ranges: Vec::new(),
@@ -327,15 +310,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         );
 
         // 动态添加新 worker，更新 worker_handles 和 result_futures
-        let (new_handles, new_result_rxs) = self.pool.add_workers(count);
-        self.worker_handles.update(|handles| {
-            let mut handles = handles.clone();
-            for handle in &new_handles {
-                // 使用 pool_id 作为 HashMap 的 key
-                handles.insert(handle.pool_id(), handle.clone());
-            }
-            handles
-        });
+        let new_result_rxs = self.pool.add_workers(count);
 
         // 添加新的 result receivers 到 FuturesUnordered
         for rx in new_result_rxs {

@@ -245,7 +245,7 @@ impl LocalHealthChecker {
     /// 处理 Stats 更新
     fn handle_stats_update(&mut self, stats: &ExecutorStats) {
         match stats {
-            ExecutorStats::Pending => {
+            ExecutorStats::Pending(_) => {
                 // 待命状态，无需处理
             }
             ExecutorStats::Running(stats) => {

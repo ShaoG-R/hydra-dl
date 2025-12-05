@@ -450,7 +450,7 @@ impl DownloadStats {
             };
 
             match stats {
-                ExecutorStats::Pending => {
+                ExecutorStats::Pending(_) => {
                     // 待命状态，添加到 pending_stats_map
                     running.pending_stats_map.insert(worker_id, ());
                 }
@@ -498,7 +498,8 @@ impl DownloadStats {
 #[cfg(test)]
 mod tests {
     use crate::pool::common::WorkerId;
-    use crate::pool::download::WorkerBroadcaster;
+    use crate::pool::download::{PendingExecutorStats, WorkerBroadcaster};
+    use crate::utils::cancel_channel::cancel_channel;
     use tokio::sync::broadcast;
 
     use super::*;
@@ -516,13 +517,18 @@ mod tests {
         let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
 
         // 发送更新（通过广播）- 使用 Pending 和 Running(Started) 状态
-        broadcaster1.send_stats(ExecutorStats::Pending);
+        let (cancel_tx1, _) = cancel_channel();
+        broadcaster1.send_stats(ExecutorStats::Pending(PendingExecutorStats {
+            cancel_tx: cancel_tx1,
+        }));
+        let (cancel_tx2, _) = cancel_channel();
         broadcaster2.send_stats(ExecutorStats::Running(
             crate::pool::download::RunningExecutorStats {
                 state: crate::pool::download::TaskState::new(),
                 written_bytes: 0,
                 total_downloaded_bytes: 0,
                 total_consumed_time: std::time::Duration::ZERO,
+                cancel_tx: cancel_tx2,
             },
         ));
 
@@ -545,20 +551,24 @@ mod tests {
         let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
 
         // 添加两个 executor - 使用 Running(Started) 状态
+        let (cancel_tx1, _) = cancel_channel();
         broadcaster1.send_stats(ExecutorStats::Running(
             crate::pool::download::RunningExecutorStats {
                 state: crate::pool::download::TaskState::new(),
                 written_bytes: 0,
                 total_downloaded_bytes: 0,
                 total_consumed_time: std::time::Duration::ZERO,
+                cancel_tx: cancel_tx1,
             },
         ));
+        let (cancel_tx2, _) = cancel_channel();
         broadcaster2.send_stats(ExecutorStats::Running(
             crate::pool::download::RunningExecutorStats {
                 state: crate::pool::download::TaskState::new(),
                 written_bytes: 0,
                 total_downloaded_bytes: 0,
                 total_consumed_time: std::time::Duration::ZERO,
+                cancel_tx: cancel_tx2,
             },
         ));
 
@@ -585,7 +595,10 @@ mod tests {
         let broadcaster = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx);
 
         // 测试状态转换：Pending -> Running(Started) -> Running(Ended) -> Stopped
-        broadcaster.send_stats(ExecutorStats::Pending);
+        let (cancel_tx, _) = cancel_channel();
+        broadcaster.send_stats(ExecutorStats::Pending(PendingExecutorStats {
+            cancel_tx: cancel_tx.clone(),
+        }));
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
         broadcaster.send_stats(ExecutorStats::Running(
@@ -594,6 +607,7 @@ mod tests {
                 written_bytes: 0,
                 total_downloaded_bytes: 0,
                 total_consumed_time: std::time::Duration::ZERO,
+                cancel_tx,
             },
         ));
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;

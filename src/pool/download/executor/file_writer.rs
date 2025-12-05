@@ -297,6 +297,7 @@ mod tests {
     use super::*;
     use crate::pool::common::WorkerId;
     use crate::pool::download::stats_updater::{StatsUpdater, WorkerBroadcaster};
+    use crate::utils::cancel_channel::cancel_channel;
     use crate::utils::chunk_strategy::SpeedBasedChunkStrategy;
     use std::num::NonZeroU64;
     use tempfile::tempdir;
@@ -321,11 +322,13 @@ mod tests {
             0.3,              // avg speed weight
         ));
         let initial_chunk_size = 4 * 1024 * 1024; // 4 MB
+        let (cancel_tx, _cancel_rx) = cancel_channel();
         let (_stats_updater, stats_handle) = StatsUpdater::new(
             worker_id,
             broadcaster,
             chunk_strategy,
             initial_chunk_size,
+            cancel_tx,
             None,
         );
 

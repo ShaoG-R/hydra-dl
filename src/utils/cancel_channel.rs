@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 /// 共享内部状态
+#[derive(Debug)]
 struct CancelChannelInner {
     /// 当前任务 ID
     task_id: u64,
@@ -32,6 +33,7 @@ struct CancelChannelInner {
 /// 共享状态
 ///
 /// 使用单个 Mutex 保护 task_id 和 tx，确保原子性
+#[derive(Debug)]
 struct CancelChannelShared {
     inner: Mutex<CancelChannelInner>,
 }
@@ -39,7 +41,7 @@ struct CancelChannelShared {
 /// 取消信号发送端
 ///
 /// 由健康检查器持有，用于发送取消信号
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CancelSender {
     shared: Arc<CancelChannelShared>,
 }
@@ -47,6 +49,7 @@ pub struct CancelSender {
 /// 取消信号接收端
 ///
 /// 由 executor 持有，用于接收取消信号并重置 channel
+#[derive(Debug)]
 pub struct CancelReceiver {
     shared: Arc<CancelChannelShared>,
 }
@@ -54,6 +57,7 @@ pub struct CancelReceiver {
 /// 取消句柄
 ///
 /// 包含获取时的 task_id，发送取消信号时验证 task_id 是否匹配
+#[derive(Debug)]
 pub struct CancelHandle {
     shared: Arc<CancelChannelShared>,
     /// 获取句柄时的 task_id
