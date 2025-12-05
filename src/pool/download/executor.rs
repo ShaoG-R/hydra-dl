@@ -78,6 +78,7 @@ impl ChunkRecorder for DownloadChunkRecorder<'_> {
         }
     }
 }
+
 /// Worker 执行结果
 ///
 /// 每个 worker 在完成所有任务后通过 oneshot 通道发送此结果
@@ -172,6 +173,48 @@ enum LoopAction {
     Done,
 }
 
+/// 内部事件循环结果
+enum LoopEvent<T> {
+    Shutdown,
+    WriteFailed(file_writer::WriteFailure),
+    WriteReceiverClosed,
+    Inner(T),
+}
+
+/// 等待事件（Shutdown, WriteFailure, 或 Primary Future）
+///
+/// 统一处理 select 逻辑，避免代码重复
+async fn wait_for_event<F, T>(
+    shutdown_rx: &mut oneshot::Receiver<()>,
+    write_failure_rx: &mut Option<oneshot::Receiver<file_writer::WriteFailure>>,
+    future: F,
+) -> LoopEvent<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown_rx => LoopEvent::Shutdown,
+        failure = async {
+            if let Some(rx) = write_failure_rx {
+                rx.await
+            } else {
+                std::future::pending().await
+            }
+        } => {
+            match failure {
+                Ok(f) => LoopEvent::WriteFailed(f),
+                Err(_) => {
+                    // 通道已关闭，清除 Option 以免再次 polling
+                    *write_failure_rx = None;
+                    LoopEvent::WriteReceiverClosed
+                }
+            }
+        }
+        res = future => LoopEvent::Inner(res),
+    }
+}
+
 /// 下载任务执行器
 ///
 /// 封装核心的下载业务逻辑，可独立于协程池进行测试。
@@ -224,8 +267,10 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         } = input;
 
         // 在 Executor 内部创建 FileWriter
-        let (file_writer, mut write_failure_rx) =
+        let (file_writer, rx) =
             FileWriter::new(worker_id, self.writer.clone(), stats_handle.clone(), None);
+        // 使用 Option 包装以处理通道关闭的情况
+        let mut write_failure_rx = Some(rx);
 
         loop {
             // 通过 TaskAllocator 统一获取下一个任务
@@ -249,27 +294,25 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                     let task_id = context.task_allocator.current_task_id();
                     let task_cancel_rx = cancel_rx.reset(task_id);
 
-                    // 使用 select 同时监听 shutdown 信号、写入失败信号和任务执行
+                    // 创建运行时上下文
                     let mut runtime = ExecutorRuntime {
                         context: &mut context,
                         stats: &mut stats,
                         stats_handle: &stats_handle,
                         file_writer: &file_writer,
                     };
-                    tokio::select! {
-                        biased;
-                        _ = &mut shutdown_rx => LoopAction::Shutdown,
-                        failure = &mut write_failure_rx => {
-                            match failure {
-                                Ok(f) => LoopAction::WriteFailed(f),
-                                Err(_) => continue, // 发送端被 drop，继续执行
-                            }
+
+                    let task_future = self.execute_single_task(task, &mut runtime, task_cancel_rx);
+
+                    match wait_for_event(&mut shutdown_rx, &mut write_failure_rx, task_future).await
+                    {
+                        LoopEvent::Shutdown => LoopAction::Shutdown,
+                        LoopEvent::WriteFailed(f) => LoopAction::WriteFailed(f),
+                        LoopEvent::WriteReceiverClosed => {
+                            error!("Worker {} 写入失败通道异常关闭", worker_id);
+                            continue;
                         }
-                        result = self.execute_single_task(
-                            task,
-                            &mut runtime,
-                            task_cancel_rx,
-                        ) => LoopAction::TaskCompleted(result)
+                        LoopEvent::Inner(result) => LoopAction::TaskCompleted(result),
                     }
                 }
                 AllocationResult::WaitForRetry {
@@ -281,16 +324,18 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                         worker_id, delay, pending_count
                     );
 
-                    tokio::select! {
-                        biased;
-                        _ = &mut shutdown_rx => LoopAction::Shutdown,
-                        failure = &mut write_failure_rx => {
-                            match failure {
-                                Ok(f) => LoopAction::WriteFailed(f),
-                                Err(_) => continue,
-                            }
+                    let sleep_future = tokio::time::sleep(delay);
+
+                    match wait_for_event(&mut shutdown_rx, &mut write_failure_rx, sleep_future)
+                        .await
+                    {
+                        LoopEvent::Shutdown => LoopAction::Shutdown,
+                        LoopEvent::WriteFailed(f) => LoopAction::WriteFailed(f),
+                        LoopEvent::WriteReceiverClosed => {
+                            error!("Worker {} 写入失败通道异常关闭", worker_id);
+                            continue;
                         }
-                        _ = tokio::time::sleep(delay) => LoopAction::RetryWaitCompleted
+                        LoopEvent::Inner(_) => LoopAction::RetryWaitCompleted,
                     }
                 }
                 AllocationResult::Done => LoopAction::Done,
@@ -350,7 +395,11 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 failed_ranges: self.failed_ranges,
             }
         };
-        let _ = result_tx.send(result);
+
+        if let Err(e) = result_tx.send(result) {
+            error!("Worker {} 发送结果失败: {:?}", worker_id, e);
+        }
+
         debug!("Worker {} 主循环结束", worker_id);
     }
 
@@ -418,11 +467,32 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             self.cumulative_stats.total_consumed_time,
         );
 
-        match fetch_result {
+        self.process_fetch_result(
+            fetch_result,
+            range,
+            retry_count,
+            runtime.file_writer,
+            runtime.context,
+        )
+        .await
+    }
+
+    /// 处理 Fetch 结果
+    async fn process_fetch_result(
+        &mut self,
+        result: Result<FetchRangeResult, crate::utils::fetch::FetchError>,
+        range: AllocatedRange,
+        retry_count: usize,
+        file_writer: &FileWriter,
+        context: &DownloadWorkerContext,
+    ) -> TaskResult {
+        let (start, end) = range.as_range_tuple();
+
+        match result {
             Ok(FetchRangeResult::Complete(data)) => {
                 // 下载成功，发送写入请求到 Writer 协程
                 // 写入失败由 Writer 协程通过 write_failure_rx 通知
-                if let Err(e) = runtime.file_writer.write(range.clone(), data).await {
+                if let Err(e) = file_writer.write(range.clone(), data).await {
                     // 发送失败说明 Writer 协程已关闭，直接返回 Success
                     // 实际的错误会通过 write_failure_rx 通知
                     warn!("Worker {} 发送写入请求失败: {:?}", self.worker_id, e);
@@ -442,7 +512,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 );
 
                 let remaining_range = match self
-                    .handle_partial_download(range, data, bytes_downloaded, runtime.file_writer)
+                    .handle_partial_download(range, data, bytes_downloaded, file_writer)
                     .await
                 {
                     Some(r) => r,
@@ -450,7 +520,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 };
 
                 let new_retry_count = retry_count + 1;
-                self.check_retry_or_fail(remaining_range, new_retry_count, runtime.context)
+                self.check_retry_or_fail(remaining_range, new_retry_count, context)
             }
             Err(e) => {
                 // 下载失败
@@ -460,7 +530,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
                 );
 
                 let new_retry_count = retry_count + 1;
-                self.check_retry_or_fail(range, new_retry_count, runtime.context)
+                self.check_retry_or_fail(range, new_retry_count, context)
             }
         }
     }
