@@ -164,9 +164,8 @@ pub mod constants {
 
 // 重新导出核心类型和函数
 pub use config::{
-    ChunkConfig, ChunkConfigBuilder, ChunkDefaults, ConcurrencyConfig, ConcurrencyConfigBuilder,
-    ConcurrencyDefaults, DownloadConfig, DownloadConfigBuilder, NetworkConfig,
-    NetworkConfigBuilder, NetworkDefaults, ProgressiveConfig, ProgressiveConfigBuilder,
+    ChunkConfig, ChunkConfigBuilder, ChunkDefaults, DownloadConfig, DownloadConfigBuilder,
+    NetworkConfig, NetworkConfigBuilder, NetworkDefaults, ProgressiveConfig, ProgressiveConfigBuilder,
     ProgressiveDefaults, RetryConfig, RetryConfigBuilder, RetryDefaults, SpeedConfig,
     SpeedConfigBuilder, SpeedDefaults,
 };

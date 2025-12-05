@@ -77,7 +77,7 @@ impl ProgressiveLauncherLogic {
 
     /// 创建新的渐进式启动逻辑管理器
     fn new(config: &DownloadConfig) -> Self {
-        let total_worker_count = config.concurrency().worker_count();
+        let total_worker_count = config.progressive().worker_count();
 
         // 根据配置的比例序列计算渐进式启动阶段
         let worker_launch_stages: Vec<u64> = config
@@ -298,7 +298,7 @@ impl ProgressiveLauncherActor {
 
         info!(
             "渐进式启动配置: 目标 {} workers, 阶段: {:?}, 启动偏移: {:?}",
-            params.config.concurrency().worker_count(),
+            params.config.progressive().worker_count(),
             logic.worker_launch_stages,
             params.start_offset
         );

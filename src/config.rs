@@ -5,7 +5,6 @@
 // ==================== 子模块 ====================
 
 pub mod chunk;
-pub mod concurrency;
 pub mod health_check;
 pub mod network;
 pub mod progressive;
@@ -15,9 +14,6 @@ pub mod speed;
 // ==================== 重导出 ====================
 
 pub use chunk::{ChunkConfig, ChunkConfigBuilder, Defaults as ChunkDefaults};
-pub use concurrency::{
-    ConcurrencyConfig, ConcurrencyConfigBuilder, Defaults as ConcurrencyDefaults,
-};
 pub use health_check::{
     Defaults as HealthCheckDefaults, HealthCheckConfig, HealthCheckConfigBuilder,
 };
@@ -37,8 +33,6 @@ pub use speed::{Defaults as SpeedDefaults, SpeedConfig, SpeedConfigBuilder};
 pub struct DownloadConfig {
     /// 分块配置
     chunk: ChunkConfig,
-    /// 并发配置
-    concurrency: ConcurrencyConfig,
     /// 网络配置
     network: NetworkConfig,
     /// 速度计算配置
@@ -70,11 +64,6 @@ impl DownloadConfig {
     #[inline]
     pub fn chunk(&self) -> &ChunkConfig {
         &self.chunk
-    }
-
-    #[inline]
-    pub fn concurrency(&self) -> &ConcurrencyConfig {
-        &self.concurrency
     }
 
     #[inline]
@@ -121,7 +110,6 @@ impl DownloadConfig {
 #[derive(Debug, Clone)]
 pub struct DownloadConfigBuilder {
     chunk: ChunkConfig,
-    concurrency: ConcurrencyConfig,
     network: NetworkConfig,
     speed: SpeedConfig,
     progressive: ProgressiveConfig,
@@ -134,7 +122,6 @@ impl DownloadConfigBuilder {
     pub fn new() -> Self {
         Self {
             chunk: ChunkConfig::default(),
-            concurrency: ConcurrencyConfig::default(),
             network: NetworkConfig::default(),
             speed: SpeedConfig::default(),
             progressive: ProgressiveConfig::default(),
@@ -168,26 +155,6 @@ impl DownloadConfigBuilder {
         self
     }
 
-    /// 配置并发设置
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use hydra_dl::DownloadConfig;
-    /// let config = DownloadConfig::builder()
-    ///     .concurrency(|c| c.worker_count(8))
-    ///     .build();
-    /// ```
-    pub fn concurrency<F>(mut self, f: F) -> Self
-    where
-        F: FnOnce(ConcurrencyConfigBuilder) -> ConcurrencyConfigBuilder,
-    {
-        let builder = ConcurrencyConfigBuilder {
-            worker_count: self.concurrency.worker_count,
-        };
-        self.concurrency = f(builder).build();
-        self
-    }
 
     /// 配置网络设置
     ///
@@ -257,6 +224,7 @@ impl DownloadConfigBuilder {
         F: FnOnce(ProgressiveConfigBuilder) -> ProgressiveConfigBuilder,
     {
         let builder = ProgressiveConfigBuilder {
+            worker_count: self.progressive.worker_count,
             worker_ratios: self.progressive.worker_ratios.clone(),
             min_speed_threshold: self.progressive.min_speed_threshold,
             min_time_before_finish: self.progressive.min_time_before_finish,
@@ -328,7 +296,6 @@ impl DownloadConfigBuilder {
 
         DownloadConfig {
             chunk,
-            concurrency: self.concurrency,
             network: self.network,
             speed: self.speed,
             progressive: self.progressive,
@@ -354,10 +321,7 @@ mod tests {
     #[test]
     fn test_download_config_default() {
         let config = DownloadConfig::default();
-        assert_eq!(
-            config.concurrency().worker_count(),
-            ConcurrencyDefaults::WORKER_COUNT
-        );
+        assert_eq!(config.progressive().worker_count(), ProgressiveDefaults::WORKER_COUNT);
         assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
         assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
         assert_eq!(config.chunk().max_size(), ChunkDefaults::MAX_SIZE);
@@ -366,11 +330,11 @@ mod tests {
     #[test]
     fn test_download_config_builder() {
         let config = DownloadConfig::builder()
-            .concurrency(|c| c.worker_count(8))
+            .progressive(|p| p.worker_count(2))
             .chunk(|c| c.min_size(1 * MB).initial_size(10 * MB).max_size(100 * MB))
             .build();
 
-        assert_eq!(config.concurrency().worker_count(), 8);
+        assert_eq!(config.progressive().worker_count(), 2);
         assert_eq!(config.chunk().min_size(), 1 * MB);
         assert_eq!(config.chunk().initial_size(), 10 * MB);
         assert_eq!(config.chunk().max_size(), 100 * MB);
@@ -396,15 +360,15 @@ mod tests {
     fn test_combined_configs() {
         // 测试多个配置组合
         let config = DownloadConfig::builder()
+            .progressive(|p| p.worker_count(2))
             .chunk(|c| c.min_size(1 * MB).initial_size(5 * MB).max_size(20 * MB))
-            .concurrency(|c| c.worker_count(8))
             .progressive(|p| p.worker_ratios(vec![0.5, 1.0]))
             .build();
 
+        assert_eq!(config.progressive().worker_count(), 2);
         assert_eq!(config.chunk.min_size, 1 * MB);
         assert_eq!(config.chunk.initial_size, 5 * MB);
         assert_eq!(config.chunk.max_size, 20 * MB);
-        assert_eq!(config.concurrency.worker_count, 8);
         assert_eq!(config.progressive().worker_ratios(), &[0.5, 1.0]);
     }
 }
