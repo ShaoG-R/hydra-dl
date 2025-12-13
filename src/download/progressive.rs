@@ -404,6 +404,14 @@ impl ProgressiveLauncherActor {
                 } else {
                     // 成功发送后推进到下一阶段
                     self.logic.next_launch_stage += 1;
+
+                    // 重置定时器，等待 batch_delay 后再检测下一批
+                    let batch_delay = self.params.config.progressive().batch_delay();
+                    self.channels.check_timer = tokio::time::interval_at(
+                        tokio::time::Instant::now() + batch_delay,
+                        self.params.config.speed().instant_speed_window(),
+                    );
+                    debug!("渐进式启动 - 等待 {:?} 后再检测下一批", batch_delay);
                 }
             }
             LaunchDecision::Wait(reason) => {

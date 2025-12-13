@@ -155,7 +155,6 @@ impl DownloadConfigBuilder {
         self
     }
 
-
     /// 配置网络设置
     ///
     /// # Example
@@ -228,6 +227,7 @@ impl DownloadConfigBuilder {
             worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: self.progressive.min_speed_threshold,
             min_time_before_finish: self.progressive.min_time_before_finish,
+            batch_delay: self.progressive.batch_delay,
         };
         self.progressive = f(builder).build();
         self
@@ -319,7 +319,10 @@ mod tests {
     #[test]
     fn test_download_config_default() {
         let config = DownloadConfig::default();
-        assert_eq!(config.progressive().worker_count(), ProgressiveDefaults::WORKER_COUNT);
+        assert_eq!(
+            config.progressive().worker_count(),
+            ProgressiveDefaults::WORKER_COUNT
+        );
         assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
         assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
         assert_eq!(config.chunk().max_size(), ChunkDefaults::MAX_SIZE);

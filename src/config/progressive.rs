@@ -17,6 +17,8 @@ impl Defaults {
     pub const MIN_SPEED_THRESHOLD: Option<NonZeroU64> = Some(NonZeroU64::new(MB).unwrap());
     /// 预期下载结束前最小时间（秒）：20 秒
     pub const MIN_TIME_BEFORE_FINISH_SECS: u64 = 20;
+    /// 每批启动后等待时间（秒）：5 秒
+    pub const BATCH_DELAY_SECS: u64 = 5;
 }
 
 // ==================== 配置结构体 ====================
@@ -33,6 +35,8 @@ pub struct ProgressiveConfig {
     pub min_speed_threshold: Option<NonZeroU64>,
     /// 预期下载结束前最小时间（在此时间内不启动新 worker）
     pub min_time_before_finish: Duration,
+    /// 每批启动后等待时间（在此时间后才检测下一批）
+    pub batch_delay: Duration,
 }
 
 impl Default for ProgressiveConfig {
@@ -44,6 +48,7 @@ impl Default for ProgressiveConfig {
             worker_launch_stages: Self::compute_worker_launch_stages(worker_count, &worker_ratios),
             min_speed_threshold: Defaults::MIN_SPEED_THRESHOLD,
             min_time_before_finish: Duration::from_secs(Defaults::MIN_TIME_BEFORE_FINISH_SECS),
+            batch_delay: Duration::from_secs(Defaults::BATCH_DELAY_SECS),
         }
     }
 }
@@ -67,6 +72,11 @@ impl ProgressiveConfig {
     #[inline]
     pub fn min_time_before_finish(&self) -> Duration {
         self.min_time_before_finish
+    }
+
+    #[inline]
+    pub fn batch_delay(&self) -> Duration {
+        self.batch_delay
     }
 
     /// 根据 worker 数量与比例序列计算各阶段目标 worker 数
@@ -108,6 +118,7 @@ pub struct ProgressiveConfigBuilder {
     pub(crate) worker_ratios: Vec<f64>,
     pub(crate) min_speed_threshold: Option<NonZeroU64>,
     pub(crate) min_time_before_finish: Duration,
+    pub(crate) batch_delay: Duration,
 }
 
 impl ProgressiveConfigBuilder {
@@ -118,6 +129,7 @@ impl ProgressiveConfigBuilder {
             worker_ratios: Defaults::WORKER_RATIOS.to_vec(),
             min_speed_threshold: Defaults::MIN_SPEED_THRESHOLD,
             min_time_before_finish: Duration::from_secs(Defaults::MIN_TIME_BEFORE_FINISH_SECS),
+            batch_delay: Duration::from_secs(Defaults::BATCH_DELAY_SECS),
         }
     }
 
@@ -145,6 +157,12 @@ impl ProgressiveConfigBuilder {
         self
     }
 
+    /// 设置每批启动后等待时间
+    pub fn batch_delay(mut self, duration: Duration) -> Self {
+        self.batch_delay = duration;
+        self
+    }
+
     /// 构建渐进式配置
     pub fn build(self) -> ProgressiveConfig {
         ProgressiveConfig {
@@ -155,6 +173,7 @@ impl ProgressiveConfigBuilder {
             ),
             min_speed_threshold: self.min_speed_threshold,
             min_time_before_finish: self.min_time_before_finish,
+            batch_delay: self.batch_delay,
         }
     }
 }
