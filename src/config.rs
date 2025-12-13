@@ -274,9 +274,7 @@ impl DownloadConfigBuilder {
         F: FnOnce(HealthCheckConfigBuilder) -> HealthCheckConfigBuilder,
     {
         let builder = HealthCheckConfigBuilder {
-            enabled: self.health_check.enabled,
             absolute_speed_threshold: self.health_check.absolute_speed_threshold,
-            relative_threshold: self.health_check.relative_threshold,
             history_size: self.health_check.history_size,
             anomaly_threshold: self.health_check.anomaly_threshold,
             stale_timeout_multiplier: self.health_check.stale_timeout_multiplier,
