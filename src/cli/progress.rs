@@ -281,9 +281,10 @@ impl ProgressManager {
 
                     // 显示已停止的 worker 数量
                     if let Some(completed) = executor_stats.get_completed_stats()
-                        && completed.count > 0 {
-                            println!("{} 个 worker 已停止", completed.count);
-                        }
+                        && completed.count > 0
+                    {
+                        println!("{} 个 worker 已停止", completed.count);
+                    }
                 }
             }
 

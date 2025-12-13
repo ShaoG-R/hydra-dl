@@ -217,9 +217,10 @@ impl LocalHealthChecker {
 
         // 使用之前获取的句柄发送取消信号（take 已将 cancel_handle 置为 None）
         if let Some(handle) = self.cancel_handle.take()
-            && handle.cancel() {
-                debug!("Worker {} 取消信号已发送 (超时)", self.worker_id);
-            }
+            && handle.cancel()
+        {
+            debug!("Worker {} 取消信号已发送 (超时)", self.worker_id);
+        }
 
         // 重置异常追踪器
         self.anomaly_tracker.reset();
@@ -276,12 +277,10 @@ impl LocalHealthChecker {
 
                                 // 使用之前获取的句柄发送取消信号
                                 if let Some(handle) = self.cancel_handle.take()
-                                    && handle.cancel() {
-                                        debug!(
-                                            "Worker {} 取消信号已发送 (速度异常)",
-                                            self.worker_id
-                                        );
-                                    }
+                                    && handle.cancel()
+                                {
+                                    debug!("Worker {} 取消信号已发送 (速度异常)", self.worker_id);
+                                }
 
                                 // 重置状态
                                 self.cancel_handle = None;

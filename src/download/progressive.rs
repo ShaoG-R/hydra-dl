@@ -116,13 +116,14 @@ impl ProgressiveLauncherLogic {
 
             // 检查速度是否达标
             if let Some(threshold) = threshold
-                && instant_speed.as_u64() < threshold.get() {
-                    speeds.push(instant_speed);
-                    return Err(WaitReason::InsufficientSpeed {
-                        speeds,
-                        threshold: Some(threshold.get()),
-                    });
-                }
+                && instant_speed.as_u64() < threshold.get()
+            {
+                speeds.push(instant_speed);
+                return Err(WaitReason::InsufficientSpeed {
+                    speeds,
+                    threshold: Some(threshold.get()),
+                });
+            }
 
             speeds.push(instant_speed);
         }
