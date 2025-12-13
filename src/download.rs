@@ -13,11 +13,9 @@ pub(crate) mod download_stats;
 mod progress_reporter;
 mod progressive;
 pub mod task;
-mod worker_health_checker;
 
 pub use progress_reporter::DownloadProgress;
 use task::DownloadTask;
-pub use worker_health_checker::WorkerSpeed;
 
 /// 下载任务句柄
 ///

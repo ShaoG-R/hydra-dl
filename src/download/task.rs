@@ -4,7 +4,6 @@ use crate::download::download_stats::{DownloadStats, DownloadStatsHandle};
 use crate::download::{
     progress_reporter::{ProgressReporter, ProgressReporterParams},
     progressive::{ProgressiveLauncher, ProgressiveLauncherParams, WorkerLaunchRequest},
-    worker_health_checker::{WorkerHealthChecker, WorkerHealthCheckerParams},
 };
 use crate::pool::download::{DownloadWorkerPool, ExecutorResult};
 use crate::utils::io_traits::HttpClient;
@@ -32,8 +31,6 @@ pub struct DownloadTask<C: HttpClient> {
     launch_request_rx: mpsc::Receiver<WorkerLaunchRequest>,
     /// Worker 结果接收器集合（每个 worker 一个 oneshot）
     result_futures: FuturesUnordered<tokio::sync::oneshot::Receiver<ExecutorResult>>,
-    /// 健康检查器（actor 模式）
-    health_checker: WorkerHealthChecker,
     /// 下载统计聚合器句柄（包含 actor 任务和关闭接口）
     stats_handle: DownloadStatsHandle,
     /// 永久失败的 ranges
@@ -77,12 +74,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
         info!("初始启动 {} 个 workers", initial_worker_count);
 
-        // 创建健康检查器（actor 模式，订阅广播）
-        let health_checker = WorkerHealthChecker::new(WorkerHealthCheckerParams {
-            config: Arc::clone(&config),
-            broadcast_rx: broadcast_tx.subscribe(),
-        });
-
         // 创建 DownloadWorkerPool（只启动第一批 worker）
         let (pool, initial_result_rxs) = DownloadWorkerPool::new(
             client.clone(),
@@ -113,7 +104,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             progressive_launcher,
             launch_request_rx,
             result_futures,
-            health_checker,
             stats_handle,
             failed_ranges: Vec::new(),
         }
@@ -232,9 +222,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 关闭 progressive launcher actor 并等待其完全停止
         self.progressive_launcher.shutdown_and_wait().await;
 
-        // 关闭 health checker actor 并等待其完全停止
-        self.health_checker.shutdown_and_wait().await;
-
         // 关闭下载统计聚合器并等待其完全停止
         self.stats_handle.shutdown_and_wait().await;
 
@@ -264,9 +251,6 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         // 这很重要，因为 actor 持有 written_bytes 的 Arc 引用
         // 必须等待它释放后才能 finalize writer
         self.progressive_launcher.shutdown_and_wait().await;
-
-        // 关闭 health checker actor 并等待其完全停止
-        self.health_checker.shutdown_and_wait().await;
 
         // 关闭下载统计聚合器并等待其完全停止
         self.stats_handle.shutdown_and_wait().await;

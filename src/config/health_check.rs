@@ -11,10 +11,6 @@ pub struct Defaults;
 impl Defaults {
     /// 绝对速度阈值：100 KB/s
     pub const ABSOLUTE_SPEED_THRESHOLD: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100 * KB) };
-    /// 是否启用健康检查
-    pub const ENABLED: bool = true;
-    /// 相对速度阈值（worker 速度低于健康基准的此比例时被视为显著慢速）
-    pub const RELATIVE_THRESHOLD: f64 = 0.5;
     /// 异常历史窗口大小
     pub const HISTORY_SIZE: usize = 10;
     /// 异常阈值比例（历史窗口中异常比例达到此值则触发）
@@ -30,12 +26,8 @@ impl Defaults {
 /// 控制异常下载线程的检测和处理策略
 #[derive(Debug, Clone)]
 pub struct HealthCheckConfig {
-    /// 是否启用健康检查
-    pub enabled: bool,
     /// 绝对速度阈值（bytes/s）
     pub absolute_speed_threshold: Option<NonZeroU64>,
-    /// 相对速度阈值（0.0-1.0，worker 速度低于健康基准的此比例时被视为显著慢速）
-    pub relative_threshold: f64,
     /// 异常历史窗口大小
     pub history_size: usize,
     /// 异常阈值（历史窗口中异常次数达到此值则触发取消）
@@ -50,9 +42,7 @@ impl Default for HealthCheckConfig {
         let anomaly_threshold =
             (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
         Self {
-            enabled: Defaults::ENABLED,
             absolute_speed_threshold: Some(Defaults::ABSOLUTE_SPEED_THRESHOLD),
-            relative_threshold: Defaults::RELATIVE_THRESHOLD,
             history_size,
             anomaly_threshold,
             stale_timeout_multiplier: Defaults::STALE_TIMEOUT_MULTIPLIER,
@@ -62,18 +52,8 @@ impl Default for HealthCheckConfig {
 
 impl HealthCheckConfig {
     #[inline]
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    #[inline]
     pub fn absolute_speed_threshold(&self) -> Option<NonZeroU64> {
         self.absolute_speed_threshold
-    }
-
-    #[inline]
-    pub fn relative_threshold(&self) -> f64 {
-        self.relative_threshold
     }
 
     #[inline]
@@ -97,9 +77,7 @@ impl HealthCheckConfig {
 /// 健康检查配置构建器
 #[derive(Debug, Clone)]
 pub struct HealthCheckConfigBuilder {
-    pub(crate) enabled: bool,
     pub(crate) absolute_speed_threshold: Option<NonZeroU64>,
-    pub(crate) relative_threshold: f64,
     pub(crate) history_size: usize,
     pub(crate) anomaly_threshold: usize,
     pub(crate) stale_timeout_multiplier: u32,
@@ -112,30 +90,16 @@ impl HealthCheckConfigBuilder {
         let anomaly_threshold =
             (history_size as f64 * Defaults::ANOMALY_THRESHOLD_RATIO).ceil() as usize;
         Self {
-            enabled: Defaults::ENABLED,
             absolute_speed_threshold: Some(Defaults::ABSOLUTE_SPEED_THRESHOLD),
-            relative_threshold: Defaults::RELATIVE_THRESHOLD,
             history_size,
             anomaly_threshold,
             stale_timeout_multiplier: Defaults::STALE_TIMEOUT_MULTIPLIER,
         }
     }
 
-    /// 设置是否启用健康检查
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
     /// 设置绝对速度阈值（bytes/s）
     pub fn absolute_speed_threshold(mut self, threshold: Option<NonZeroU64>) -> Self {
         self.absolute_speed_threshold = threshold;
-        self
-    }
-
-    /// 设置相对速度阈值（0.0-1.0）
-    pub fn relative_threshold(mut self, ratio: f64) -> Self {
-        self.relative_threshold = ratio.clamp(0.0, 1.0);
         self
     }
 
@@ -160,9 +124,7 @@ impl HealthCheckConfigBuilder {
     /// 构建健康检查配置
     pub fn build(self) -> HealthCheckConfig {
         HealthCheckConfig {
-            enabled: self.enabled,
             absolute_speed_threshold: self.absolute_speed_threshold,
-            relative_threshold: self.relative_threshold,
             history_size: self.history_size,
             anomaly_threshold: self.anomaly_threshold,
             stale_timeout_multiplier: self.stale_timeout_multiplier,
