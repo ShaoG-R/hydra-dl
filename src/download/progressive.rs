@@ -115,15 +115,14 @@ impl ProgressiveLauncherLogic {
             };
 
             // 检查速度是否达标
-            if let Some(threshold) = threshold {
-                if instant_speed.as_u64() < threshold.get() {
+            if let Some(threshold) = threshold
+                && instant_speed.as_u64() < threshold.get() {
                     speeds.push(instant_speed);
                     return Err(WaitReason::InsufficientSpeed {
                         speeds,
                         threshold: Some(threshold.get()),
                     });
                 }
-            }
 
             speeds.push(instant_speed);
         }
@@ -188,7 +187,7 @@ impl ProgressiveLauncherLogic {
 
         // 检查 worker 速度
         match self.check_worker_speeds(aggregated_stats, config) {
-            Err(reason) => return LaunchDecision::Wait(reason),
+            Err(reason) => LaunchDecision::Wait(reason),
             Ok(speeds) => {
                 // 检查剩余时间
                 if let Err(reason) =
@@ -368,7 +367,7 @@ impl ProgressiveLauncherActor {
 
             // 从聚合统计获取信息并决策
             self.logic.decide_next_launch(
-                &*aggregated_stats,
+                &aggregated_stats,
                 bytes_summary.written_bytes,
                 self.params.total_size,
                 &self.params.config,

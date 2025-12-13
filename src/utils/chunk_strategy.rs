@@ -112,7 +112,7 @@ impl ChunkStrategy for SpeedBasedChunkStrategy {
             + (avg_speed_bps * self.avg_speed_weight);
 
         // 计算理想分块大小 (bytes/s * s = bytes)
-        let ideal_chunk_size = (weighted_speed * self.expected_duration) as f64;
+        let ideal_chunk_size = weighted_speed * self.expected_duration;
 
         // 应用平滑算法: 新大小 = 当前大小 + (理想大小 - 当前大小) * 平滑系数
         let current_as_f64 = current_chunk_size as f64;

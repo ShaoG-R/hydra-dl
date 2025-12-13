@@ -154,11 +154,10 @@ impl ProgressReporterActor {
             tokio::select! {
                 // 内部定时器：自主触发进度更新
                 _ = self.progress_timer.tick() => {
-                    if let Some(ref tx) = sender {
-                        if let Some(msg) = self.generate_progress_update() {
+                    if let Some(ref tx) = sender
+                        && let Some(msg) = self.generate_progress_update() {
                             let _ = tx.send(msg).await;
                         }
-                    }
                 }
                 // 外部消息
                 msg = self.message_rx.recv() => {
@@ -219,9 +218,7 @@ impl ProgressReporterActor {
     /// 生成进度更新消息（从 aggregated_stats 获取所有数据）
     fn generate_progress_update(&mut self) -> Option<DownloadProgress> {
         // 只有当有 sender 时才生成消息（虽然调用方也会检查，但双重检查无害）
-        if self.progress_sender.is_none() {
-            return None;
-        }
+        self.progress_sender.as_ref()?;
 
         // 从 aggregated_stats 获取所有 Executor 的统计
         let executor_stats = self.get_aggregated_stats();

@@ -69,6 +69,12 @@ pub enum TaskState {
     Ended(EndedState),
 }
 
+impl Default for TaskState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskState {
     pub fn new() -> Self {
         Self::Started(StartedState {

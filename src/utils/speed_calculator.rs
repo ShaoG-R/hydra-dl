@@ -46,7 +46,7 @@ impl SpeedCalculatorConfig {
 
         // 优化的缓冲区大小计算
         let base_size = (required_samples as f64 * buffer_size_margin) as usize;
-        let max_samples = base_size.max(MIN_BUFFER_SIZE).min(MAX_BUFFER_SIZE);
+        let max_samples = base_size.clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
 
         Self {
             max_samples,
@@ -125,12 +125,11 @@ impl SpeedCalculatorRecording {
         let current_elapsed_ns = start_time.elapsed().as_nanos() as u64;
 
         // 检查是否需要采样（距离上次采样超过配置的采样间隔）
-        if let Some(last_sample) = self.samples.back() {
-            if current_elapsed_ns.saturating_sub(last_sample.timestamp_ns.get())
+        if let Some(last_sample) = self.samples.back()
+            && current_elapsed_ns.saturating_sub(last_sample.timestamp_ns.get())
                 < self.config.sample_interval_ns
-            {
-                return None;
-            }
+        {
+            return None;
         }
 
         // 环形缓冲区：满时移除最旧的采样点

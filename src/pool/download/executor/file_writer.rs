@@ -263,7 +263,7 @@ impl FileWriterActor {
         let range_end = range.end();
         let written_bytes = range.len();
 
-        match self.writer.write_range(range.clone(), data.as_ref()) {
+        match self.writer.write_range(range, data.as_ref()) {
             Ok(()) => {
                 // 写入成功，通知统计更新
                 self.stats_handle.send_bytes_written(written_bytes);

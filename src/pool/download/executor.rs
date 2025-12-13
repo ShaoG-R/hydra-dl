@@ -279,7 +279,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
             let action = match context.task_allocator.next_task(chunk_size) {
                 AllocationResult::Task(task) => {
-                    let range = task.range().clone();
+                    let range = *task.range();
                     let retry_count = task.retry_count();
 
                     debug!(
@@ -492,7 +492,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             Ok(FetchRangeResult::Complete(data)) => {
                 // 下载成功，发送写入请求到 Writer 协程
                 // 写入失败由 Writer 协程通过 write_failure_rx 通知
-                if let Err(e) = file_writer.write(range.clone(), data).await {
+                if let Err(e) = file_writer.write(range, data).await {
                     // 发送失败说明 Writer 协程已关闭，直接返回 Success
                     // 实际的错误会通过 write_failure_rx 通知
                     warn!("Worker {} 发送写入请求失败: {:?}", self.worker_id, e);
@@ -555,7 +555,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         if let Some(low) = low {
             let low_len = low.len() as usize;
             let partial_data = data.slice(0..low_len);
-            if let Err(e) = file_writer.write(low.clone(), partial_data).await {
+            if let Err(e) = file_writer.write(low, partial_data).await {
                 error!("Worker {} 发送部分写入请求失败: {:?}", self.worker_id, e);
                 return Some(range);
             }

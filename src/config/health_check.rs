@@ -10,7 +10,7 @@ pub struct Defaults;
 
 impl Defaults {
     /// 绝对速度阈值：100 KB/s
-    pub const ABSOLUTE_SPEED_THRESHOLD: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100 * KB) };
+    pub const ABSOLUTE_SPEED_THRESHOLD: NonZeroU64 = NonZeroU64::new(100 * KB).unwrap();
     /// 异常历史窗口大小
     pub const HISTORY_SIZE: usize = 10;
     /// 异常阈值比例（历史窗口中异常比例达到此值则触发）

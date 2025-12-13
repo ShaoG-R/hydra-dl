@@ -115,7 +115,7 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
         // 性能优化 1: Vec 容量预分配
         // 典型 HTTP chunk 大小为 8KB-64KB，这里使用 16KB 作为保守估计
         // 预分配可以避免多次 realloc 和数据移动
-        let estimated_chunks = ((expected_size + 16 * KB - 1) / (16 * KB)).max(4) as usize;
+        let estimated_chunks = expected_size.div_ceil(16 * KB).max(4) as usize;
         let mut chunks = Vec::with_capacity(estimated_chunks);
         let mut downloaded_bytes = 0u64;
 

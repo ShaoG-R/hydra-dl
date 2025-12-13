@@ -93,13 +93,12 @@ pub(crate) fn theil_sen_regression(
             let delta_b = b_j as i128 - b_i as i128;
 
             // 允许零速度（delta_b >= 0），但时间戳必须不同
-            if delta_t_ns > 0 && delta_b >= 0 {
-                if let (Ok(delta_t), Ok(delta_b)) =
+            if delta_t_ns > 0 && delta_b >= 0
+                && let (Ok(delta_t), Ok(delta_b)) =
                     (u64::try_from(delta_t_ns), u64::try_from(delta_b))
                 {
-                    speed_pairs.push((delta_t, delta_b as u64));
+                    speed_pairs.push((delta_t, delta_b));
                 }
-            }
         }
     }
 
@@ -147,12 +146,11 @@ pub(crate) fn two_point_speed(samples: &[(i128, u64)]) -> Option<DownloadSpeed> 
     let delta_t_ns = t_last - t_first;
     let delta_b = b_last as i128 - b_first as i128;
 
-    if delta_t_ns > 0 && delta_b >= 0 {
-        if let (Ok(delta_t), Ok(delta_b)) = (u64::try_from(delta_t_ns), u64::try_from(delta_b)) {
+    if delta_t_ns > 0 && delta_b >= 0
+        && let (Ok(delta_t), Ok(delta_b)) = (u64::try_from(delta_t_ns), u64::try_from(delta_b)) {
             let duration = Duration::from_nanos(delta_t);
             return Some(DownloadSpeed::new(delta_b, duration));
         }
-    }
     None
 }
 

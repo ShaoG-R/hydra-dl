@@ -134,6 +134,12 @@ impl FetchRange {
     pub fn len(&self) -> u64 {
         self.end - self.start
     }
+
+    /// 获取范围长度
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// fetch_range 的返回结果
