@@ -56,15 +56,15 @@
 //!             }
 //!             DownloadProgress::Progress { percentage, avg_speed, executor_stats, .. } => {
 //!                 // 每个 executor 有各自的统计信息
-//!                 let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
+//!                 let speed_mbps = avg_speed.as_u64() as f64 / 1024.0 / 1024.0;
 //!                 println!("进度: {:.1}%, 速度: {:.2} MB/s, {} 个 executors",
 //!                     percentage,
 //!                     speed_mbps,
-//!                     executor_stats.stats_map.len());
+//!                     executor_stats.running_count());
 //!             }
 //!             DownloadProgress::Completed { total_written_bytes, total_time, executor_stats, .. } => {
 //!                 println!("下载完成！{:.2} MB in {:.2}s, {} 个 executors 完成",
-//!                     total_written_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.stats_map.len());
+//!                     total_written_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.total_count());
 //!             }
 //!             DownloadProgress::Error { message } => {
 //!                 eprintln!("下载出错: {}", message);
@@ -89,7 +89,7 @@
 //! async fn main() -> Result<(), hydra_dl::DownloadError> {
 //!     // 自定义配置：更多 worker，更大的分块范围
 //!     let config = DownloadConfig::builder()
-//!         .concurrency(|c| c.worker_count(8))         // 8 个并发 worker
+//!         .progressive(|p| p.worker_count(8))        // 8 个并发 worker
 //!         .chunk(|c| c
 //!             .initial_size(10 * MB)                  // 初始 10 MB 分块
 //!             .min_size(5 * MB)                       // 最小 5 MB（慢速时）

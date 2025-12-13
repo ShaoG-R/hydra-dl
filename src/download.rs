@@ -59,12 +59,12 @@ impl DownloadHandle {
     ///     match progress {
     ///         DownloadProgress::Progress { percentage, avg_speed, executor_stats, .. } => {
     ///             // 每个 executor 有各自的统计信息
-    ///             let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
+    ///             let speed_mbps = avg_speed.as_u64() as f64 / 1024.0 / 1024.0;
     ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} executors",
-    ///                 percentage, speed_mbps, executor_stats.stats_map.len());
+    ///                 percentage, speed_mbps, executor_stats.running_count());
     ///         }
-    ///         DownloadProgress::Completed { .. } => {
-    ///             println!("下载完成！");
+    ///         DownloadProgress::Completed { executor_stats, .. } => {
+    ///             println!("下载完成！总共 {} executors", executor_stats.total_count());
     ///         }
     ///         _ => {}
     ///     }
@@ -289,15 +289,15 @@ where
 ///     match progress {
 ///         DownloadProgress::Progress { percentage, avg_speed, executor_stats, .. } => {
 ///             // 每个 executor 有各自的统计信息
-///             let speed_mbps = avg_speed.map(|s| s.as_u64() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
+///             let speed_mbps = avg_speed.as_u64() as f64 / 1024.0 / 1024.0;
 ///             println!("进度: {:.1}%, 速度: {:.2} MB/s, {} executors",
 ///                 percentage,
 ///                 speed_mbps,
-///                 executor_stats.stats_map.len());
+///                 executor_stats.running_count());
 ///         }
 ///         DownloadProgress::Completed { total_written_bytes, total_time, executor_stats, .. } => {
 ///             println!("下载完成！{:.2} MB in {:.2}s, {} executors",
-///                 total_written_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.stats_map.len());
+///                 total_written_bytes as f64 / 1024.0 / 1024.0, total_time, executor_stats.total_count());
 ///         }
 ///         _ => {}
 ///     }

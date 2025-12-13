@@ -53,7 +53,7 @@ impl DownloadConfig {
     /// ```
     /// # use hydra_dl::DownloadConfig;
     /// let config = DownloadConfig::builder()
-    ///     .concurrency(|c| c.worker_count(4))
+    ///     .progressive(|p| p.worker_count(4))
     ///     .chunk(|c| c.initial_size(5 * 1024 * 1024))
     ///     .build();
     /// ```
@@ -104,7 +104,7 @@ impl DownloadConfig {
 /// # use hydra_dl::DownloadConfig;
 /// let config = DownloadConfig::builder()
 ///     .chunk(|c| c.min_size(2 * 1024 * 1024).initial_size(10 * 1024 * 1024))
-///     .concurrency(|c| c.worker_count(8))
+///     .progressive(|p| p.worker_count(8))
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -266,7 +266,7 @@ impl DownloadConfigBuilder {
     /// # use hydra_dl::DownloadConfig;
     /// # use std::num::NonZeroU64;
     /// let config = DownloadConfig::builder()
-    ///     .health_check(|h| h.enabled(true).absolute_speed_threshold(NonZeroU64::new(100 * 1024)))
+    ///     .health_check(|h| h.absolute_speed_threshold(NonZeroU64::new(100 * 1024)))
     ///     .build();
     /// ```
     pub fn health_check<F>(mut self, f: F) -> Self
