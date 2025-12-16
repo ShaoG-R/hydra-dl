@@ -1,7 +1,5 @@
 //! 健康检查配置模块
 
-pub mod anomaly_checker;
-
 use crate::constants::KB;
 use std::num::NonZeroU64;
 

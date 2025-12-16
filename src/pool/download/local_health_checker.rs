@@ -16,13 +16,16 @@
 //! 3. 超时时触发取消信号
 //! 4. 收到 Stats 更新时检查绝对速度阈值
 
+mod anomaly_checker;
+
 use super::executor::state::TaskState;
 use super::stats_updater::{ExecutorBroadcast, ExecutorStats, WorkerBroadcaster};
-use crate::config::health_check::anomaly_checker::AnomalyChecker;
-use crate::config::health_check::{AbsoluteSpeedConfig, RelativeSpeedConfig};
+use crate::config::health_check::AbsoluteSpeedConfig;
+use crate::config::health_check::RelativeSpeedConfig;
 use crate::download::download_stats::AggregatedStats;
 use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::{CancelHandle, CancelSender};
+use anomaly_checker::AnomalyChecker;
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use smr_swap::LocalReader;
