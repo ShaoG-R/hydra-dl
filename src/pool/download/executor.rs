@@ -445,26 +445,11 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
         // Inline fetch_range logic to avoid borrowing self immutably while state is borrowed mutably
         use crate::utils::fetch::FetchRange;
-        use crate::utils::fetch::downloader::FetchAction;
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
+        use crate::utils::fetch::downloader::FetchHandler;
 
-        struct ExecutorFetchAction {
-            rx: Pin<Box<oneshot::Receiver<()>>>,
-        }
+        struct ExecutorFetchHandler;
 
-        impl Future for ExecutorFetchAction {
-            type Output = ();
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-                match self.rx.as_mut().poll(cx) {
-                    Poll::Ready(_) => Poll::Ready(()),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-        }
-
-        impl FetchAction for ExecutorFetchAction {
+        impl FetchHandler<Result<(), oneshot::error::RecvError>> for ExecutorFetchHandler {
             type Result = FetchRangeResult;
 
             fn on_complete(self, data: bytes::Bytes) -> Self::Result {
@@ -473,7 +458,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
 
             fn on_cancelled(
                 self,
-                _output: (),
+                _output: Result<(), oneshot::error::RecvError>,
                 data: bytes::Bytes,
                 bytes_downloaded: u64,
             ) -> Self::Result {
@@ -487,17 +472,13 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
         let fetch_range =
             FetchRange::from_allocated_range(&range).expect("AllocatedRange 应该总是有效的");
 
-        let action = ExecutorFetchAction {
-            rx: Box::pin(cancel_rx),
-        };
-
         let fetch_result = RangeFetcher::new(
             &self.client,
             &runtime.context.url,
             fetch_range,
             &mut recorder,
         )
-        .fetch(action)
+        .fetch(cancel_rx, ExecutorFetchHandler)
         .await;
 
         // 任务结束，发送信号到辅助协程

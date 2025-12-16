@@ -12,15 +12,14 @@ use std::future::Future;
 // Chunk 记录器和 RangeFetcher
 // ============================================================================
 
-/// RangeFetcher 动作控制 Trait
+/// RangeFetcher 结果处理器
 ///
-/// 定义下载过程中的行为控制（如取消信号）和结果构造。
-/// 这个 Trait 允许调用者完全控制取消机制和返回值类型，实现最大程度的解耦。
+/// 定义下载结果的构造逻辑。
+/// 这个 Trait 允许调用者完全控制返回值类型，实现最大程度的解耦。
 ///
-/// # Requirements
-/// * `Future`: 实现 Future 用作取消信号。当 Future Ready 时，下载将被中断。
-/// * `Unpin`: 为了方便在 `select!` 中使用，要求实现 Unpin。
-pub trait FetchAction: Future + Unpin + Send {
+/// # Type Parameters
+/// * `CancelOutput`: 取消信号 Future 的输出类型
+pub trait FetchHandler<CancelOutput> {
     /// 下载操作的返回结果类型
     type Result;
 
@@ -28,7 +27,7 @@ pub trait FetchAction: Future + Unpin + Send {
     fn on_complete(self, data: Bytes) -> Self::Result;
 
     /// 当下载被取消（Future ready）时调用
-    fn on_cancelled(self, output: Self::Output, data: Bytes, bytes_downloaded: u64)
+    fn on_cancelled(self, output: CancelOutput, data: Bytes, bytes_downloaded: u64)
     -> Self::Result;
 }
 
@@ -72,17 +71,17 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
 
     /// 执行下载任务
     ///
-    /// 使用提供的 `FetchAction` 控制下载流程（取消）并生成结果。
-    ///
     /// # Arguments
-    /// * `action` - 实现 `FetchAction` 的控制对象，提供取消信号和结果构造逻辑
+    /// * `cancel` - 取消信号 Future。当此 Future Ready 时，下载将被中断。
+    /// * `handler` - 结果处理器，定义如何处理完成或取消时的结果。
     ///
     /// # Returns
     ///
-    /// 返回 `Result<A::Result>`，其中 `A::Result` 由 `action` 构造
-    pub async fn fetch<A>(mut self, action: A) -> Result<A::Result>
+    /// 返回 `Result<H::Result>`，其中 `H::Result` 由 `handler` 构造
+    pub async fn fetch<F, H>(mut self, cancel: F, handler: H) -> Result<H::Result>
     where
-        A: FetchAction,
+        F: Future + Unpin + Send,
+        H: FetchHandler<F::Output> + Send,
     {
         let (http_start, http_end) = self.range.as_http_range();
         debug!(
@@ -99,14 +98,21 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
             return Err(FetchError::HttpStatus(response.status().as_u16()));
         }
 
-        self.download_stream(response.bytes_stream(), action).await
+        self.download_stream(response.bytes_stream(), cancel, handler)
+            .await
     }
 
     /// 下载数据流
-    async fn download_stream<S, A>(&mut self, mut stream: S, mut action: A) -> Result<A::Result>
+    async fn download_stream<S, F, H>(
+        &mut self,
+        mut stream: S,
+        mut cancel: F,
+        handler: H,
+    ) -> Result<H::Result>
     where
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
-        A: FetchAction,
+        F: Future + Unpin + Send,
+        H: FetchHandler<F::Output> + Send,
     {
         let expected_size = self.range.len();
 
@@ -142,14 +148,14 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
                                 });
                             }
                             let data = self.merge_chunks(chunks);
-                            return Ok(action.on_complete(data));
+                            return Ok(handler.on_complete(data));
                         }
                     }
                 }
-                output = &mut action => {
+                output = &mut cancel => {
                     // 收到取消信号
                     let data = self.merge_chunks(chunks);
-                    return Ok(action.on_cancelled(output, data, downloaded_bytes));
+                    return Ok(handler.on_cancelled(output, data, downloaded_bytes));
                 }
             }
         }
@@ -240,12 +246,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Removed import of FetchRangeResult to use local TestResult instead
     use crate::utils::io_traits::mock::MockHttpClient;
     use reqwest::header::HeaderMap;
     use std::path::PathBuf;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
     use tokio::sync::oneshot;
 
     #[derive(Debug)]
@@ -254,26 +257,19 @@ mod tests {
         Cancelled { data: Bytes, bytes_downloaded: u64 },
     }
 
-    struct TestFetchAction {
-        rx: Pin<Box<oneshot::Receiver<()>>>,
-    }
+    struct TestFetchHandler;
 
-    impl Future for TestFetchAction {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            match self.rx.as_mut().poll(cx) {
-                Poll::Ready(_) => Poll::Ready(()),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    impl FetchAction for TestFetchAction {
+    impl FetchHandler<std::result::Result<(), oneshot::error::RecvError>> for TestFetchHandler {
         type Result = TestResult;
         fn on_complete(self, data: Bytes) -> Self::Result {
             TestResult::Complete(data)
         }
-        fn on_cancelled(self, _output: (), data: Bytes, bytes_downloaded: u64) -> Self::Result {
+        fn on_cancelled(
+            self,
+            _output: std::result::Result<(), oneshot::error::RecvError>,
+            data: Bytes,
+            bytes_downloaded: u64,
+        ) -> Self::Result {
             TestResult::Cancelled {
                 data,
                 bytes_downloaded,
@@ -339,9 +335,6 @@ mod tests {
         let log = client.get_request_log();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0], format!("GET {}", test_url));
-
-        // 注意：由于使用了真实的 AsyncFile，文件会实际创建在磁盘上
-        // 这里我们只验证下载逻辑是否正常
     }
 
     #[tokio::test]
@@ -413,11 +406,10 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let action = TestFetchAction {
-            rx: Box::pin(cancel_rx),
-        };
+        let handler = TestFetchHandler;
+
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch(action)
+            .fetch(cancel_rx, handler)
             .await;
 
         assert!(result.is_ok(), "下载应该成功: {:?}", result);
@@ -472,11 +464,10 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let action = TestFetchAction {
-            rx: Box::pin(cancel_rx),
-        };
+        let handler = TestFetchHandler;
+
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch(action)
+            .fetch(cancel_rx, handler)
             .await;
 
         assert!(result.is_err(), "应该返回错误");
@@ -527,11 +518,10 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let action = TestFetchAction {
-            rx: Box::pin(cancel_rx),
-        };
+        let handler = TestFetchHandler;
+
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch(action)
+            .fetch(cancel_rx, handler)
             .await;
 
         assert!(result.is_ok(), "大数据下载应该成功");
@@ -603,16 +593,15 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let action = TestFetchAction {
-            rx: Box::pin(cancel_rx),
-        };
+        let handler = TestFetchHandler;
+
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch(action)
+            .fetch(cancel_rx, handler)
             .await;
 
         assert!(result.is_ok(), "调用应该成功");
 
-        // 验证结果（注意：Mock 实现可能一次性返回所有数据，在取消前就完成）
+        // 验证结果
         match result.unwrap() {
             TestResult::Cancelled {
                 data,
@@ -679,11 +668,10 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
-        let action = TestFetchAction {
-            rx: Box::pin(cancel_rx),
-        };
+        let handler = TestFetchHandler;
+
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch(action)
+            .fetch(cancel_rx, handler)
             .await;
 
         // 应该成功（可能完成也可能取消，取决于执行时机）
