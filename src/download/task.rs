@@ -64,7 +64,7 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
         let (progressive_launcher, launch_request_rx) =
             ProgressiveLauncher::new(ProgressiveLauncherParams {
                 config: Arc::clone(&config),
-                aggregated_stats: aggregated_stats_reader.clone(),
+                aggregated_stats: aggregated_stats_reader.local(),
                 total_size: writer.total_size(),
                 start_offset: std::time::Duration::ZERO,
             });
@@ -83,13 +83,14 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
             url.clone(),
             Arc::clone(&config),
             broadcast_tx,
+            aggregated_stats_reader.clone(),
         );
 
         // 创建进度报告器（使用配置的统计窗口作为更新间隔） - 偏移 100ms
         let progress_reporter = ProgressReporter::new(ProgressReporterParams {
             progress_sender,
             total_size,
-            aggregated_stats: aggregated_stats_reader,
+            aggregated_stats: aggregated_stats_reader.local(),
             update_interval: config.speed().instant_speed_window(),
             start_offset: base_offset * 2,
         });

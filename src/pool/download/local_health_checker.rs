@@ -18,10 +18,12 @@
 
 use super::executor::state::TaskState;
 use super::stats_updater::{ExecutorBroadcast, ExecutorStats, WorkerBroadcaster};
+use crate::download::download_stats::AggregatedStats;
 use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::{CancelHandle, CancelSender};
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
+use smr_swap::LocalReader;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -138,6 +140,8 @@ pub(crate) struct LocalHealthChecker {
     cancel_handle: Option<CancelHandle>,
     /// 异常追踪器
     anomaly_tracker: AnomalyTracker,
+    /// 聚合统计读取器
+    aggregated_stats: LocalReader<AggregatedStats>,
 }
 
 impl LocalHealthChecker {
@@ -149,11 +153,13 @@ impl LocalHealthChecker {
     /// - `broadcaster`: Worker 广播器，用于订阅本地 watch
     /// - `cancel_tx`: 取消信号发送器
     /// - `config`: 配置
+    /// - `aggregated_stats`: 聚合统计读取器
     pub(crate) fn new(
         worker_id: WorkerId,
         broadcaster: &WorkerBroadcaster,
         cancel_tx: CancelSender,
         config: LocalHealthCheckerConfig,
+        aggregated_stats: LocalReader<AggregatedStats>,
     ) -> Self {
         let watch_rx = broadcaster.subscribe_local();
         let anomaly_tracker = AnomalyTracker::new(config.history_size, config.anomaly_threshold);
@@ -165,6 +171,7 @@ impl LocalHealthChecker {
             cancel_tx,
             cancel_handle: None,
             anomaly_tracker,
+            aggregated_stats,
         }
     }
 
@@ -263,8 +270,8 @@ impl LocalHealthChecker {
                         }
 
                         if let Some(speed_stats) = stats.get_speed_stats() {
-                            // 检查绝对速度阈值
-                            let is_anomaly = self.check_absolute_speed(speed_stats.instant_speed);
+                            let is_anomaly = self.check_absolute_speed(speed_stats.instant_speed)
+                                || self.check_relative_speed();
                             self.anomaly_tracker.record(is_anomaly);
 
                             // 检查是否超过异常阈值
@@ -315,10 +322,53 @@ impl LocalHealthChecker {
         let is_slow = instant_speed.as_u64() < threshold;
         if is_slow {
             debug!(
-                "Worker {} 速度 {} 低于阈值 {}",
+                "Worker {} 速度 {} 低于绝对阈值 {}",
                 self.worker_id,
                 instant_speed.to_formatted(self.config.size_standard),
                 DownloadSpeed::from_raw(threshold).to_formatted(self.config.size_standard)
+            );
+        }
+        is_slow
+    }
+
+    /// 检查相对速度是否低于阈值
+    ///
+    /// 检查当前线程窗口平均速度是否低于 (窗口平均速度 / 下载线程数) * 0.005
+    fn check_relative_speed(&self) -> bool {
+        let guard = self.aggregated_stats.load();
+
+        let total_window_avg = guard
+            .get_summary()
+            .map(|s| s.window_avg_speed.as_u64())
+            .unwrap_or(0);
+        let count = guard.running_count() as u64;
+
+        if count == 0 {
+            return false;
+        }
+
+        let avg_per_thread = total_window_avg / count;
+        // 0.5% = 5 / 1000
+        let threshold = avg_per_thread * 5 / 1000;
+
+        // 获取当前线程的窗口平均速度
+        let current_window_avg = match guard.get_running(self.worker_id.pool_id()) {
+            Some(stats) => stats
+                .get_window_avg_speed()
+                .map(|s| s.as_u64())
+                .unwrap_or(0),
+            None => return false,
+        };
+
+        let is_slow = current_window_avg < threshold;
+        if is_slow {
+            debug!(
+                "Worker {} 窗口平均速度 {} 低于相对阈值 {} (总平均: {}, 线程数: {})",
+                self.worker_id,
+                DownloadSpeed::from_raw(current_window_avg).to_formatted(self.config.size_standard),
+                DownloadSpeed::from_raw(threshold).to_formatted(self.config.size_standard),
+                DownloadSpeed::from_raw(avg_per_thread).to_formatted(self.config.size_standard),
+                count
             );
         }
         is_slow

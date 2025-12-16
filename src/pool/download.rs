@@ -51,6 +51,9 @@ use tokio::task::JoinHandle;
 
 use std::sync::Arc;
 
+use crate::download::download_stats::AggregatedStats;
+use smr_swap::SmrReader;
+
 // ==================== Worker 输入参数 ====================
 
 /// 下载 Worker 的输入参数
@@ -71,6 +74,8 @@ pub(crate) struct DownloadWorkerInput {
     pub(crate) broadcast_tx: broadcast::Sender<TaggedBroadcast>,
     /// 本地健康检查器配置
     pub(crate) local_health_config: LocalHealthCheckerConfig,
+    /// 聚合统计读取器
+    pub(crate) aggregated_stats: SmrReader<AggregatedStats>,
 }
 
 // ==================== 下载任务工厂 ====================
@@ -122,6 +127,7 @@ where
             result_tx,
             broadcast_tx,
             local_health_config,
+            aggregated_stats,
         } = input;
 
         // --- 创建取消通道 ---
@@ -145,8 +151,13 @@ where
         let stats_updater_handle = tokio::spawn(stats_updater.run());
 
         // --- 协程 2: 本地健康检查协程 ---
-        let local_health_checker =
-            LocalHealthChecker::new(worker_id, &broadcaster, cancel_tx, local_health_config);
+        let local_health_checker = LocalHealthChecker::new(
+            worker_id,
+            &broadcaster,
+            cancel_tx,
+            local_health_config,
+            aggregated_stats.local(),
+        );
         let local_health_handle = tokio::spawn(local_health_checker.run());
 
         // --- 创建 Executor ---
@@ -188,6 +199,8 @@ pub(crate) struct DownloadWorkerPool<C: HttpClient> {
     url: String,
     /// 广播发送器
     broadcast_tx: broadcast::Sender<TaggedBroadcast>,
+    /// 聚合统计读取器
+    aggregated_stats: SmrReader<AggregatedStats>,
 }
 
 impl<C> DownloadWorkerPool<C>
@@ -205,6 +218,7 @@ where
     /// - `url`: 下载 URL
     /// - `config`: 下载配置，用于创建分块策略和设置速度窗口
     /// - `broadcast_tx`: 广播发送器，用于发送 ExecutorStats 更新和关闭信号
+    /// - `aggregated_stats`: 聚合统计读取器
     ///
     /// # Returns
     ///
@@ -217,6 +231,7 @@ where
         url: String,
         config: Arc<crate::config::DownloadConfig>,
         broadcast_tx: broadcast::Sender<TaggedBroadcast>,
+        aggregated_stats: SmrReader<AggregatedStats>,
     ) -> (Self, Vec<tokio::sync::oneshot::Receiver<ExecutorResult>>) {
         let allocator = Arc::new(allocator);
 
@@ -233,6 +248,7 @@ where
                 allocator.clone(),
                 url.clone(),
                 broadcast_tx.clone(),
+                aggregated_stats.clone(),
             );
             inputs.push(input);
             result_rxs.push(result_rx);
@@ -250,6 +266,7 @@ where
                 allocator,
                 url,
                 broadcast_tx,
+                aggregated_stats,
             },
             result_rxs,
         )
@@ -263,6 +280,7 @@ where
         allocator: Arc<ConcurrentAllocator>,
         url: String,
         broadcast_tx: broadcast::Sender<TaggedBroadcast>,
+        aggregated_stats: SmrReader<AggregatedStats>,
     ) -> (
         DownloadWorkerInput,
         tokio::sync::oneshot::Receiver<ExecutorResult>,
@@ -298,6 +316,7 @@ where
             result_tx,
             broadcast_tx,
             local_health_config,
+            aggregated_stats,
         };
 
         (input, result_rx)
@@ -325,6 +344,7 @@ where
                 self.allocator.clone(),
                 self.url.clone(),
                 self.broadcast_tx.clone(),
+                self.aggregated_stats.clone(),
             );
             inputs.push(input);
             result_rxs.push(result_rx);
@@ -357,6 +377,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_pool_creation() {
+        use crate::download::download_stats::AggregatedStats;
+        use smr_swap::SmrSwap;
         use std::num::NonZeroU64;
 
         let client = MockHttpClient::new();
@@ -370,6 +392,10 @@ mod tests {
         let worker_count = 4;
         let config = Arc::new(crate::config::DownloadConfig::default());
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
+
+        let stats = SmrSwap::new(AggregatedStats::Pending);
+        let aggregated_stats = stats.reader();
+
         let (pool, _result_rx) = DownloadWorkerPool::new(
             client,
             worker_count,
@@ -378,6 +404,7 @@ mod tests {
             url,
             config,
             broadcast_tx,
+            aggregated_stats,
         );
 
         assert_eq!(pool.worker_count(), 4);
@@ -385,6 +412,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_worker_pool_shutdown() {
+        use crate::download::download_stats::AggregatedStats;
+        use smr_swap::SmrSwap;
         use std::num::NonZeroU64;
 
         let client = MockHttpClient::new();
@@ -397,6 +426,10 @@ mod tests {
 
         let config = Arc::new(crate::config::DownloadConfig::default());
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
+
+        let stats = SmrSwap::new(AggregatedStats::Pending);
+        let aggregated_stats = stats.reader();
+
         let (mut pool, _result_rx) = DownloadWorkerPool::new(
             client.clone(),
             2,
@@ -405,6 +438,7 @@ mod tests {
             url,
             config,
             broadcast_tx,
+            aggregated_stats,
         );
 
         // 关闭 workers

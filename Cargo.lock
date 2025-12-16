@@ -1341,9 +1341,9 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smr-swap"
-version = "0.8.1"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c9782a56b945971b20eb7f29d949f75641ec267fe7f1de6cf7060d6a7dc42b0"
+checksum = "977906e646fb92a9cefcae4188656b70c6f834fd84c168be267ef9879c398162"
 dependencies = [
  "swmr-cell",
 ]
@@ -1378,9 +1378,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swmr-cell"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e40b7669d26053198dce0f93fa4f256622939131b4f15014db50e7a00d72c962"
+checksum = "cbf6a7dd0c53b634acc4427b468beacff1b17b5455b97bca13f8a0bfb8f77e04"
 dependencies = [
  "antidote",
 ]

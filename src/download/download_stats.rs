@@ -17,7 +17,7 @@ use lite_sync::oneshot::lite;
 use log::debug;
 use net_bytes::DownloadSpeed;
 use rustc_hash::FxHashMap;
-use smr_swap::{LocalReader, SmrSwap};
+use smr_swap::SmrSwap;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -367,12 +367,14 @@ impl DownloadStats {
     /// 返回 `DownloadStatsHandle`（只包含 shutdown 接口）
     pub(crate) fn spawn(
         broadcast_rx: broadcast::Receiver<TaggedBroadcast>,
-    ) -> (DownloadStatsHandle, LocalReader<AggregatedStats>) {
+    ) -> (DownloadStatsHandle, smr_swap::SmrReader<AggregatedStats>) {
         let (shutdown_tx, shutdown_rx) = lite::channel();
 
         // 使用 SmrSwap 包装统计数据，初始为 Pending 状态
         let stats = SmrSwap::new(AggregatedStats::Pending);
-        let stats_reader = stats.local();
+
+        // Create reader before moving stats
+        let stats_reader = stats.reader();
 
         let aggregator = Self {
             stats,
