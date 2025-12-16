@@ -18,13 +18,14 @@
 
 use super::executor::state::TaskState;
 use super::stats_updater::{ExecutorBroadcast, ExecutorStats, WorkerBroadcaster};
+use crate::config::health_check::anomaly_checker::AnomalyChecker;
+use crate::config::health_check::{AbsoluteSpeedConfig, RelativeSpeedConfig};
 use crate::download::download_stats::AggregatedStats;
 use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::{CancelHandle, CancelSender};
 use log::{debug, warn};
 use net_bytes::{DownloadSpeed, FileSizeFormat, SizeStandard};
 use smr_swap::LocalReader;
-use std::num::NonZeroU64;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -33,14 +34,12 @@ use tokio::sync::watch;
 pub(crate) struct LocalHealthCheckerConfig {
     /// 超时时间（距离上次更新超过此时间则取消）
     pub stale_timeout: Duration,
-    /// 绝对速度阈值（bytes/s），低于此值且超过阈值次数则取消
-    pub absolute_threshold: Option<NonZeroU64>,
+    /// 绝对速度检测配置
+    pub absolute: AbsoluteSpeedConfig,
+    /// 相对速度检测配置
+    pub relative: RelativeSpeedConfig,
     /// 文件大小单位标准（用于日志）
     pub size_standard: SizeStandard,
-    /// 异常历史窗口大小（来自 HealthCheckConfig）
-    pub history_size: usize,
-    /// 异常阈值（来自 HealthCheckConfig）
-    pub anomaly_threshold: usize,
 }
 
 impl LocalHealthCheckerConfig {
@@ -53,74 +52,10 @@ impl LocalHealthCheckerConfig {
 
         Self {
             stale_timeout,
-            absolute_threshold: health_check.absolute_speed_threshold(),
+            absolute: health_check.absolute().clone(),
+            relative: health_check.relative().clone(),
             size_standard: config.speed().size_standard(),
-            history_size: health_check.history_size(),
-            anomaly_threshold: health_check.anomaly_threshold(),
         }
-    }
-}
-
-/// 异常历史追踪器
-///
-/// 使用滑动窗口记录异常状态，O(1) 增量更新
-struct AnomalyTracker {
-    /// 异常历史（环形缓冲区）
-    history: Vec<bool>,
-    /// 当前写入位置
-    position: usize,
-    /// 当前异常计数
-    anomaly_count: usize,
-    /// 窗口大小
-    size: usize,
-    /// 异常阈值
-    threshold: usize,
-}
-
-impl AnomalyTracker {
-    /// 创建新的追踪器
-    fn new(size: usize, threshold: usize) -> Self {
-        Self {
-            history: vec![false; size],
-            position: 0,
-            anomaly_count: 0,
-            size,
-            threshold,
-        }
-    }
-
-    /// 记录一次检查结果（O(1)）
-    fn record(&mut self, is_anomaly: bool) {
-        // 移除旧记录的计数
-        if self.history[self.position] {
-            self.anomaly_count -= 1;
-        }
-        // 添加新记录的计数
-        if is_anomaly {
-            self.anomaly_count += 1;
-        }
-        // 更新历史
-        self.history[self.position] = is_anomaly;
-        self.position = (self.position + 1) % self.size;
-    }
-
-    /// 检查是否超过异常阈值
-    #[inline]
-    fn exceeds_threshold(&self) -> bool {
-        self.anomaly_count >= self.threshold
-    }
-
-    /// 重置追踪器
-    fn reset(&mut self) {
-        self.history.fill(false);
-        self.position = 0;
-        self.anomaly_count = 0;
-    }
-
-    /// 获取当前异常计数
-    #[inline]
-    fn anomaly_count(&self) -> usize {
-        self.anomaly_count
     }
 }
 
@@ -138,8 +73,10 @@ pub(crate) struct LocalHealthChecker {
     cancel_tx: CancelSender,
     /// 当前任务的取消句柄（在任务开始时获取，Some 表示任务运行中）
     cancel_handle: Option<CancelHandle>,
-    /// 异常追踪器
-    anomaly_tracker: AnomalyTracker,
+    /// 绝对速度异常检测器
+    absolute_checker: AnomalyChecker,
+    /// 相对速度异常检测器
+    relative_checker: AnomalyChecker,
     /// 聚合统计读取器
     aggregated_stats: LocalReader<AggregatedStats>,
 }
@@ -162,7 +99,14 @@ impl LocalHealthChecker {
         aggregated_stats: LocalReader<AggregatedStats>,
     ) -> Self {
         let watch_rx = broadcaster.subscribe_local();
-        let anomaly_tracker = AnomalyTracker::new(config.history_size, config.anomaly_threshold);
+        let absolute_checker = AnomalyChecker::new(
+            config.absolute.window.history_size,
+            config.absolute.window.anomaly_threshold,
+        );
+        let relative_checker = AnomalyChecker::new(
+            config.relative.window.history_size,
+            config.relative.window.anomaly_threshold,
+        );
 
         Self {
             worker_id,
@@ -170,7 +114,8 @@ impl LocalHealthChecker {
             watch_rx,
             cancel_tx,
             cancel_handle: None,
-            anomaly_tracker,
+            absolute_checker,
+            relative_checker,
             aggregated_stats,
         }
     }
@@ -229,8 +174,9 @@ impl LocalHealthChecker {
             debug!("Worker {} 取消信号已发送 (超时)", self.worker_id);
         }
 
-        // 重置异常追踪器
-        self.anomaly_tracker.reset();
+        // 重置检测器
+        self.absolute_checker.reset();
+        self.relative_checker.reset();
     }
 
     /// 处理广播消息
@@ -270,51 +216,77 @@ impl LocalHealthChecker {
                         }
 
                         if let Some(speed_stats) = stats.get_speed_stats() {
-                            let is_anomaly = self.check_absolute_speed(speed_stats.instant_speed)
-                                || self.check_relative_speed();
-                            self.anomaly_tracker.record(is_anomaly);
+                            // 检查绝对速度
+                            let is_absolute_slow =
+                                self.check_absolute_speed(speed_stats.instant_speed);
+                            self.absolute_checker.record(is_absolute_slow);
 
-                            // 检查是否超过异常阈值
-                            if self.anomaly_tracker.exceeds_threshold() {
-                                let anomaly_count = self.anomaly_tracker.anomaly_count();
+                            if self.absolute_checker.exceeds_threshold() {
+                                let anomaly_count = self.absolute_checker.anomaly_count();
                                 warn!(
-                                    "Worker {} 速度异常次数过多 ({}/{}), 取消当前任务",
-                                    self.worker_id, anomaly_count, self.config.history_size
+                                    "Worker {} 绝对速度异常次数过多 ({}/{}), 取消当前任务",
+                                    self.worker_id,
+                                    anomaly_count,
+                                    self.config.absolute.window.history_size
                                 );
+                                self.trigger_cancel("绝对速度异常");
+                                return;
+                            }
 
-                                // 使用之前获取的句柄发送取消信号
-                                if let Some(handle) = self.cancel_handle.take()
-                                    && handle.cancel()
-                                {
-                                    debug!("Worker {} 取消信号已发送 (速度异常)", self.worker_id);
-                                }
+                            // 检查相对速度
+                            let is_relative_slow = self.check_relative_speed();
+                            self.relative_checker.record(is_relative_slow);
 
-                                // 重置状态
-                                self.cancel_handle = None;
-                                self.anomaly_tracker.reset();
+                            if self.relative_checker.exceeds_threshold() {
+                                let anomaly_count = self.relative_checker.anomaly_count();
+                                warn!(
+                                    "Worker {} 相对速度异常次数过多 ({}/{}), 取消当前任务",
+                                    self.worker_id,
+                                    anomaly_count,
+                                    self.config.relative.window.history_size
+                                );
+                                self.trigger_cancel("相对速度异常");
+                                return;
                             }
                         }
                     }
                     TaskState::Ended { .. } => {
                         // 任务结束，重置状态
                         self.cancel_handle = None;
-                        self.anomaly_tracker.reset();
+                        self.absolute_checker.reset();
+                        self.relative_checker.reset();
                     }
                 }
             }
             ExecutorStats::Stopped(_) => {
                 // Executor 停止，重置状态
                 self.cancel_handle = None;
-                self.anomaly_tracker.reset();
+                self.absolute_checker.reset();
+                self.relative_checker.reset();
             }
         }
+    }
+
+    /// 触发取消并重置状态
+    fn trigger_cancel(&mut self, reason: &str) {
+        // 使用之前获取的句柄发送取消信号
+        if let Some(handle) = self.cancel_handle.take()
+            && handle.cancel()
+        {
+            debug!("Worker {} 取消信号已发送 ({})", self.worker_id, reason);
+        }
+
+        // 重置状态
+        self.cancel_handle = None;
+        self.absolute_checker.reset();
+        self.relative_checker.reset();
     }
 
     /// 检查绝对速度是否低于阈值
     ///
     /// 返回 true 表示速度异常（低于阈值）
     fn check_absolute_speed(&self, instant_speed: DownloadSpeed) -> bool {
-        let threshold = match self.config.absolute_threshold {
+        let threshold = match self.config.absolute.threshold {
             Some(t) => t.get(),
             None => return false, // 未配置阈值，不检查
         };
@@ -372,61 +344,5 @@ impl LocalHealthChecker {
             );
         }
         is_slow
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_anomaly_tracker_basic() {
-        let mut tracker = AnomalyTracker::new(5, 3);
-
-        // 初始状态
-        assert_eq!(tracker.anomaly_count(), 0);
-        assert!(!tracker.exceeds_threshold());
-
-        // 记录 3 次异常
-        tracker.record(true);
-        tracker.record(true);
-        tracker.record(true);
-
-        assert_eq!(tracker.anomaly_count(), 3);
-        assert!(tracker.exceeds_threshold());
-    }
-
-    #[test]
-    fn test_anomaly_tracker_sliding_window() {
-        let mut tracker = AnomalyTracker::new(3, 2);
-
-        // 记录: [true, true, false]
-        tracker.record(true);
-        tracker.record(true);
-        tracker.record(false);
-
-        assert_eq!(tracker.anomaly_count(), 2);
-        assert!(tracker.exceeds_threshold());
-
-        // 滑动: [true, false, false] -> [false, false]
-        tracker.record(false);
-        assert_eq!(tracker.anomaly_count(), 1);
-        assert!(!tracker.exceeds_threshold());
-    }
-
-    #[test]
-    fn test_anomaly_tracker_reset() {
-        let mut tracker = AnomalyTracker::new(5, 3);
-
-        tracker.record(true);
-        tracker.record(true);
-        tracker.record(true);
-
-        assert_eq!(tracker.anomaly_count(), 3);
-
-        tracker.reset();
-
-        assert_eq!(tracker.anomaly_count(), 0);
-        assert!(!tracker.exceeds_threshold());
     }
 }

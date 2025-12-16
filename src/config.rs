@@ -266,19 +266,18 @@ impl DownloadConfigBuilder {
     /// # use hydra_dl::DownloadConfig;
     /// # use std::num::NonZeroU64;
     /// let config = DownloadConfig::builder()
-    ///     .health_check(|h| h.absolute_speed_threshold(NonZeroU64::new(100 * 1024)))
+    ///     .health_check(|h| h.absolute(|a| a.threshold(NonZeroU64::new(100 * 1024))))
     ///     .build();
     /// ```
     pub fn health_check<F>(mut self, f: F) -> Self
     where
         F: FnOnce(HealthCheckConfigBuilder) -> HealthCheckConfigBuilder,
     {
-        let builder = HealthCheckConfigBuilder {
-            absolute_speed_threshold: self.health_check.absolute_speed_threshold,
-            history_size: self.health_check.history_size,
-            anomaly_threshold: self.health_check.anomaly_threshold,
-            stale_timeout_multiplier: self.health_check.stale_timeout_multiplier,
-        };
+        let builder = HealthCheckConfigBuilder::new()
+            .absolute_config(self.health_check.absolute.clone())
+            .relative_config(self.health_check.relative.clone())
+            .stale_timeout_multiplier(self.health_check.stale_timeout_multiplier);
+
         self.health_check = f(builder).build();
         self
     }
