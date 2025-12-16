@@ -1,4 +1,4 @@
-use super::range::{FetchRange, FetchRangeResult};
+use super::range::FetchRange;
 use super::{FetchError, Result};
 use crate::constants::KB;
 use crate::task::FileTask;
@@ -6,11 +6,31 @@ use crate::utils::io_traits::{HttpClient, HttpResponse, IoError};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use log::{debug, info};
-use tokio::sync::oneshot;
+use std::future::Future;
 
 // ============================================================================
 // Chunk 记录器和 RangeFetcher
 // ============================================================================
+
+/// RangeFetcher 动作控制 Trait
+///
+/// 定义下载过程中的行为控制（如取消信号）和结果构造。
+/// 这个 Trait 允许调用者完全控制取消机制和返回值类型，实现最大程度的解耦。
+///
+/// # Requirements
+/// * `Future`: 实现 Future 用作取消信号。当 Future Ready 时，下载将被中断。
+/// * `Unpin`: 为了方便在 `select!` 中使用，要求实现 Unpin。
+pub trait FetchAction: Future + Unpin + Send {
+    /// 下载操作的返回结果类型
+    type Result;
+
+    /// 当下载完整完成时调用
+    fn on_complete(self, data: Bytes) -> Self::Result;
+
+    /// 当下载被取消（Future ready）时调用
+    fn on_cancelled(self, output: Self::Output, data: Bytes, bytes_downloaded: u64)
+    -> Self::Result;
+}
 
 /// Chunk 记录器 trait
 ///
@@ -25,7 +45,7 @@ pub trait ChunkRecorder {
 
 /// Range 下载器
 ///
-/// 封装 Range 下载的参数和逻辑，提供可取消和不可取消两种下载方式
+/// 封装 Range 下载的参数和逻辑
 pub struct RangeFetcher<'a, C: HttpClient, R: ChunkRecorder> {
     client: &'a C,
     url: &'a str,
@@ -50,23 +70,23 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
         }
     }
 
-    /// 下载指定范围的数据（可取消）
+    /// 执行下载任务
+    ///
+    /// 使用提供的 `FetchAction` 控制下载流程（取消）并生成结果。
     ///
     /// # Arguments
-    /// * `cancel_rx` - 取消信号接收器（oneshot），收到信号时中途停止下载
+    /// * `action` - 实现 `FetchAction` 的控制对象，提供取消信号和结果构造逻辑
     ///
     /// # Returns
     ///
-    /// 返回 `FetchRangeResult`：
-    /// - `Complete(Bytes)`: 下载完整完成，包含所有请求的数据
-    /// - `Cancelled { data, bytes_downloaded }`: 下载被取消，包含已下载的部分数据和已下载的字节数
-    pub async fn fetch_with_cancel(
-        mut self,
-        cancel_rx: oneshot::Receiver<()>,
-    ) -> Result<FetchRangeResult> {
+    /// 返回 `Result<A::Result>`，其中 `A::Result` 由 `action` 构造
+    pub async fn fetch<A>(mut self, action: A) -> Result<A::Result>
+    where
+        A: FetchAction,
+    {
         let (http_start, http_end) = self.range.as_http_range();
         debug!(
-            "开始下载 Range (可取消): {} (bytes {}-{})",
+            "开始下载 Range: {} (bytes {}-{})",
             self.url, http_start, http_end
         );
 
@@ -79,36 +99,14 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
             return Err(FetchError::HttpStatus(response.status().as_u16()));
         }
 
-        let result = self
-            .download_stream_with_cancel(response.bytes_stream(), cancel_rx)
-            .await?;
-
-        let (start, end) = self.range.as_file_range();
-        match &result {
-            FetchRangeResult::Complete(data) => {
-                debug!("Range {}..{} 下载完成: {} bytes", start, end, data.len());
-            }
-            FetchRangeResult::Cancelled {
-                bytes_downloaded, ..
-            } => {
-                debug!(
-                    "Range {}..{} 下载被取消，已下载: {} bytes",
-                    start, end, bytes_downloaded
-                );
-            }
-        }
-
-        Ok(result)
+        self.download_stream(response.bytes_stream(), action).await
     }
 
-    /// 下载数据流（可取消版本）
-    async fn download_stream_with_cancel<S>(
-        &mut self,
-        mut stream: S,
-        mut cancel_rx: oneshot::Receiver<()>,
-    ) -> Result<FetchRangeResult>
+    /// 下载数据流
+    async fn download_stream<S, A>(&mut self, mut stream: S, mut action: A) -> Result<A::Result>
     where
         S: futures::Stream<Item = std::result::Result<Bytes, IoError>> + Unpin,
+        A: FetchAction,
     {
         let expected_size = self.range.len();
 
@@ -144,17 +142,14 @@ impl<'a, C: HttpClient, R: ChunkRecorder> RangeFetcher<'a, C, R> {
                                 });
                             }
                             let data = self.merge_chunks(chunks);
-                            return Ok(FetchRangeResult::Complete(data));
+                            return Ok(action.on_complete(data));
                         }
                     }
                 }
-                _ = &mut cancel_rx => {
-                    // 收到取消信号，返回已下载的字节数和数据
+                output = &mut action => {
+                    // 收到取消信号
                     let data = self.merge_chunks(chunks);
-                    return Ok(FetchRangeResult::Cancelled {
-                        data,
-                        bytes_downloaded: downloaded_bytes,
-                    });
+                    return Ok(action.on_cancelled(output, data, downloaded_bytes));
                 }
             }
         }
@@ -245,9 +240,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Removed import of FetchRangeResult to use local TestResult instead
     use crate::utils::io_traits::mock::MockHttpClient;
     use reqwest::header::HeaderMap;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::sync::oneshot;
+
+    #[derive(Debug)]
+    enum TestResult {
+        Complete(Bytes),
+        Cancelled { data: Bytes, bytes_downloaded: u64 },
+    }
+
+    struct TestFetchAction {
+        rx: Pin<Box<oneshot::Receiver<()>>>,
+    }
+
+    impl Future for TestFetchAction {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            match self.rx.as_mut().poll(cx) {
+                Poll::Ready(_) => Poll::Ready(()),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl FetchAction for TestFetchAction {
+        type Result = TestResult;
+        fn on_complete(self, data: Bytes) -> Self::Result {
+            TestResult::Complete(data)
+        }
+        fn on_cancelled(self, _output: (), data: Bytes, bytes_downloaded: u64) -> Self::Result {
+            TestResult::Cancelled {
+                data,
+                bytes_downloaded,
+            }
+        }
+    }
 
     /// 测试用 Mock ChunkRecorder
     #[derive(Default)]
@@ -381,18 +413,21 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let action = TestFetchAction {
+            rx: Box::pin(cancel_rx),
+        };
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(cancel_rx)
+            .fetch(action)
             .await;
 
         assert!(result.is_ok(), "下载应该成功: {:?}", result);
 
         // 验证返回完整数据
         match result.unwrap() {
-            FetchRangeResult::Complete(data) => {
+            TestResult::Complete(data) => {
                 assert_eq!(data.as_ref(), expected_data, "下载的数据应该匹配");
             }
-            FetchRangeResult::Cancelled { .. } => {
+            TestResult::Cancelled { .. } => {
                 panic!("不应该被取消");
             }
         }
@@ -437,8 +472,11 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let action = TestFetchAction {
+            rx: Box::pin(cancel_rx),
+        };
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(cancel_rx)
+            .fetch(action)
             .await;
 
         assert!(result.is_err(), "应该返回错误");
@@ -489,19 +527,22 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let action = TestFetchAction {
+            rx: Box::pin(cancel_rx),
+        };
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(cancel_rx)
+            .fetch(action)
             .await;
 
         assert!(result.is_ok(), "大数据下载应该成功");
 
         // 验证返回完整数据
         match result.unwrap() {
-            FetchRangeResult::Complete(data) => {
+            TestResult::Complete(data) => {
                 assert_eq!(data.len(), large_data.len(), "下载的数据大小应该匹配");
                 assert_eq!(data.as_ref(), &large_data[..], "下载的数据内容应该匹配");
             }
-            FetchRangeResult::Cancelled { .. } => {
+            TestResult::Cancelled { .. } => {
                 panic!("不应该被取消");
             }
         }
@@ -562,15 +603,18 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let action = TestFetchAction {
+            rx: Box::pin(cancel_rx),
+        };
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(cancel_rx)
+            .fetch(action)
             .await;
 
         assert!(result.is_ok(), "调用应该成功");
 
         // 验证结果（注意：Mock 实现可能一次性返回所有数据，在取消前就完成）
         match result.unwrap() {
-            FetchRangeResult::Cancelled {
+            TestResult::Cancelled {
                 data,
                 bytes_downloaded,
             } => {
@@ -585,7 +629,7 @@ mod tests {
                     "已下载字节数应该匹配数据长度"
                 );
             }
-            FetchRangeResult::Complete(data) => {
+            TestResult::Complete(data) => {
                 // Mock 在取消信号到达前就返回了所有数据
                 assert_eq!(data.len(), test_data.len(), "完整数据应该匹配");
             }
@@ -635,22 +679,25 @@ mod tests {
 
         // 执行下载
         let fetch_range = FetchRange::from_allocated_range(&range).unwrap();
+        let action = TestFetchAction {
+            rx: Box::pin(cancel_rx),
+        };
         let result = RangeFetcher::new(&client, test_url, fetch_range, &mut recorder)
-            .fetch_with_cancel(cancel_rx)
+            .fetch(action)
             .await;
 
         // 应该成功（可能完成也可能取消，取决于执行时机）
         assert!(result.is_ok(), "调用应该成功");
 
         match result.unwrap() {
-            FetchRangeResult::Cancelled {
+            TestResult::Cancelled {
                 data,
                 bytes_downloaded,
             } => {
                 // 被立即取消，可能没有下载任何数据
                 assert_eq!(bytes_downloaded, data.len() as u64);
             }
-            FetchRangeResult::Complete(_) => {
+            TestResult::Complete(_) => {
                 // 在取消信号处理前就完成了
             }
         }
