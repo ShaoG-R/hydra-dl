@@ -350,6 +350,8 @@ where
             result_rxs.push(result_rx);
         }
 
+        self.pool.add_workers(inputs);
+
         result_rxs
     }
 

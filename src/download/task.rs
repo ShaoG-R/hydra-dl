@@ -160,6 +160,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                             );
                             return Err(DownloadError::Other(format!("写入失败: {}", error)));
                         }
+                        Ok(ExecutorResult::FatalError { worker_id, error }) => {
+                            error!("Worker #{} 发生致命错误: {}", worker_id, error);
+                            return Err(DownloadError::Other(format!(
+                                "Worker #{} 致命错误: {}",
+                                worker_id, error
+                            )));
+                        }
                         Err(_) => {
                             // oneshot 通道被取消（worker 异常退出）
                             warn!("Worker result channel cancelled");

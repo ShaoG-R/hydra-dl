@@ -142,6 +142,27 @@ impl TaskAllocator {
         }
     }
 
+    /// 完成任务并更新状态
+    ///
+    /// 内聚处理任务完成后的逻辑（递增 ID、调度重试等）
+    pub fn complete_task<T>(&mut self, result: T)
+    where
+        T: Into<super::TaskResult>,
+    {
+        match result.into() {
+            super::TaskResult::Success => {
+                self.advance_task_id();
+            }
+            super::TaskResult::NeedRetry { range, retry_count } => {
+                self.schedule_retry(range, retry_count);
+                self.advance_task_id();
+            }
+            super::TaskResult::PermanentFailure => {
+                self.advance_task_id();
+            }
+        }
+    }
+
     /// 调度重试任务
     pub fn schedule_retry(&mut self, range: ranged_mmap::AllocatedRange, retry_count: usize) {
         self.retry_scheduler

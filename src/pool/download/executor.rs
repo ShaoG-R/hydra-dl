@@ -105,12 +105,16 @@ pub(crate) enum ExecutorResult {
         /// 错误信息
         error: String,
     },
+    /// 其他致命错误（如文件写入器异常退出）
+    FatalError {
+        /// Worker ID
+        worker_id: WorkerId,
+        /// 错误信息
+        error: String,
+    },
 }
 
 /// 下载 Worker 的上下文
-///
-/// 包含任务分配器和下载 URL。
-/// 分块策略已移至 StatsUpdater，通过 SmrSwap 维护 chunk_size。
 pub(crate) struct DownloadWorkerContext {
     /// 任务分配器（封装了 allocator 和重试调度）
     pub(crate) task_allocator: TaskAllocator,
@@ -136,41 +140,38 @@ pub(crate) struct ExecutorInput {
     pub cancel_rx: CancelReceiver,
 }
 
-/// Executor 运行时状态
+/// 正在运行的 Executor
 ///
-/// 封装 `execute_single_task` 所需的运行时引用
-struct ExecutorRuntime<'a> {
-    context: &'a mut DownloadWorkerContext,
-    stats: &'a mut WorkerStatsRecording,
-    stats_handle: &'a StatsUpdaterHandle,
-    file_writer: &'a FileWriter,
+/// 持有 Executor 运行时所需的所有可变状态，
+/// 通过方法调用来处理状态转换，以及所有权传递。
+struct RunningExecutor<'a, C> {
+    // 基础组件
+    worker_id: WorkerId,
+    client: &'a C,
+
+    // 运行时状态
+    task_allocator: TaskAllocator,
+    url: String,
+    stats_recorder: WorkerStatsRecording,
+    stats_handle: StatsUpdaterHandle,
+    cumulative_stats: ExecutorCumulativeStats,
+
+    // 通道与交互
+    file_writer: FileWriter,
+    write_failure_rx: oneshot::Receiver<file_writer::WriteFailure>,
+    shutdown_rx: oneshot::Receiver<()>,
+    result_tx: oneshot::Sender<ExecutorResult>,
+
+    // 错误记录
+    failed_ranges: Vec<(AllocatedRange, String)>,
 }
 
-/// 单个任务的执行结果
-enum TaskResult {
-    /// 任务成功完成
-    Success,
-    /// 任务需要重试
-    NeedRetry {
-        range: AllocatedRange,
-        retry_count: usize,
-    },
-    /// 任务永久失败（达到最大重试次数）
-    PermanentFailure,
-}
-
-/// 主循环 select 结果
-enum LoopAction {
-    /// 收到关闭信号
-    Shutdown,
-    /// 写入失败
-    WriteFailed(file_writer::WriteFailure),
-    /// 任务执行完成
-    TaskCompleted(TaskResult),
-    /// 等待重试完成
-    RetryWaitCompleted,
-    /// 没有更多任务
-    Done,
+/// 步骤执行结果
+enum StepResult<'a, C> {
+    /// 继续执行下一状态
+    Continue(RunningExecutor<'a, C>, ExecutorState),
+    /// 执行器已终止（内部已处理清理和结果发送）
+    Exit,
 }
 
 /// 内部事件循环结果
@@ -182,11 +183,9 @@ enum LoopEvent<T> {
 }
 
 /// 等待事件（Shutdown, WriteFailure, 或 Primary Future）
-///
-/// 统一处理 select 逻辑，避免代码重复
 async fn wait_for_event<F, T>(
     shutdown_rx: &mut oneshot::Receiver<()>,
-    write_failure_rx: &mut Option<oneshot::Receiver<file_writer::WriteFailure>>,
+    write_failure_rx: &mut oneshot::Receiver<file_writer::WriteFailure>,
     future: F,
 ) -> LoopEvent<T>
 where
@@ -195,24 +194,467 @@ where
     tokio::select! {
         biased;
         _ = shutdown_rx => LoopEvent::Shutdown,
-        failure = async {
-            if let Some(rx) = write_failure_rx {
-                rx.await
-            } else {
-                std::future::pending().await
-            }
-        } => {
+        failure = write_failure_rx => {
             match failure {
                 Ok(f) => LoopEvent::WriteFailed(f),
-                Err(_) => {
-                    // 通道已关闭，清除 Option 以免再次 polling
-                    *write_failure_rx = None;
-                    LoopEvent::WriteReceiverClosed
-                }
+                Err(_) => LoopEvent::WriteReceiverClosed,
             }
         }
         res = future => LoopEvent::Inner(res),
     }
+}
+
+impl<'a, C: HttpClient> RunningExecutor<'a, C> {
+    /// 执行 Idle 状态步骤
+    fn step_idle(mut self, cancel_rx: &mut CancelReceiver) -> StepResult<'a, C> {
+        // chunk_size 从 StatsUpdaterHandle 读取（由 SmrSwap 维护）
+        let chunk_size = self.stats_handle.read_chunk_size();
+
+        match self.task_allocator.next_task(chunk_size) {
+            AllocationResult::Task(task) => {
+                debug!(
+                    "Worker {} 获取任务 (range {}..{}, retry={})",
+                    self.worker_id,
+                    task.range().start(),
+                    task.range().end(),
+                    task.retry_count()
+                );
+                // 重置 cancel channel 并获取 receiver
+                let task_id = self.task_allocator.current_task_id();
+                let cancel_token = cancel_rx.reset(task_id);
+
+                StepResult::Continue(
+                    self,
+                    ExecutorState::Working {
+                        task,
+                        cancel_rx: cancel_token,
+                    },
+                )
+            }
+            AllocationResult::WaitForRetry {
+                delay,
+                pending_count,
+            } => {
+                debug!(
+                    "Worker {} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
+                    self.worker_id, delay, pending_count
+                );
+                StepResult::Continue(self, ExecutorState::WaitingForRetry { delay })
+            }
+            AllocationResult::Done => StepResult::Continue(self, ExecutorState::Draining),
+        }
+    }
+
+    /// 执行 Working 状态步骤
+    async fn step_working(
+        mut self,
+        task: AllocatedTask,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> StepResult<'a, C> {
+        // 构建任务执行依赖
+        let deps = TaskExecutionDeps {
+            worker_id: self.worker_id,
+            client: self.client,
+            url: &self.url,
+            stats_recorder: &mut self.stats_recorder,
+            stats_handle: &mut self.stats_handle,
+            cumulative_stats: &mut self.cumulative_stats,
+            file_writer: &self.file_writer,
+            failed_ranges: &mut self.failed_ranges,
+            task_allocator: &mut self.task_allocator,
+        };
+
+        // 创建任务 future
+        let task_future = execute_single_task(deps, task, cancel_rx);
+
+        // 使用独立的 wait_for_event 函数
+        let event = wait_for_event(
+            &mut self.shutdown_rx,
+            &mut self.write_failure_rx,
+            task_future,
+        )
+        .await;
+
+        match event {
+            LoopEvent::Shutdown => {
+                info!("Worker {} 收到关闭信号，退出", self.worker_id);
+                self.finalize(false).await;
+                StepResult::Exit
+            }
+            LoopEvent::WriteFailed(f) => {
+                self.handle_write_failure_and_exit(Some(f)).await;
+                StepResult::Exit
+            }
+            LoopEvent::WriteReceiverClosed => {
+                self.handle_write_failure_and_exit(None).await;
+                StepResult::Exit
+            }
+            LoopEvent::Inner(result) => match result {
+                Ok(task_result) => {
+                    self.task_allocator.complete_task(task_result);
+                    StepResult::Continue(self, ExecutorState::Idle)
+                }
+                Err((range, error_msg)) => {
+                    error!("Worker {} 发生致命错误: {}", self.worker_id, error_msg);
+                    let failure = file_writer::WriteFailure {
+                        range,
+                        error: error_msg,
+                    };
+                    self.handle_write_failure_and_exit(Some(failure)).await;
+                    StepResult::Exit
+                }
+            },
+        }
+    }
+
+    /// 执行 WaitingForRetry 状态步骤
+    async fn step_waiting(mut self, delay: Duration) -> StepResult<'a, C> {
+        let sleep_future = tokio::time::sleep(delay);
+
+        let event = wait_for_event(
+            &mut self.shutdown_rx,
+            &mut self.write_failure_rx,
+            sleep_future,
+        )
+        .await;
+
+        match event {
+            LoopEvent::Shutdown => {
+                info!("Worker {} 收到关闭信号，退出", self.worker_id);
+                self.finalize(false).await;
+                StepResult::Exit
+            }
+            LoopEvent::WriteFailed(f) => {
+                self.handle_write_failure_and_exit(Some(f)).await;
+                StepResult::Exit
+            }
+            LoopEvent::WriteReceiverClosed => {
+                self.handle_write_failure_and_exit(None).await;
+                StepResult::Exit
+            }
+            LoopEvent::Inner(_) => {
+                // 等待完成，激活所有重试任务
+                self.task_allocator.advance_all_retries();
+                StepResult::Continue(self, ExecutorState::Idle)
+            }
+        }
+    }
+
+    /// 执行 Draining 状态步骤
+    async fn step_draining(self) -> StepResult<'a, C> {
+        debug!("Worker {} 没有更多任务，等待写入完成", self.worker_id);
+        self.finalize(true).await;
+        StepResult::Exit
+    }
+
+    /// 处理写入失败并退出
+    async fn handle_write_failure_and_exit(self, failure: Option<file_writer::WriteFailure>) {
+        self.file_writer.shutdown_and_wait().await;
+        self.stats_handle.send_executor_shutdown();
+
+        debug!("Worker {} 收到写入失败信号，主循环退出", self.worker_id);
+
+        if let Some(f) = failure {
+            let _ = self.result_tx.send(ExecutorResult::WriteFailed {
+                worker_id: self.worker_id,
+                range: f.range,
+                error: f.error,
+            });
+        } else {
+            error!("Worker {} 写入失败通道异常关闭", self.worker_id);
+            let _ = self.result_tx.send(ExecutorResult::FatalError {
+                worker_id: self.worker_id,
+                error: "写入通道异常关闭，Writer可能已崩溃".to_string(),
+            });
+        }
+    }
+
+    /// 最终结算：关闭 Writer 并发送结果
+    ///
+    /// drain: 是否等待所有任务写入完成
+    async fn finalize(self, drain: bool) {
+        if drain {
+            self.file_writer.drain_and_wait().await;
+        } else {
+            self.file_writer.shutdown_and_wait().await;
+        }
+
+        self.stats_handle.send_executor_shutdown();
+
+        let result = if self.failed_ranges.is_empty() {
+            ExecutorResult::Success {
+                worker_id: self.worker_id,
+            }
+        } else {
+            ExecutorResult::DownloadFailed {
+                worker_id: self.worker_id,
+                failed_ranges: self.failed_ranges,
+            }
+        };
+
+        if let Err(e) = self.result_tx.send(result) {
+            error!("Worker {} 发送结果失败: {:?}", self.worker_id, e);
+        }
+    }
+}
+
+/// 任务执行依赖上下文
+struct TaskExecutionDeps<'a, C> {
+    worker_id: WorkerId,
+    client: &'a C,
+    url: &'a str,
+    stats_recorder: &'a mut WorkerStatsRecording,
+    stats_handle: &'a StatsUpdaterHandle,
+    cumulative_stats: &'a mut ExecutorCumulativeStats,
+    file_writer: &'a FileWriter,
+    failed_ranges: &'a mut Vec<(AllocatedRange, String)>,
+    task_allocator: &'a mut TaskAllocator,
+}
+
+/// 执行单个任务逻辑
+///
+/// 这是一个独立的函数，避免直接借用 Executor 的 self
+async fn execute_single_task<C: HttpClient>(
+    deps: TaskExecutionDeps<'_, C>,
+    task: AllocatedTask,
+    cancel_rx: oneshot::Receiver<()>,
+) -> Result<TaskResult, (AllocatedRange, String)> {
+    let (range, retry_count, pending_state) = match task {
+        AllocatedTask::New { range, state } => (range, 0, state),
+        AllocatedTask::Retry {
+            range,
+            retry_count,
+            state,
+        } => (range, retry_count, state),
+    };
+
+    let (start, end) = range.as_range_tuple();
+    debug!(
+        "Worker {} 执行 Range 任务: {} (range {}..{}, retry {})",
+        deps.worker_id, deps.url, start, end, retry_count
+    );
+
+    deps.stats_recorder.clear_samples();
+    let mut active_state = pending_state.transition_to_started();
+    deps.stats_handle.send_state_update(
+        active_state.as_task_state(),
+        deps.cumulative_stats.total_downloaded_bytes,
+        deps.cumulative_stats.total_consumed_time,
+    );
+
+    // 创建 Chunk 记录器
+    let mut recorder = DownloadChunkRecorder {
+        stats: deps.stats_recorder,
+        stats_handle: deps.stats_handle,
+        state: &mut active_state,
+        cumulative_stats: deps.cumulative_stats,
+    };
+
+    use crate::utils::fetch::FetchRange;
+    use crate::utils::fetch::downloader::FetchHandler;
+
+    struct ExecutorFetchHandler;
+
+    impl FetchHandler<Result<(), oneshot::error::RecvError>> for ExecutorFetchHandler {
+        type Result = FetchRangeResult;
+
+        fn on_complete(self, data: bytes::Bytes) -> Self::Result {
+            FetchRangeResult::Complete(data)
+        }
+
+        fn on_cancelled(
+            self,
+            _output: Result<(), oneshot::error::RecvError>,
+            data: bytes::Bytes,
+            bytes_downloaded: u64,
+        ) -> Self::Result {
+            FetchRangeResult::Cancelled {
+                bytes_downloaded,
+                data,
+            }
+        }
+    }
+
+    let fetch_range =
+        FetchRange::from_allocated_range(&range).expect("AllocatedRange 应该总是有效的");
+
+    let fetch_result = RangeFetcher::new(deps.client, deps.url, fetch_range, &mut recorder)
+        .fetch(cancel_rx, ExecutorFetchHandler)
+        .await;
+
+    // 任务结束，发送信号到辅助协程
+    let state = active_state.transition_to_ended();
+
+    deps.cumulative_stats.total_consumed_time += state.consumed_time();
+
+    deps.stats_handle.send_state_update(
+        state.into_task_state(),
+        deps.cumulative_stats.total_downloaded_bytes,
+        deps.cumulative_stats.total_consumed_time,
+    );
+
+    match fetch_result {
+        Ok(FetchRangeResult::Complete(data)) => {
+            if let Err(e) = deps.file_writer.write(range, data).await {
+                warn!("Worker {} 发送写入请求失败: {:?}", deps.worker_id, e);
+                return Ok(TaskResult::Success);
+            }
+            Ok(TaskResult::Success)
+        }
+        Ok(FetchRangeResult::Cancelled {
+            data,
+            bytes_downloaded,
+        }) => {
+            warn!(
+                "Worker {} Range {}..{} 被取消 (已下载 {} bytes)",
+                deps.worker_id, start, end, bytes_downloaded
+            );
+
+            let remaining_range = handle_partial_download(
+                range,
+                data,
+                bytes_downloaded,
+                deps.file_writer,
+                deps.worker_id,
+            )
+            .await
+            .map_err(|e| (range, e))?;
+
+            let remaining_range = match remaining_range {
+                Some(r) => r,
+                None => return Ok(TaskResult::Success),
+            };
+
+            let new_retry_count = retry_count + 1;
+            Ok(check_retry_or_fail(
+                remaining_range, // Corrected to use remaining_range
+                new_retry_count,
+                deps.task_allocator,
+                deps.failed_ranges,
+                deps.worker_id,
+            ))
+        }
+        Err(e) => {
+            warn!(
+                "Worker {} Range {}..{} 下载失败 (重试 {}): {:?}",
+                deps.worker_id, start, end, retry_count, e
+            );
+
+            let new_retry_count = retry_count + 1;
+            Ok(check_retry_or_fail(
+                range,
+                new_retry_count,
+                deps.task_allocator,
+                deps.failed_ranges,
+                deps.worker_id,
+            ))
+        }
+    }
+}
+
+/// 处理部分下载的数据
+async fn handle_partial_download(
+    range: AllocatedRange,
+    data: bytes::Bytes,
+    bytes_downloaded: u64,
+    file_writer: &FileWriter,
+    worker_id: WorkerId,
+) -> Result<Option<AllocatedRange>, String> {
+    let (low, remaining) = match range.split_at_align_down(bytes_downloaded) {
+        SplitDownResult::Split { low, high } => (Some(low), Some(high)),
+        SplitDownResult::High(high) => (None, Some(high)),
+        SplitDownResult::OutOfBounds(low) => {
+            let msg = format!(
+                "split_at_align_down 拆分失败: range={:?}, bytes_downloaded={}",
+                low, bytes_downloaded
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+    };
+
+    if let Some(low) = low {
+        let low_len = low.len() as usize;
+        let partial_data = data.slice(0..low_len);
+        if let Err(e) = file_writer.write(low, partial_data).await {
+            error!("Worker {} 发送部分写入请求失败: {:?}", worker_id, e);
+            // 这里是一个写入请求发送失败，可能通道关闭等，暂且认为非致命或者上层会处理
+            // 但如果这里要视为失败，也应该 return Err
+            // 目前保持原逻辑，返回 Some(range) 意味着还没完成，可能重试
+            // 但 handle_partial_download 语义是处理已下载部分，并返回剩余部分。
+            // 如果写入失败，我们是否仍要返回 range 重新尝试？
+            // 之前的逻辑是 returns Some(range) (the original range) effectively ignoring the partial data
+            return Ok(Some(range));
+        }
+        debug!("Worker {} 发送部分写入请求 {} bytes", worker_id, low.len());
+    }
+
+    Ok(remaining)
+}
+
+/// 检查是否需要重试或标记为永久失败
+fn check_retry_or_fail(
+    range: AllocatedRange,
+    retry_count: usize,
+    task_allocator: &TaskAllocator,
+    failed_ranges: &mut Vec<(AllocatedRange, String)>,
+    worker_id: WorkerId,
+) -> TaskResult {
+    let max_retries = task_allocator.max_retry_count();
+
+    if retry_count > max_retries {
+        let error_msg = format!("达到最大重试次数 ({}) 后仍然失败", max_retries);
+        error!(
+            "Worker {} Range {}..{} {}",
+            worker_id,
+            range.start(),
+            range.end(),
+            error_msg
+        );
+        failed_ranges.push((range, error_msg));
+        TaskResult::PermanentFailure
+    } else {
+        TaskResult::NeedRetry { range, retry_count }
+    }
+}
+
+/// 单个任务的执行结果
+pub(crate) enum TaskResult {
+    /// 任务成功完成
+    Success,
+    /// 任务需要重试
+    NeedRetry {
+        range: AllocatedRange,
+        retry_count: usize,
+    },
+    /// 任务永久失败（达到最大重试次数）
+    PermanentFailure,
+}
+
+/// 执行器运行状态
+enum ExecutorState {
+    /// 空闲状态
+    ///
+    /// 准备向分配器请求下一个任务。
+    Idle,
+
+    /// 工作状态
+    ///
+    /// 正在执行下载任务。包含当前任务信息和取消对应的接收器。
+    Working {
+        task: AllocatedTask,
+        cancel_rx: oneshot::Receiver<()>,
+    },
+
+    /// 等待重试状态
+    ///
+    /// 无新任务，但有待重试的任务未到期。
+    WaitingForRetry { delay: Duration },
+
+    /// 正在排空状态
+    ///
+    /// 所有任务已完成，正在等待文件写入器处理完剩余队列。
+    Draining,
 }
 
 /// 下载任务执行器
@@ -229,10 +671,6 @@ pub(crate) struct DownloadTaskExecutor<C> {
     client: C,
     /// 文件写入器
     writer: MmapWriter,
-    /// 累计的失败 ranges
-    failed_ranges: Vec<(AllocatedRange, String)>,
-    /// 累计统计
-    cumulative_stats: ExecutorCumulativeStats,
 }
 
 impl<C> DownloadTaskExecutor<C> {
@@ -242,380 +680,69 @@ impl<C> DownloadTaskExecutor<C> {
             worker_id,
             client,
             writer,
-            failed_ranges: Vec::new(),
-            cumulative_stats: ExecutorCumulativeStats::new(),
         }
     }
 }
 
 impl<C: HttpClient> DownloadTaskExecutor<C> {
     /// Worker 主循环
-    ///
-    /// 运行下载 Worker 的主事件循环，通过 TaskAllocator 统一获取任务并执行。
-    /// 任务分配和重试调度由 TaskAllocator 封装处理。
-    pub(crate) async fn run_loop(mut self, input: ExecutorInput) {
+    pub(crate) async fn run_loop(self, input: ExecutorInput) {
         let worker_id = self.worker_id;
         debug!("Worker {} 主循环启动", worker_id);
 
         let ExecutorInput {
-            mut context,
-            mut stats,
+            context,
+            stats,
             stats_handle,
             result_tx,
-            mut shutdown_rx,
+            shutdown_rx,
             mut cancel_rx,
         } = input;
 
         // 在 Executor 内部创建 FileWriter
-        let (file_writer, rx) =
+        let (file_writer, write_failure_rx) =
             FileWriter::new(worker_id, self.writer.clone(), stats_handle.clone(), None);
-        // 使用 Option 包装以处理通道关闭的情况
-        let mut write_failure_rx = Some(rx);
 
-        loop {
-            // 通过 TaskAllocator 统一获取下一个任务
-            // chunk_size 从 StatsUpdaterHandle 读取（由 SmrSwap 维护）
-            let chunk_size = stats_handle.read_chunk_size();
-
-            let action = match context.task_allocator.next_task(chunk_size) {
-                AllocationResult::Task(task) => {
-                    let range = *task.range();
-                    let retry_count = task.retry_count();
-
-                    debug!(
-                        "Worker {} 执行任务 (range {}..{}, retry={})",
-                        worker_id,
-                        range.start(),
-                        range.end(),
-                        retry_count
-                    );
-
-                    // 为当前任务创建新的 cancel oneshot channel
-                    let task_id = context.task_allocator.current_task_id();
-                    let task_cancel_rx = cancel_rx.reset(task_id);
-
-                    // 创建运行时上下文
-                    let mut runtime = ExecutorRuntime {
-                        context: &mut context,
-                        stats: &mut stats,
-                        stats_handle: &stats_handle,
-                        file_writer: &file_writer,
-                    };
-
-                    let task_future = self.execute_single_task(task, &mut runtime, task_cancel_rx);
-
-                    match wait_for_event(&mut shutdown_rx, &mut write_failure_rx, task_future).await
-                    {
-                        LoopEvent::Shutdown => LoopAction::Shutdown,
-                        LoopEvent::WriteFailed(f) => LoopAction::WriteFailed(f),
-                        LoopEvent::WriteReceiverClosed => {
-                            error!("Worker {} 写入失败通道异常关闭", worker_id);
-                            continue;
-                        }
-                        LoopEvent::Inner(result) => LoopAction::TaskCompleted(result),
-                    }
-                }
-                AllocationResult::WaitForRetry {
-                    delay,
-                    pending_count,
-                } => {
-                    debug!(
-                        "Worker {} 无新任务，等待 {:?} 后处理 {} 个待重试任务",
-                        worker_id, delay, pending_count
-                    );
-
-                    let sleep_future = tokio::time::sleep(delay);
-
-                    match wait_for_event(&mut shutdown_rx, &mut write_failure_rx, sleep_future)
-                        .await
-                    {
-                        LoopEvent::Shutdown => LoopAction::Shutdown,
-                        LoopEvent::WriteFailed(f) => LoopAction::WriteFailed(f),
-                        LoopEvent::WriteReceiverClosed => {
-                            error!("Worker {} 写入失败通道异常关闭", worker_id);
-                            continue;
-                        }
-                        LoopEvent::Inner(_) => LoopAction::RetryWaitCompleted,
-                    }
-                }
-                AllocationResult::Done => LoopAction::Done,
-            };
-
-            // 统一处理 action
-            match action {
-                LoopAction::Shutdown => {
-                    info!("Worker {} 收到关闭信号，退出", worker_id);
-                    file_writer.shutdown_and_wait().await;
-                    break;
-                }
-                LoopAction::WriteFailed(failure) => {
-                    file_writer.shutdown_and_wait().await;
-                    let _ = result_tx.send(ExecutorResult::WriteFailed {
-                        worker_id,
-                        range: failure.range,
-                        error: failure.error,
-                    });
-                    stats_handle.send_executor_shutdown();
-                    debug!("Worker {} 收到写入失败信号，主循环退出", worker_id);
-                    return;
-                }
-                LoopAction::TaskCompleted(task_result) => match task_result {
-                    TaskResult::Success => {
-                        context.task_allocator.advance_task_id();
-                    }
-                    TaskResult::NeedRetry { range, retry_count } => {
-                        context.task_allocator.schedule_retry(range, retry_count);
-                        context.task_allocator.advance_task_id();
-                    }
-                    TaskResult::PermanentFailure => {
-                        context.task_allocator.advance_task_id();
-                    }
-                },
-                LoopAction::RetryWaitCompleted => {
-                    context.task_allocator.advance_all_retries();
-                }
-                LoopAction::Done => {
-                    debug!("Worker {} 没有更多任务，退出", worker_id);
-                    // 等待所有写入请求处理完后再退出
-                    file_writer.drain_and_wait().await;
-                    break;
-                }
-            }
-        }
-
-        // Executor 关闭，通知聚合器移除统计
-        stats_handle.send_executor_shutdown();
-
-        // 主循环结束后发送最终结果
-        let result = if self.failed_ranges.is_empty() {
-            ExecutorResult::Success { worker_id }
-        } else {
-            ExecutorResult::DownloadFailed {
-                worker_id,
-                failed_ranges: self.failed_ranges,
-            }
+        // 初始化 RunningExecutor
+        let mut executor = RunningExecutor {
+            worker_id,
+            client: &self.client,
+            task_allocator: context.task_allocator,
+            url: context.url,
+            stats_recorder: stats,
+            stats_handle: stats_handle.clone(),
+            cumulative_stats: ExecutorCumulativeStats::new(),
+            file_writer,
+            write_failure_rx,
+            shutdown_rx,
+            result_tx,
+            failed_ranges: Vec::new(),
         };
 
-        if let Err(e) = result_tx.send(result) {
-            error!("Worker {} 发送结果失败: {:?}", worker_id, e);
+        // 初始状态
+        let mut state = ExecutorState::Idle;
+
+        loop {
+            let result = match state {
+                ExecutorState::Idle => executor.step_idle(&mut cancel_rx),
+                ExecutorState::Working { task, cancel_rx } => {
+                    executor.step_working(task, cancel_rx).await
+                }
+                ExecutorState::WaitingForRetry { delay } => executor.step_waiting(delay).await,
+                ExecutorState::Draining => executor.step_draining().await,
+            };
+
+            match result {
+                StepResult::Continue(next_executor, next_state) => {
+                    executor = next_executor;
+                    state = next_state;
+                }
+                StepResult::Exit => {
+                    break;
+                }
+            }
         }
 
         debug!("Worker {} 主循环结束", worker_id);
-    }
-
-    /// 执行单个任务
-    ///
-    /// 返回任务执行结果，不进行重试循环
-    async fn execute_single_task(
-        &mut self,
-        task: AllocatedTask,
-        runtime: &mut ExecutorRuntime<'_>,
-        cancel_rx: oneshot::Receiver<()>,
-    ) -> TaskResult {
-        let (range, retry_count, pending_state) = match task {
-            AllocatedTask::New { range, state } => (range, 0, state),
-            AllocatedTask::Retry {
-                range,
-                retry_count,
-                state,
-            } => (range, retry_count, state),
-        };
-
-        let (start, end) = range.as_range_tuple();
-        debug!(
-            "Worker {} 执行 Range 任务: {} (range {}..{}, retry {})",
-            self.worker_id, runtime.context.url, start, end, retry_count
-        );
-
-        runtime.stats.clear_samples();
-        let mut active_state = pending_state.transition_to_started();
-        runtime.stats_handle.send_state_update(
-            active_state.as_task_state(),
-            self.cumulative_stats.total_downloaded_bytes,
-            self.cumulative_stats.total_consumed_time,
-        );
-
-        // 创建 Chunk 记录器
-        let mut recorder = DownloadChunkRecorder {
-            stats: runtime.stats,
-            stats_handle: runtime.stats_handle,
-            state: &mut active_state,
-            cumulative_stats: &mut self.cumulative_stats,
-        };
-
-        // Inline fetch_range logic to avoid borrowing self immutably while state is borrowed mutably
-        use crate::utils::fetch::FetchRange;
-        use crate::utils::fetch::downloader::FetchHandler;
-
-        struct ExecutorFetchHandler;
-
-        impl FetchHandler<Result<(), oneshot::error::RecvError>> for ExecutorFetchHandler {
-            type Result = FetchRangeResult;
-
-            fn on_complete(self, data: bytes::Bytes) -> Self::Result {
-                FetchRangeResult::Complete(data)
-            }
-
-            fn on_cancelled(
-                self,
-                _output: Result<(), oneshot::error::RecvError>,
-                data: bytes::Bytes,
-                bytes_downloaded: u64,
-            ) -> Self::Result {
-                FetchRangeResult::Cancelled {
-                    bytes_downloaded,
-                    data,
-                }
-            }
-        }
-
-        let fetch_range =
-            FetchRange::from_allocated_range(&range).expect("AllocatedRange 应该总是有效的");
-
-        let fetch_result = RangeFetcher::new(
-            &self.client,
-            &runtime.context.url,
-            fetch_range,
-            &mut recorder,
-        )
-        .fetch(cancel_rx, ExecutorFetchHandler)
-        .await;
-
-        // 任务结束，发送信号到辅助协程
-        let state = active_state.transition_to_ended();
-
-        self.cumulative_stats.total_consumed_time += state.consumed_time();
-
-        runtime.stats_handle.send_state_update(
-            state.into_task_state(),
-            self.cumulative_stats.total_downloaded_bytes,
-            self.cumulative_stats.total_consumed_time,
-        );
-
-        self.process_fetch_result(
-            fetch_result,
-            range,
-            retry_count,
-            runtime.file_writer,
-            runtime.context,
-        )
-        .await
-    }
-
-    /// 处理 Fetch 结果
-    async fn process_fetch_result(
-        &mut self,
-        result: Result<FetchRangeResult, crate::utils::fetch::FetchError>,
-        range: AllocatedRange,
-        retry_count: usize,
-        file_writer: &FileWriter,
-        context: &DownloadWorkerContext,
-    ) -> TaskResult {
-        let (start, end) = range.as_range_tuple();
-
-        match result {
-            Ok(FetchRangeResult::Complete(data)) => {
-                // 下载成功，发送写入请求到 Writer 协程
-                // 写入失败由 Writer 协程通过 write_failure_rx 通知
-                if let Err(e) = file_writer.write(range, data).await {
-                    // 发送失败说明 Writer 协程已关闭，直接返回 Success
-                    // 实际的错误会通过 write_failure_rx 通知
-                    warn!("Worker {} 发送写入请求失败: {:?}", self.worker_id, e);
-                    return TaskResult::Success;
-                }
-
-                TaskResult::Success
-            }
-            Ok(FetchRangeResult::Cancelled {
-                data,
-                bytes_downloaded,
-            }) => {
-                // 下载被取消（健康检查触发）
-                warn!(
-                    "Worker {} Range {}..{} 被取消 (已下载 {} bytes)",
-                    self.worker_id, start, end, bytes_downloaded
-                );
-
-                let remaining_range = match self
-                    .handle_partial_download(range, data, bytes_downloaded, file_writer)
-                    .await
-                {
-                    Some(r) => r,
-                    None => return TaskResult::Success, // remaining_range不存在，返回成功
-                };
-
-                let new_retry_count = retry_count + 1;
-                self.check_retry_or_fail(remaining_range, new_retry_count, context)
-            }
-            Err(e) => {
-                // 下载失败
-                warn!(
-                    "Worker {} Range {}..{} 下载失败 (重试 {}): {:?}",
-                    self.worker_id, start, end, retry_count, e
-                );
-
-                let new_retry_count = retry_count + 1;
-                self.check_retry_or_fail(range, new_retry_count, context)
-            }
-        }
-    }
-
-    /// 处理部分下载的数据
-    async fn handle_partial_download(
-        &self,
-        range: AllocatedRange,
-        data: bytes::Bytes,
-        bytes_downloaded: u64,
-        file_writer: &FileWriter,
-    ) -> Option<AllocatedRange> {
-        let (low, remaining) = match range.split_at_align_down(bytes_downloaded) {
-            SplitDownResult::Split { low, high } => (Some(low), Some(high)),
-            SplitDownResult::High(high) => (None, Some(high)),
-            SplitDownResult::OutOfBounds(low) => {
-                error!("split_at_align_down 拆分失败");
-                (Some(low), None)
-            }
-        };
-
-        if let Some(low) = low {
-            let low_len = low.len() as usize;
-            let partial_data = data.slice(0..low_len);
-            if let Err(e) = file_writer.write(low, partial_data).await {
-                error!("Worker {} 发送部分写入请求失败: {:?}", self.worker_id, e);
-                return Some(range);
-            }
-            debug!(
-                "Worker {} 发送部分写入请求 {} bytes",
-                self.worker_id,
-                low.len()
-            );
-        }
-
-        remaining
-    }
-
-    /// 检查是否需要重试或标记为永久失败
-    fn check_retry_or_fail(
-        &mut self,
-        range: AllocatedRange,
-        retry_count: usize,
-        context: &DownloadWorkerContext,
-    ) -> TaskResult {
-        let max_retries = context.task_allocator.max_retry_count();
-
-        if retry_count > max_retries {
-            let error_msg = format!("达到最大重试次数 ({}) 后仍然失败", max_retries);
-            error!(
-                "Worker {} Range {}..{} {}",
-                self.worker_id,
-                range.start(),
-                range.end(),
-                error_msg
-            );
-            self.failed_ranges.push((range, error_msg));
-            TaskResult::PermanentFailure
-        } else {
-            TaskResult::NeedRetry { range, retry_count }
-        }
     }
 }
