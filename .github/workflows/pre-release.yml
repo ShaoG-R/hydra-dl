@@ -1,0 +1,160 @@
+name: Pre-release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux (MUSL) - x64 & arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_zigbuild: true
+            archive_ext: tar.gz
+            asset_suffix: linux-musl-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_zigbuild: true
+            archive_ext: tar.gz
+            asset_suffix: linux-musl-aarch64
+          
+          # Windows - x64 & arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_zigbuild: false
+            archive_ext: zip
+            asset_suffix: windows-x86_64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            use_zigbuild: false
+            archive_ext: zip
+            asset_suffix: windows-aarch64
+          
+          # macOS - x64 & arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            use_zigbuild: false
+            archive_ext: tar.gz
+            asset_suffix: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use_zigbuild: false
+            archive_ext: tar.gz
+            asset_suffix: macos-aarch64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build (Zigbuild)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build (Standard)
+        if: ${{ !matrix.use_zigbuild }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Artifacts
+        shell: bash
+        run: |
+          # Define binary name
+          BIN_NAME="hydra-dl"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BIN_NAME="hydra-dl.exe"
+          fi
+
+          # Define output paths
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          ASSET_NAME="hydra-dl-${{ matrix.asset_suffix }}.${{ matrix.archive_ext }}"
+          
+          cd "$RELEASE_DIR"
+          
+          # Package
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            7z a "../../../$ASSET_NAME" "$BIN_NAME"
+          else
+            tar czf "../../../$ASSET_NAME" "$BIN_NAME"
+          fi
+          
+          cd ../../../
+          
+          # Export for upload
+          echo "ASSET_PATH=${ASSET_NAME}" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_suffix }}
+          path: ${{ env.ASSET_PATH }}
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Download all artifacts from the build matrix
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List Artifacts
+        run: ls -R artifacts
+
+      - name: Update Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Cleanup old release and tag
+          gh release delete pre-release --cleanup-tag --yes || true
+          git tag -d pre-release || true
+          git push origin :refs/tags/pre-release || true
+          
+          # Create new release
+          gh release create pre-release \
+            --title "Pre-release" \
+            --notes "Latest pre-release builds for Windows, macOS, and Linux." \
+            --prerelease \
+            --target ${{ github.sha }} \
+            artifacts/*
