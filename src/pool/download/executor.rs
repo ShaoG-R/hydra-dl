@@ -291,8 +291,16 @@ impl<'a, C: HttpClient> RunningExecutor<'a, C> {
             }
             LoopEvent::Inner(result) => match result {
                 Ok(task_result) => {
+                    let is_permanent_failure = matches!(task_result, TaskResult::PermanentFailure);
                     self.task_allocator.complete_task(task_result);
-                    StepResult::Continue(self, ExecutorState::Idle)
+
+                    if is_permanent_failure {
+                        warn!("Worker {} 检测到永久失败任务，准备退出", self.worker_id);
+                        self.finalize(false).await;
+                        StepResult::Exit
+                    } else {
+                        StepResult::Continue(self, ExecutorState::Idle)
+                    }
                 }
                 Err((range, error_msg)) => {
                     error!("Worker {} 发生致命错误: {}", self.worker_id, error_msg);
@@ -577,14 +585,9 @@ async fn handle_partial_download(
         let low_len = low.len() as usize;
         let partial_data = data.slice(0..low_len);
         if let Err(e) = file_writer.write(low, partial_data).await {
-            error!("Worker {} 发送部分写入请求失败: {:?}", worker_id, e);
-            // 这里是一个写入请求发送失败，可能通道关闭等，暂且认为非致命或者上层会处理
-            // 但如果这里要视为失败，也应该 return Err
-            // 目前保持原逻辑，返回 Some(range) 意味着还没完成，可能重试
-            // 但 handle_partial_download 语义是处理已下载部分，并返回剩余部分。
-            // 如果写入失败，我们是否仍要返回 range 重新尝试？
-            // 之前的逻辑是 returns Some(range) (the original range) effectively ignoring the partial data
-            return Ok(Some(range));
+            let msg = format!("发送部分写入请求失败: {:?}", e);
+            error!("Worker {} {}", worker_id, msg);
+            return Err(msg);
         }
         debug!("Worker {} 发送部分写入请求 {} bytes", worker_id, low.len());
     }
