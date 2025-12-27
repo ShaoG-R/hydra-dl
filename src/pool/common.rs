@@ -23,7 +23,7 @@
 //! - Worker 的 spawn 和 shutdown
 //! - JoinHandle 的管理和等待
 
-use deferred_map::DeferredMap;
+use deferred_map::{DefaultKey, DeferredMap, Key};
 use log::{debug, error, info};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::task::JoinHandle;
@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkerId {
     /// DeferredMap 槽位 ID（用于内部管理）
-    slot_id: u64,
+    slot_id: DefaultKey,
     /// 池内唯一 ID（单调递增，用于日志和外部标识）
     pool_id: u64,
 }
@@ -53,13 +53,13 @@ impl WorkerId {
     ///
     /// - `slot_id`: DeferredMap 分配的槽位 ID
     /// - `pool_id`: 池内唯一 ID（由 WorkerPool 分配）
-    pub fn new(slot_id: u64, pool_id: u64) -> Self {
+    pub fn new(slot_id: DefaultKey, pool_id: u64) -> Self {
         Self { slot_id, pool_id }
     }
 
     /// 获取 DeferredMap 槽位 ID
     #[inline]
-    pub fn slot_id(&self) -> u64 {
+    pub fn slot_id(&self) -> DefaultKey {
         self.slot_id
     }
 
@@ -231,7 +231,7 @@ impl<F: WorkerFactory> WorkerPool<F> {
     pub async fn shutdown(&mut self) {
         info!("发送关闭信号到所有活跃 workers");
 
-        let slot_ids: Vec<u64> = self.slots.iter().map(|(key, _)| key).collect();
+        let slot_ids: Vec<DefaultKey> = self.slots.iter().map(|(key, _)| key).collect();
         let closed_count = slot_ids.len();
 
         let mut all_join_handles = Vec::with_capacity(closed_count);
@@ -239,7 +239,7 @@ impl<F: WorkerFactory> WorkerPool<F> {
         for slot_id in slot_ids {
             if let Some(slot) = self.slots.remove(slot_id) {
                 let _ = slot.shutdown_sender.send(());
-                debug!("Worker (slot={}) 关闭信号已发送", slot_id);
+                debug!("Worker (slot={}) 关闭信号已发送", slot_id.index());
                 all_join_handles.push((slot_id, slot.join_handles));
             }
         }
@@ -249,10 +249,10 @@ impl<F: WorkerFactory> WorkerPool<F> {
         for (slot_id, handles) in all_join_handles {
             for handle in handles {
                 if let Err(e) = handle.await {
-                    error!("Worker (slot={}) 协程退出错误: {:?}", slot_id, e);
+                    error!("Worker (slot={}) 协程退出错误: {:?}", slot_id.index(), e);
                 }
             }
-            debug!("Worker (slot={}) 已退出", slot_id);
+            debug!("Worker (slot={}) 已退出", slot_id.index());
         }
 
         info!("所有 workers 已完全退出");

@@ -23,7 +23,7 @@ rustc-hash = "2.1.1"
 
 # 下面的crates是 hydra-dl 作者维护的
 ranged-mmap = "0.4.0"
-deferred-map = "0.2.0"
+deferred-map = "0.3.1"
 lite-sync = "0.2.0"
 net-bytes = "0.3.0"
 smr-swap = "0.8.3"

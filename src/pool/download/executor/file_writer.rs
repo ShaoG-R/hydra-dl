@@ -299,9 +299,19 @@ mod tests {
     use crate::pool::download::stats_updater::{StatsUpdater, WorkerBroadcaster};
     use crate::utils::cancel_channel::cancel_channel;
     use crate::utils::chunk_strategy::SpeedBasedChunkStrategy;
+    use deferred_map::DeferredMap;
     use std::num::NonZeroU64;
     use tempfile::tempdir;
     use tokio::sync::broadcast;
+
+    /// 辅助函数：创建测试用的 WorkerId
+    fn create_test_worker_id(pool_id: u64) -> WorkerId {
+        let mut map: DeferredMap<()> = DeferredMap::new();
+        let handle = map.allocate_handle();
+        let slot_id = handle.key();
+        map.insert(handle, ());
+        WorkerId::new(slot_id, pool_id)
+    }
 
     #[tokio::test]
     async fn test_file_writer_shutdown() {
@@ -311,7 +321,7 @@ mod tests {
 
         // 创建 stats updater
         let (broadcast_tx, _) = broadcast::channel(16);
-        let worker_id = WorkerId::new(0, 0);
+        let worker_id = create_test_worker_id(0);
         let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx);
         let chunk_strategy = Box::new(SpeedBasedChunkStrategy::new(
             1024 * 1024,      // min: 1 MB

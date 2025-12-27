@@ -502,9 +502,19 @@ mod tests {
     use crate::pool::common::WorkerId;
     use crate::pool::download::{PendingExecutorStats, WorkerBroadcaster};
     use crate::utils::cancel_channel::cancel_channel;
+    use deferred_map::DeferredMap;
     use tokio::sync::broadcast;
 
     use super::*;
+
+    /// 辅助函数：创建测试用的 WorkerId
+    fn create_test_worker_id(pool_id: u64) -> WorkerId {
+        let mut map: DeferredMap<()> = DeferredMap::new();
+        let handle = map.allocate_handle();
+        let slot_id = handle.key();
+        map.insert(handle, ());
+        WorkerId::new(slot_id, pool_id)
+    }
 
     #[tokio::test]
     async fn test_aggregator_update() {
@@ -515,8 +525,8 @@ mod tests {
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
         // 创建 WorkerBroadcaster 用于发送消息
-        let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx.clone());
-        let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
+        let broadcaster1 = WorkerBroadcaster::new(create_test_worker_id(0), broadcast_tx.clone());
+        let broadcaster2 = WorkerBroadcaster::new(create_test_worker_id(1), broadcast_tx);
 
         // 发送更新（通过广播）- 使用 Pending 和 Running(Started) 状态
         let (cancel_tx1, _) = cancel_channel();
@@ -549,8 +559,8 @@ mod tests {
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
         // 创建 WorkerBroadcaster 用于发送消息
-        let broadcaster1 = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx.clone());
-        let broadcaster2 = WorkerBroadcaster::new(WorkerId::new(1, 1), broadcast_tx);
+        let broadcaster1 = WorkerBroadcaster::new(create_test_worker_id(0), broadcast_tx.clone());
+        let broadcaster2 = WorkerBroadcaster::new(create_test_worker_id(1), broadcast_tx);
 
         // 添加两个 executor - 使用 Running(Started) 状态
         let (cancel_tx1, _) = cancel_channel();
@@ -594,7 +604,7 @@ mod tests {
         let (handle, _) = DownloadStats::spawn(broadcast_rx);
 
         // 创建 WorkerBroadcaster 用于发送消息
-        let broadcaster = WorkerBroadcaster::new(WorkerId::new(0, 0), broadcast_tx);
+        let broadcaster = WorkerBroadcaster::new(create_test_worker_id(0), broadcast_tx);
 
         // 测试状态转换：Pending -> Running(Started) -> Running(Ended) -> Stopped
         let (cancel_tx, _) = cancel_channel();

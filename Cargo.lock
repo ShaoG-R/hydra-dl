@@ -201,9 +201,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "deferred-map"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8532bf8d4816ed7372c622825a28ecd0b4eade400d12a2fc8dd261e08efacd67"
+checksum = "150632d91bb8334c0d41f35f5f1749c824f6b9af35fa26a2b123aaf5c5db1b98"
 
 [[package]]
 name = "displaydoc"
