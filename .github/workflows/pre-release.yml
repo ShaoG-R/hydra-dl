@@ -125,8 +125,7 @@ jobs:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    permissions: write-all
 
     steps:
       - name: Checkout code
@@ -148,7 +147,6 @@ jobs:
         run: |
           # Cleanup old release and tag
           gh release delete pre-release --cleanup-tag --yes || true
-          git tag -d pre-release || true
           git push origin :refs/tags/pre-release || true
           
           # Create new release
