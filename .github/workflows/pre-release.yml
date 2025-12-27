@@ -72,7 +72,7 @@ jobs:
 
       - name: Install Zig
         if: matrix.use_zigbuild
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.15.1
 
