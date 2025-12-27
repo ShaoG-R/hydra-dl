@@ -16,7 +16,7 @@
 - 🚀 **极速下载** - 多 worker 并发下载，充分利用带宽
 - 🎯 **智能分块** - 根据实时速度自动调整分块大小（2-50 MB）
 - 🔄 **断点续传** - 支持 HTTP Range 请求，单文件分段下载
-- 📊 **实时监控** - 详细的进度统计和速度监测
+- 📊 **实时监控** - 详细的进度统计、速度/加速度监测及精准 ETA
 - 🛡️ **稳定可靠** - 自动重试机制，失败任务智能调度
 - 🧵 **渐进式启动** - 分批启动 worker，避免服务器压力
 - 💾 **内存友好** - 流式写入，内存占用低
@@ -58,6 +58,7 @@ hydra-dl https://example.com/file.zip -o ./downloads
 # 自定义并发数和分块大小
 hydra-dl https://example.com/large_file.bin \
   --workers 8 \
+  --initial-workers 2 \
   --chunk-size 10 \
   --min-chunk 5 \
   --max-chunk 100
@@ -75,6 +76,7 @@ hydra-dl https://example.com/file.zip --verbose
 选项:
   -o, --output <DIRECTORY>     保存目录（默认：当前目录）
   -n, --workers <NUM>          Worker 并发数（默认：4）
+      --initial-workers <NUM>  初始 Worker 数量（默认：1）
       --chunk-size <MB>        初始分块大小（默认：5 MB）
       --min-chunk <MB>         最小分块大小（默认：2 MB）
       --max-chunk <MB>         最大分块大小（默认：50 MB）
