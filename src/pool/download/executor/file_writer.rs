@@ -298,7 +298,6 @@ mod tests {
     use crate::pool::common::WorkerId;
     use crate::pool::download::stats_updater::{StatsUpdater, WorkerBroadcaster};
     use crate::utils::cancel_channel::cancel_channel;
-    use crate::utils::chunk_strategy::SpeedBasedChunkStrategy;
     use deferred_map::DeferredMap;
     use std::num::NonZeroU64;
     use tempfile::tempdir;
@@ -323,24 +322,9 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel(16);
         let worker_id = create_test_worker_id(0);
         let broadcaster = WorkerBroadcaster::new(worker_id, broadcast_tx);
-        let chunk_strategy = Box::new(SpeedBasedChunkStrategy::new(
-            1024 * 1024,      // min: 1 MB
-            16 * 1024 * 1024, // max: 16 MB
-            2.0,              // expected duration: 2s
-            0.3,              // smoothing factor
-            0.7,              // instant speed weight
-            0.3,              // avg speed weight
-        ));
-        let initial_chunk_size = 4 * 1024 * 1024; // 4 MB
         let (cancel_tx, _cancel_rx) = cancel_channel();
-        let (_stats_updater, stats_handle) = StatsUpdater::new(
-            worker_id,
-            broadcaster,
-            chunk_strategy,
-            initial_chunk_size,
-            cancel_tx,
-            None,
-        );
+        let (_stats_updater, stats_handle) =
+            StatsUpdater::new(worker_id, broadcaster, cancel_tx, None);
 
         // 创建 file writer
         let (file_writer, _failure_rx) = FileWriter::new(worker_id, writer, stats_handle, None);

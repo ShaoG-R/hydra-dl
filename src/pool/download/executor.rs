@@ -18,6 +18,7 @@ use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::CancelReceiver;
 use crate::utils::writer::MmapWriter;
 use crate::utils::{
+    chunk_strategy::ChunkStrategy,
     fetch::{ChunkRecorder, FetchRangeResult, RangeFetcher},
     io_traits::HttpClient,
     stats::WorkerStatsRecording,
@@ -51,12 +52,13 @@ impl ExecutorCumulativeStats {
 /// 下载 Chunk 记录器
 ///
 /// 实现 `ChunkRecorder` trait，封装 `WorkerStatsRecording` 和 `StatsUpdaterHandle`。
-/// chunk_size 计算已移至 StatsUpdater，此处仅负责采样和发送。
+/// chunk_size 计算由 Executor 维护，采样成功后根据策略更新。
 pub(crate) struct DownloadChunkRecorder<'a> {
     stats: &'a mut WorkerStatsRecording,
     stats_handle: &'a StatsUpdaterHandle,
     state: &'a mut TaskInternalState<Active>,
     cumulative_stats: &'a mut ExecutorCumulativeStats,
+    chunk_strategy: &'a mut (dyn ChunkStrategy + Send),
 }
 
 impl ChunkRecorder for DownloadChunkRecorder<'_> {
@@ -65,6 +67,11 @@ impl ChunkRecorder for DownloadChunkRecorder<'_> {
         if let Some(active) = self.stats.record_chunk(bytes) {
             // 更新总下载字节数
             self.cumulative_stats.total_downloaded_bytes += bytes;
+
+            // 计算并更新新的 chunk size
+            let speed_stats = active.get_speed_stats();
+            self.chunk_strategy
+                .update_chunk_size(speed_stats.instant_speed, speed_stats.window_avg_speed);
 
             // 更新状态
             self.state.transition_to_running(active);
@@ -120,6 +127,8 @@ pub(crate) struct DownloadWorkerContext {
     pub(crate) task_allocator: TaskAllocator,
     /// 下载 URL
     pub(crate) url: String,
+    /// 分块策略
+    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send>,
 }
 
 /// Executor 运行时输入
@@ -155,6 +164,7 @@ struct RunningExecutor<'a, C> {
     stats_recorder: WorkerStatsRecording,
     stats_handle: StatsUpdaterHandle,
     cumulative_stats: ExecutorCumulativeStats,
+    chunk_strategy: Box<dyn ChunkStrategy + Send>,
 
     // 通道与交互
     file_writer: FileWriter,
@@ -207,8 +217,8 @@ where
 impl<'a, C: HttpClient> RunningExecutor<'a, C> {
     /// 执行 Idle 状态步骤
     fn step_idle(mut self, cancel_rx: &mut CancelReceiver) -> StepResult<'a, C> {
-        // chunk_size 从 StatsUpdaterHandle 读取（由 SmrSwap 维护）
-        let chunk_size = self.stats_handle.read_chunk_size();
+        // chunk_size 由 Executor 维护
+        let chunk_size = self.chunk_strategy.current_size();
 
         match self.task_allocator.next_task(chunk_size) {
             AllocationResult::Task(task) => {
@@ -262,6 +272,7 @@ impl<'a, C: HttpClient> RunningExecutor<'a, C> {
             file_writer: &self.file_writer,
             failed_ranges: &mut self.failed_ranges,
             task_allocator: &mut self.task_allocator,
+            chunk_strategy: &mut *self.chunk_strategy,
         };
 
         // 创建任务 future
@@ -417,6 +428,7 @@ struct TaskExecutionDeps<'a, C> {
     file_writer: &'a FileWriter,
     failed_ranges: &'a mut Vec<(AllocatedRange, String)>,
     task_allocator: &'a mut TaskAllocator,
+    chunk_strategy: &'a mut (dyn ChunkStrategy + Send),
 }
 
 /// 执行单个任务逻辑
@@ -443,7 +455,7 @@ async fn execute_single_task<C: HttpClient>(
     );
 
     deps.stats_recorder.clear_samples();
-    let mut active_state = pending_state.transition_to_started();
+    let mut active_state = pending_state.transition_to_started(range.len() as u64);
     deps.stats_handle.send_state_update(
         active_state.as_task_state(),
         deps.cumulative_stats.total_downloaded_bytes,
@@ -456,6 +468,7 @@ async fn execute_single_task<C: HttpClient>(
         stats_handle: deps.stats_handle,
         state: &mut active_state,
         cumulative_stats: deps.cumulative_stats,
+        chunk_strategy: deps.chunk_strategy,
     };
 
     use crate::utils::fetch::FetchRange;
@@ -720,6 +733,7 @@ impl<C: HttpClient> DownloadTaskExecutor<C> {
             shutdown_rx,
             result_tx,
             failed_ranges: Vec::new(),
+            chunk_strategy: context.chunk_strategy,
         };
 
         // 初始状态

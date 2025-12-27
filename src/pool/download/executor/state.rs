@@ -13,12 +13,18 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct StartedState {
     start_time: Instant,
+    current_chunk_size: u64,
 }
 
 impl StartedState {
     /// 获取任务启动时间
     pub fn start_time(&self) -> Instant {
         self.start_time
+    }
+
+    /// 获取当前分块大小
+    pub fn current_chunk_size(&self) -> u64 {
+        self.current_chunk_size
     }
 }
 
@@ -27,12 +33,18 @@ impl StartedState {
 pub struct RunningState {
     start_time: Instant,
     stats: WorkerStatsActive,
+    current_chunk_size: u64,
 }
 
 impl RunningState {
     /// 获取统计数据
     pub fn stats(&self) -> &WorkerStatsActive {
         &self.stats
+    }
+
+    /// 获取当前分块大小
+    pub fn current_chunk_size(&self) -> u64 {
+        self.current_chunk_size
     }
 
     /// 设置统计数据
@@ -79,6 +91,7 @@ impl TaskState {
     pub fn new() -> Self {
         Self::Started(StartedState {
             start_time: Instant::now(),
+            current_chunk_size: 0,
         })
     }
 
@@ -119,9 +132,10 @@ impl TaskInternalState<Pending> {
     }
 
     /// 转换到 Started 状态
-    pub fn transition_to_started(self) -> TaskInternalState<Active> {
+    pub fn transition_to_started(self, current_chunk_size: u64) -> TaskInternalState<Active> {
         let started = StartedState {
             start_time: Instant::now(),
+            current_chunk_size,
         };
         TaskInternalState {
             state: Active::Started(started),
@@ -140,6 +154,7 @@ impl TaskInternalState<Active> {
                 let running = RunningState {
                     start_time: started.start_time,
                     stats,
+                    current_chunk_size: started.current_chunk_size,
                 };
                 self.state = Active::Running(running);
             }
@@ -148,7 +163,6 @@ impl TaskInternalState<Active> {
             }
         }
     }
-
     /// 转换到 Ended 状态
     pub fn transition_to_ended(self) -> TaskInternalState<EndedState> {
         let start_time = match &self.state {

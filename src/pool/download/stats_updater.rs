@@ -13,18 +13,11 @@
 //!
 //! 统计更新通过 broadcast channel 广播 `ExecutorBroadcast` 消息到所有订阅者。
 //!
-//! # chunk_size 维护
-//!
-//! `current_chunk_size` 由 `Arc<AtomicU64>` 维护，Executor 通过原子操作读取。
-//! 当 `ChunkSampled` 消息到达时，使用 `ChunkStrategy` 计算新的 chunk size 并更新。
 
 use crate::pool::common::WorkerId;
 use crate::utils::cancel_channel::CancelSender;
-use crate::utils::chunk_strategy::ChunkStrategy;
 use log::{debug, warn};
 use net_bytes::DownloadSpeed;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -76,26 +69,26 @@ impl RunningExecutorStats {
 
     /// 获取平均速度
     pub fn get_avg_speed(&self) -> Option<DownloadSpeed> {
-        self.state.stats().map(|s| s.get_speed_stats(0).avg_speed)
+        self.state.stats().map(|s| s.get_speed_stats().avg_speed)
     }
 
     /// 获取实时速度
     pub fn get_instant_speed(&self) -> Option<DownloadSpeed> {
         self.state
             .stats()
-            .map(|s| s.get_speed_stats(0).instant_speed)
+            .map(|s| s.get_speed_stats().instant_speed)
     }
 
     /// 获取窗口平均速度
     pub fn get_window_avg_speed(&self) -> Option<DownloadSpeed> {
         self.state
             .stats()
-            .map(|s| s.get_speed_stats(0).window_avg_speed)
+            .map(|s| s.get_speed_stats().window_avg_speed)
     }
 
     /// 获取速度统计
     pub fn get_speed_stats(&self) -> Option<crate::utils::stats::SpeedStats> {
-        self.state.stats().map(|s| s.get_speed_stats(0))
+        self.state.stats().map(|s| s.get_speed_stats())
     }
 }
 
@@ -233,19 +226,9 @@ impl Default for StatsUpdaterConfig {
 #[derive(Clone)]
 pub(crate) struct StatsUpdaterHandle {
     tx: mpsc::Sender<StatsMessage>,
-    /// chunk size 读取器（通过 Arc<AtomicU64> 实现无锁读取）
-    chunk_size: Arc<AtomicU64>,
 }
 
 impl StatsUpdaterHandle {
-    /// 读取当前 chunk size
-    ///
-    /// 通过 `AtomicU64` 无锁读取
-    #[inline]
-    pub(crate) fn read_chunk_size(&self) -> u64 {
-        self.chunk_size.load(Ordering::Relaxed)
-    }
-
     /// 发送任务状态更新
     #[inline]
     pub(crate) fn send_state_update(
@@ -295,10 +278,6 @@ pub(crate) struct StatsUpdater {
     rx: mpsc::Receiver<StatsMessage>,
     /// Worker 广播器（封装外部和本地广播）
     broadcaster: WorkerBroadcaster,
-    /// 分块策略（用于计算 chunk size）
-    chunk_strategy: Box<dyn ChunkStrategy + Send>,
-    /// 当前 chunk size（Arc<AtomicU64> 维护）
-    chunk_size: Arc<AtomicU64>,
 }
 
 impl StatsUpdater {
@@ -306,27 +285,20 @@ impl StatsUpdater {
     pub(crate) fn new(
         worker_id: WorkerId,
         broadcaster: WorkerBroadcaster,
-        chunk_strategy: Box<dyn ChunkStrategy + Send>,
-        initial_chunk_size: u64,
         cancel_tx: CancelSender,
         config: Option<StatsUpdaterConfig>,
     ) -> (Self, StatsUpdaterHandle) {
         let config = config.unwrap_or_default();
         let (tx, rx) = mpsc::channel(config.channel_capacity);
 
-        // 创建 Arc<AtomicU64> 用于维护 chunk_size
-        let chunk_size = Arc::new(AtomicU64::new(initial_chunk_size));
-
         let updater = Self {
             worker_id,
             state: ExecutorStats::Pending(PendingExecutorStats { cancel_tx }),
             rx,
             broadcaster,
-            chunk_strategy,
-            chunk_size: chunk_size.clone(),
         };
 
-        let handle = StatsUpdaterHandle { tx, chunk_size };
+        let handle = StatsUpdaterHandle { tx };
 
         (updater, handle)
     }
@@ -357,21 +329,6 @@ impl StatsUpdater {
         total_downloaded_bytes: u64,
         total_consumed_time: Duration,
     ) {
-        // 更新 chunk size
-        if let Some(stats) = new_state.stats() {
-            // 计算新的 chunk size
-            let current_chunk_size = self.chunk_size.load(Ordering::Relaxed);
-            let speed_stats = stats.get_speed_stats(current_chunk_size);
-            let new_chunk_size = self.chunk_strategy.calculate_chunk_size(
-                current_chunk_size,
-                speed_stats.instant_speed,
-                speed_stats.window_avg_speed,
-            );
-
-            // 更新 atomic chunk size
-            self.chunk_size.store(new_chunk_size, Ordering::Relaxed);
-        }
-
         // 更新 ExecutorStats
         match &mut self.state {
             ExecutorStats::Pending(pending) => {

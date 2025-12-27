@@ -10,8 +10,6 @@ use std::time::Instant;
 /// 速度字段不再使用 `Option`，因为只有在成功采样后才会创建 `WorkerStatsActive`。
 #[derive(Debug, Clone, Copy)]
 pub struct SpeedStats {
-    /// 当前分块大小 (bytes)
-    pub current_chunk_size: u64,
     /// 平均速度（从开始到现在）
     pub avg_speed: DownloadSpeed,
     /// 实时速度（基于短时间窗口）
@@ -35,9 +33,6 @@ pub(crate) struct WorkerStatsRecording {
     total_bytes: u64,
     /// 速度计算器（管理瞬时速度和窗口平均速度的采样点）
     speed_calculator: SpeedCalculatorRecording,
-    /// 当前分块大小
-    /// 由 worker 内部的 ChunkStrategy 更新，外部只读访问
-    current_chunk_size: u64,
     /// Worker 生命周期开始时间（用于计算整体平均速度）
     /// 不随 clear_samples() 重置，在第一次记录数据时初始化
     worker_start_time: Option<Instant>,
@@ -76,7 +71,6 @@ impl WorkerStatsRecording {
         Self {
             total_bytes: 0,
             speed_calculator: SpeedCalculatorRecording::from_config(config),
-            current_chunk_size: 0,
             worker_start_time: None,
         }
     }
@@ -165,9 +159,8 @@ impl WorkerStatsActive {
     ///
     /// `SpeedStats` - 速度统计快照（所有字段保证有效，无 Option）
     #[inline]
-    pub fn get_speed_stats(&self, current_chunk_size: u64) -> SpeedStats {
+    pub fn get_speed_stats(&self) -> SpeedStats {
         SpeedStats {
-            current_chunk_size,
             avg_speed: self.get_speed(),
             instant_speed: self.speed_calculator.get_instant_speed(),
             window_avg_speed: self.speed_calculator.get_window_avg_speed(),
@@ -190,7 +183,6 @@ impl std::fmt::Debug for WorkerStatsRecording {
         f.debug_struct("WorkerStatsRecording")
             .field("total_bytes", &self.total_bytes)
             .field("speed_calculator", &self.speed_calculator)
-            .field("current_chunk_size", &self.current_chunk_size)
             .finish()
     }
 }

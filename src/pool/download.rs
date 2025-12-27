@@ -64,10 +64,6 @@ pub(crate) struct DownloadWorkerInput {
     pub(crate) context: DownloadWorkerContext,
     /// 统计数据
     pub(crate) stats: WorkerStatsRecording,
-    /// 分块策略（传递给 StatsUpdater）
-    pub(crate) chunk_strategy: Box<dyn ChunkStrategy + Send>,
-    /// 初始 chunk size
-    pub(crate) initial_chunk_size: u64,
     /// 结果发送通道（oneshot，仅在 worker 完成时发送一次）
     pub(crate) result_tx: tokio::sync::oneshot::Sender<ExecutorResult>,
     /// 外部广播发送器（spawn_worker 中创建 WorkerBroadcaster）
@@ -122,8 +118,6 @@ where
         let DownloadWorkerInput {
             context,
             stats,
-            chunk_strategy,
-            initial_chunk_size,
             result_tx,
             broadcast_tx,
             local_health_config,
@@ -140,14 +134,8 @@ where
 
         // --- 协程 1: Stats Updater 辅助协程 ---
         // chunk_strategy 和 initial_chunk_size 传递给 StatsUpdater
-        let (stats_updater, stats_handle) = StatsUpdater::new(
-            worker_id,
-            broadcaster.clone(),
-            chunk_strategy,
-            initial_chunk_size,
-            cancel_tx.clone(),
-            None,
-        );
+        let (stats_updater, stats_handle) =
+            StatsUpdater::new(worker_id, broadcaster.clone(), cancel_tx.clone(), None);
         let stats_updater_handle = tokio::spawn(stats_updater.run());
 
         // --- 协程 2: 本地健康检查协程 ---
@@ -292,16 +280,16 @@ where
         // 创建任务分配器
         let task_allocator = TaskAllocator::new(allocator, config.retry().clone());
 
-        // 创建上下文（chunk_strategy 已移至 StatsUpdater）
+        // 创建分块策略（传递给 Executor）
+        let chunk_strategy =
+            Box::new(SpeedBasedChunkStrategy::from_config(config)) as Box<dyn ChunkStrategy + Send>;
+
+        // 创建上下文（chunk_strategy 已移至 Executor）
         let context = DownloadWorkerContext {
             task_allocator,
             url,
+            chunk_strategy,
         };
-
-        // 创建分块策略（传递给 StatsUpdater）
-        let chunk_strategy =
-            Box::new(SpeedBasedChunkStrategy::from_config(config)) as Box<dyn ChunkStrategy + Send>;
-        let initial_chunk_size = config.chunk().initial_size();
 
         // 创建结果通道（oneshot）
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -312,8 +300,6 @@ where
         let input = DownloadWorkerInput {
             context,
             stats,
-            chunk_strategy,
-            initial_chunk_size,
             result_tx,
             broadcast_tx,
             local_health_config,

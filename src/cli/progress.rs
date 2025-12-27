@@ -137,12 +137,10 @@ impl ProgressManager {
                 // 计算分块大小范围（只统计 TaskStats::Running 的 Executor）
                 let chunk_sizes: Vec<u64> = executor_stats
                     .iter_running()
-                    .filter_map(|(_, stats)| {
-                        let task_state = stats.as_task_state();
-                        if let Some(active_stats) = task_state.stats() {
-                            return Some(active_stats.get_speed_stats(0).current_chunk_size);
-                        }
-                        None
+                    .filter_map(|(_, stats)| match stats.as_task_state() {
+                        TaskState::Started(s) => Some(s.current_chunk_size()),
+                        TaskState::Running(s) => Some(s.current_chunk_size()),
+                        _ => None,
                     })
                     .collect();
                 let chunk_info = if !chunk_sizes.is_empty() {
@@ -206,8 +204,9 @@ impl ProgressManager {
                                         .to_formatted(self.size_standard)
                                         .to_string();
                                     format!(
-                                        "[下载中] 当前速度 {}, 已下载 {}, 已写入 {}",
+                                        "[下载中] 速度 {}, 分块 {}, 下载 {}, 写入 {}",
                                         speed,
+                                        format_bytes(running.current_chunk_size()),
                                         format_bytes(executor_stats.total_downloaded_bytes),
                                         format_bytes(executor_stats.written_bytes),
                                     )
