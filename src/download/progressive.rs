@@ -289,8 +289,6 @@ impl ProgressiveLauncherActor {
 ///
 /// 提供与 ProgressiveLauncherActor 通信的接口
 pub(super) struct ProgressiveLauncher {
-    /// 初始 worker 数量
-    initial_worker_count: u64,
     /// Actor 任务句柄
     actor_handle: Option<tokio::task::JoinHandle<()>>,
     /// 关闭发送器
@@ -304,9 +302,6 @@ impl ProgressiveLauncher {
     pub(super) fn new(
         params: ProgressiveLauncherParams,
     ) -> (Self, mpsc::Receiver<WorkerLaunchRequest>) {
-        // 从配置获取初始 worker 数量
-        let initial_worker_count = params.config.progressive().initial_worker_count();
-
         // 使用 oneshot channel
         let (shutdown_tx, shutdown_rx) = lite::channel();
         let (launch_request_tx, launch_request_rx) = mpsc::channel(10);
@@ -320,16 +315,10 @@ impl ProgressiveLauncher {
 
         let launcher = Self {
             shutdown_tx,
-            initial_worker_count,
             actor_handle: Some(actor_handle),
         };
 
         (launcher, launch_request_rx)
-    }
-
-    /// 获取第一批 Worker 的数量
-    pub(super) fn initial_worker_count(&self) -> u64 {
-        self.initial_worker_count
     }
 
     /// 关闭 actor 并等待其完全停止

@@ -225,7 +225,6 @@ where
     /// 返回新创建的 DownloadWorkerPool、所有初始 worker 的结果接收器
     pub(crate) fn new(
         client: C,
-        initial_worker_count: u64,
         writer: MmapWriter,
         allocator: ConcurrentAllocator,
         url: String,
@@ -238,9 +237,11 @@ where
         // 创建工厂
         let factory = DownloadWorkerFactory::new(client, writer);
 
+        let initial_worker_count = config.progressive().initial_worker_count().get() as usize;
+
         // 为每个 worker 创建输入参数
-        let mut inputs = Vec::with_capacity(initial_worker_count as usize);
-        let mut result_rxs = Vec::with_capacity(initial_worker_count as usize);
+        let mut inputs = Vec::with_capacity(initial_worker_count);
+        let mut result_rxs = Vec::with_capacity(initial_worker_count);
 
         for _ in 0..initial_worker_count {
             let (input, result_rx) = Self::create_worker_input(
@@ -391,8 +392,11 @@ mod tests {
             MmapWriter::new(save_path, NonZeroU64::new(1000).unwrap()).unwrap();
         let url = "http://example.com/file.bin".to_string();
 
-        let worker_count = 4;
-        let config = Arc::new(crate::config::DownloadConfig::default());
+        let config = Arc::new(
+            crate::config::DownloadConfig::builder()
+                .progressive(|p| p.initial_worker_count(NonZeroU64::new(4).unwrap()))
+                .build(),
+        );
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(128);
 
         let stats = SmrSwap::new(AggregatedStats::Pending);
@@ -400,7 +404,6 @@ mod tests {
 
         let (pool, _result_rx) = DownloadWorkerPool::new(
             client,
-            worker_count,
             writer,
             allocator,
             url,
@@ -434,7 +437,6 @@ mod tests {
 
         let (mut pool, _result_rx) = DownloadWorkerPool::new(
             client.clone(),
-            2,
             writer,
             allocator,
             url,

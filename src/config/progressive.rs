@@ -12,10 +12,9 @@ impl Defaults {
     /// 默认最大并发下载线程数：4
     pub const MAX_CONCURRENT_DOWNLOADS: u64 = 4;
     /// 默认初始下载线程数：1
-    pub const INITIAL_WORKER_COUNT: u64 = 1;
+    pub const INITIAL_WORKER_COUNT: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(1) };
     /// 默认预期最低单下载线程速度：1 MB/s
-    pub const MIN_SPEED_PER_THREAD: Option<NonZeroU64> =
-        Some(unsafe { NonZeroU64::new_unchecked(MB) });
+    pub const MIN_SPEED_PER_THREAD: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(MB) };
 }
 
 // ==================== 配置结构体 ====================
@@ -28,7 +27,7 @@ pub struct ProgressiveConfig {
     /// 最大并发下载线程数
     pub max_concurrent_downloads: u64,
     /// 初始下载线程数
-    pub initial_worker_count: u64,
+    pub initial_worker_count: NonZeroU64,
     /// 预期最低单下载线程速度
     pub min_speed_per_thread: NonZeroU64,
 }
@@ -38,7 +37,7 @@ impl Default for ProgressiveConfig {
         Self {
             max_concurrent_downloads: Defaults::MAX_CONCURRENT_DOWNLOADS,
             initial_worker_count: Defaults::INITIAL_WORKER_COUNT,
-            min_speed_per_thread: Defaults::MIN_SPEED_PER_THREAD.unwrap(),
+            min_speed_per_thread: Defaults::MIN_SPEED_PER_THREAD,
         }
     }
 }
@@ -50,7 +49,7 @@ impl ProgressiveConfig {
     }
 
     #[inline]
-    pub fn initial_worker_count(&self) -> u64 {
+    pub fn initial_worker_count(&self) -> NonZeroU64 {
         self.initial_worker_count
     }
 
@@ -66,7 +65,7 @@ impl ProgressiveConfig {
 #[derive(Debug, Clone)]
 pub struct ProgressiveConfigBuilder {
     pub(crate) max_concurrent_downloads: u64,
-    pub(crate) initial_worker_count: u64,
+    pub(crate) initial_worker_count: NonZeroU64,
     pub(crate) min_speed_per_thread: NonZeroU64,
 }
 
@@ -76,7 +75,7 @@ impl ProgressiveConfigBuilder {
         Self {
             max_concurrent_downloads: Defaults::MAX_CONCURRENT_DOWNLOADS,
             initial_worker_count: Defaults::INITIAL_WORKER_COUNT,
-            min_speed_per_thread: Defaults::MIN_SPEED_PER_THREAD.unwrap(),
+            min_speed_per_thread: Defaults::MIN_SPEED_PER_THREAD,
         }
     }
 
@@ -87,7 +86,7 @@ impl ProgressiveConfigBuilder {
     }
 
     /// 设置初始下载线程数
-    pub fn initial_worker_count(mut self, count: u64) -> Self {
+    pub fn initial_worker_count(mut self, count: NonZeroU64) -> Self {
         self.initial_worker_count = count;
         self
     }
@@ -133,7 +132,7 @@ mod tests {
         );
         assert_eq!(
             config.min_speed_per_thread(),
-            Defaults::MIN_SPEED_PER_THREAD.unwrap()
+            Defaults::MIN_SPEED_PER_THREAD
         );
     }
 
@@ -142,11 +141,13 @@ mod tests {
         let speed = NonZeroU64::new(512 * 1024).unwrap();
         let config = ProgressiveConfigBuilder::new()
             .max_concurrent_downloads(8)
-            .initial_worker_count(2)
+            .initial_worker_count(unsafe { NonZeroU64::new_unchecked(2) })
             .min_speed_per_thread(speed)
             .build();
         assert_eq!(config.max_concurrent_downloads(), 8);
-        assert_eq!(config.initial_worker_count(), 2);
+        assert_eq!(config.initial_worker_count(), unsafe {
+            NonZeroU64::new_unchecked(2)
+        });
         assert_eq!(config.min_speed_per_thread(), speed);
     }
 }

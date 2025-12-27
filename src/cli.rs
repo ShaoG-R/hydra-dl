@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use clap::Parser;
 
 mod logger;
@@ -57,7 +59,7 @@ pub struct Cli {
 
     /// 初始 Worker 数量
     #[arg(long, default_value = "1")]
-    pub initial_workers: u64,
+    pub initial_workers: NonZeroU64,
 
     /// 初始分块大小（MB）
     #[arg(long, default_value = "5")]

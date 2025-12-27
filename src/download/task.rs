@@ -69,15 +69,14 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
                 start_offset: std::time::Duration::ZERO,
             });
 
-        // 第一批 worker 数量
-        let initial_worker_count = progressive_launcher.initial_worker_count();
-
-        info!("初始启动 {} 个 workers", initial_worker_count);
+        info!(
+            "初始启动 {} 个 workers",
+            config.progressive().initial_worker_count().get()
+        );
 
         // 创建 DownloadWorkerPool（只启动第一批 worker）
         let (pool, initial_result_rxs) = DownloadWorkerPool::new(
             client.clone(),
-            initial_worker_count,
             writer.clone(),
             allocator,
             url.clone(),
