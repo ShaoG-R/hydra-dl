@@ -78,7 +78,7 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
-        run: cargo install cargo-zigbuild --locked
+        run: command -v cargo-zigbuild > /dev/null || cargo install cargo-zigbuild --locked
 
       - name: Build (Zigbuild)
         if: matrix.use_zigbuild
