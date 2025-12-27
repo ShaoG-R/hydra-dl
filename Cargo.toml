@@ -9,14 +9,14 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1.48.0", features = ["full"] }
-reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "stream", "gzip", "http2", "charset", "macos-system-configuration"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream", "gzip", "http2", "charset", "macos-system-configuration"] }
 futures = "0.3"
 thiserror = "2.0.17"
 log = "0.4"
-bytes = "1.10.1"
+bytes = "1.11.0"
 async-trait = "0.1.89"
 clap = { version = "4.5", features = ["derive"] }
-indicatif = "0.18.2"
+indicatif = "0.18.3"
 url = "2.5"
 urlencoding = "2.1"
 rustc-hash = "2.1.1"
@@ -26,9 +26,9 @@ ranged-mmap = "0.4.0"
 deferred-map = "0.3.1"
 lite-sync = "0.2.0"
 net-bytes = "0.3.0"
-smr-swap = "0.8.3"
-lfrlock = "0.2.0"
+smr-swap = "0.9.0"
+lfrlock = "0.2.5"
 
 [dev-dependencies]
-tempfile = "3.23.0"
+tempfile = "3.24.0"
 env_logger = "0.11.8"
