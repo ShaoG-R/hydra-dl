@@ -157,7 +157,7 @@ async fn download_ranged_generic<C>(
 where
     C: HttpClient + Clone + Send + 'static,
 {
-    let worker_count = config.progressive().worker_count();
+    let worker_count = config.progressive().max_concurrent_downloads();
 
     info!(
         "准备 Range 下载: {} ({} 个 workers, 动态分块)",
@@ -414,7 +414,7 @@ mod tests {
         // 执行下载（使用 1 个 worker 以简化测试）
         let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(1))
+            .progressive(|p| p.max_concurrent_downloads(1))
             .chunk(|c| {
                 c.initial_size(chunk_size)
                     .min_size(1) // 设置为 1 以允许小文件测试
@@ -472,7 +472,7 @@ mod tests {
 
         // 执行下载
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(2))
+            .progressive(|p| p.max_concurrent_downloads(2))
             .chunk(|c| {
                 c.initial_size(test_data.len() as u64) // 单次分块完成
                     .min_size(1)
@@ -554,7 +554,7 @@ mod tests {
         // 使用 2 个 workers 下载
         let chunk_size = chunk_size as u64;
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(2))
+            .progressive(|p| p.max_concurrent_downloads(2))
             .chunk(|c| c.initial_size(chunk_size).min_size(1).max_size(chunk_size)) // 固定分块大小以便测试
             .build();
 
@@ -608,7 +608,7 @@ mod tests {
 
         // 使用 1 MB 的初始分块大小下载 1 MB 文件
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(4))
+            .progressive(|p| p.max_concurrent_downloads(4))
             .chunk(|c| {
                 c.initial_size(1 * 1024 * 1024) // 1 MB
                     .min_size(512 * 1024) // 512 KB
@@ -672,7 +672,7 @@ mod tests {
         }
 
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(3))
+            .progressive(|p| p.max_concurrent_downloads(3))
             .chunk(|c| {
                 c.initial_size(chunk_size as u64)
                     .min_size(chunk_size as u64)
@@ -735,7 +735,7 @@ mod tests {
         }
 
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(4))
+            .progressive(|p| p.max_concurrent_downloads(4))
             .chunk(|c| {
                 c.initial_size(chunk_size as u64)
                     .min_size(chunk_size as u64)
@@ -797,15 +797,17 @@ mod tests {
             );
         }
 
-        // 配置渐进式启动：[0.5, 1.0] 表示先启动2个worker，再启动剩余2个
+        // 配置渐进式启动：设置最大并发数和最小速度
+        // 这里只是为了验证配置是否能正常工作，并不真正验证渐进式启动的过程（需要时间）
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(4))
+            .progressive(|p| p.max_concurrent_downloads(4))
             .chunk(|c| {
                 c.initial_size(chunk_size as u64)
                     .min_size(chunk_size as u64)
                     .max_size(chunk_size as u64)
             })
-            .progressive(|p| p.worker_ratios(vec![0.5, 1.0]).min_speed_threshold(None)) // 设置为0以便立即启动下一批
+            // 设置一个较大的最小速度要求，但对于测试来说主要验证不报错
+            .progressive(|p| p.min_speed_per_thread(NonZeroU64::new(1024).unwrap()))
             .build();
 
         let result =
@@ -819,18 +821,14 @@ mod tests {
     fn test_progressive_config() {
         // 测试渐进式启动配置的正确性
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(12))
-            .progressive(|p| {
-                p.worker_ratios(vec![0.25, 0.5, 0.75, 1.0])
-                    .min_speed_threshold(Some(NonZeroU64::new(5 * 1024 * 1024).unwrap()))
-            }) // 5 MB/s
+            .progressive(|p| p.max_concurrent_downloads(12))
+            .progressive(|p| p.min_speed_per_thread(NonZeroU64::new(5 * 1024 * 1024).unwrap())) // 5 MB/s
             .build();
 
-        assert_eq!(config.progressive().worker_count(), 12);
-        assert_eq!(config.progressive().worker_launch_stages(), &[3, 6, 9, 12]);
+        assert_eq!(config.progressive().max_concurrent_downloads(), 12);
         assert_eq!(
-            config.progressive().min_speed_threshold(),
-            Some(NonZeroU64::new(5 * 1024 * 1024).unwrap())
+            config.progressive().min_speed_per_thread(),
+            NonZeroU64::new(5 * 1024 * 1024).unwrap()
         );
     }
 
@@ -953,7 +951,7 @@ mod tests {
 
         // 配置：1 个 worker，最大重试 3 次
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(1))
+            .progressive(|p| p.max_concurrent_downloads(1))
             .chunk(|c| {
                 c.initial_size(chunk_size as u64)
                     .min_size(chunk_size as u64)
@@ -1037,7 +1035,7 @@ mod tests {
 
         // 配置：1 个 worker，最大重试 2 次
         let config = crate::config::DownloadConfig::builder()
-            .progressive(|p| p.worker_count(1))
+            .progressive(|p| p.max_concurrent_downloads(1))
             .chunk(|c| {
                 c.initial_size(chunk_size as u64)
                     .min_size(1)

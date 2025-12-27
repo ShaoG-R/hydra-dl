@@ -206,9 +206,9 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
 
     /// 处理 worker 启动请求（由 progressive_launcher actor 发送）
     async fn handle_launch_request(&mut self, request: WorkerLaunchRequest) {
-        let WorkerLaunchRequest { count, stage } = request;
+        let WorkerLaunchRequest { count, batch_id } = request;
 
-        self.execute_worker_launch(count, stage).await
+        self.execute_worker_launch(count, batch_id).await
     }
 
     /// 关闭并清理资源
@@ -290,15 +290,13 @@ impl<C: HttpClient + Clone> DownloadTask<C> {
     }
 
     /// 执行 worker 启动（内部方法）
-    async fn execute_worker_launch(&mut self, count: u64, stage: usize) {
+    async fn execute_worker_launch(&mut self, count: u64, batch_id: usize) {
         let current_worker_count = self.pool.worker_count();
         let next_target = current_worker_count + count;
 
         info!(
             "渐进式启动 - 第{}批: 启动 {} 个新 workers (总计 {} 个)",
-            stage + 1,
-            count,
-            next_target
+            batch_id, count, next_target
         );
 
         // 动态添加新 worker，更新 worker_handles 和 result_futures

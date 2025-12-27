@@ -16,7 +16,10 @@ pub async fn execute_download(
 ) -> Result<()> {
     // 构建下载配置
     let config = DownloadConfig::builder()
-        .progressive(|p| p.worker_count(cli.workers))
+        .progressive(|p| {
+            p.max_concurrent_downloads(cli.workers)
+                .initial_worker_count(cli.initial_workers)
+        })
         .chunk(|c| {
             c.initial_size(cli.chunk_size * 1024 * 1024)
                 .min_size(cli.min_chunk * 1024 * 1024)
@@ -29,7 +32,7 @@ pub async fn execute_download(
     info!("开始下载: {}", cli.url);
     info!(
         "配置: {} workers, 分块大小: {} ~ {} (初始: {})",
-        config.progressive().worker_count(),
+        config.progressive().max_concurrent_downloads(),
         format_bytes(config.chunk().min_size()),
         format_bytes(config.chunk().max_size()),
         format_bytes(config.chunk().initial_size()),

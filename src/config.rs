@@ -53,7 +53,7 @@ impl DownloadConfig {
     /// ```
     /// # use hydra_dl::DownloadConfig;
     /// let config = DownloadConfig::builder()
-    ///     .progressive(|p| p.worker_count(4))
+    ///     .progressive(|p| p.max_concurrent_downloads(4))
     ///     .chunk(|c| c.initial_size(5 * 1024 * 1024))
     ///     .build();
     /// ```
@@ -104,7 +104,7 @@ impl DownloadConfig {
 /// # use hydra_dl::DownloadConfig;
 /// let config = DownloadConfig::builder()
 ///     .chunk(|c| c.min_size(2 * 1024 * 1024).initial_size(10 * 1024 * 1024))
-///     .progressive(|p| p.worker_count(8))
+///     .progressive(|p| p.max_concurrent_downloads(8))
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -214,8 +214,9 @@ impl DownloadConfigBuilder {
     ///
     /// ```
     /// # use hydra_dl::DownloadConfig;
+    /// # use std::num::NonZeroU64;
     /// let config = DownloadConfig::builder()
-    ///     .progressive(|p| p.worker_ratios(vec![0.5, 1.0]))
+    ///     .progressive(|p| p.max_concurrent_downloads(8).min_speed_per_thread(NonZeroU64::new(1024).unwrap()))
     ///     .build();
     /// ```
     pub fn progressive<F>(mut self, f: F) -> Self
@@ -223,11 +224,9 @@ impl DownloadConfigBuilder {
         F: FnOnce(ProgressiveConfigBuilder) -> ProgressiveConfigBuilder,
     {
         let builder = ProgressiveConfigBuilder {
-            worker_count: self.progressive.worker_count,
-            worker_ratios: ProgressiveDefaults::WORKER_RATIOS.to_vec(),
-            min_speed_threshold: self.progressive.min_speed_threshold,
-            min_time_before_finish: self.progressive.min_time_before_finish,
-            batch_delay: self.progressive.batch_delay,
+            max_concurrent_downloads: self.progressive.max_concurrent_downloads,
+            initial_worker_count: self.progressive.initial_worker_count,
+            min_speed_per_thread: self.progressive.min_speed_per_thread,
         };
         self.progressive = f(builder).build();
         self
@@ -314,13 +313,14 @@ impl Default for DownloadConfigBuilder {
 mod tests {
     use super::*;
     use crate::constants::MB;
+    use std::num::NonZeroU64;
 
     #[test]
     fn test_download_config_default() {
         let config = DownloadConfig::default();
         assert_eq!(
-            config.progressive().worker_count(),
-            ProgressiveDefaults::WORKER_COUNT
+            config.progressive().max_concurrent_downloads(),
+            ProgressiveDefaults::MAX_CONCURRENT_DOWNLOADS
         );
         assert_eq!(config.chunk().min_size(), ChunkDefaults::MIN_SIZE);
         assert_eq!(config.chunk().initial_size(), ChunkDefaults::INITIAL_SIZE);
@@ -330,12 +330,11 @@ mod tests {
     #[test]
     fn test_download_config_builder() {
         let config = DownloadConfig::builder()
-            .progressive(|p| p.worker_count(2))
+            .progressive(|p| p.max_concurrent_downloads(2))
             .chunk(|c| c.min_size(1 * MB).initial_size(10 * MB).max_size(100 * MB))
             .build();
 
-        assert_eq!(config.progressive().worker_count(), 2);
-        assert_eq!(config.progressive().worker_launch_stages(), &[1, 1, 2, 2]);
+        assert_eq!(config.progressive().max_concurrent_downloads(), 2);
         assert_eq!(config.chunk().min_size(), 1 * MB);
         assert_eq!(config.chunk().initial_size(), 10 * MB);
         assert_eq!(config.chunk().max_size(), 100 * MB);
@@ -360,16 +359,17 @@ mod tests {
     #[test]
     fn test_combined_configs() {
         // 测试多个配置组合
+        let speed = NonZeroU64::new(512 * 1024).unwrap();
         let config = DownloadConfig::builder()
-            .progressive(|p| p.worker_count(2))
+            .progressive(|p| p.max_concurrent_downloads(2))
             .chunk(|c| c.min_size(1 * MB).initial_size(5 * MB).max_size(20 * MB))
-            .progressive(|p| p.worker_ratios(vec![0.5, 1.0]))
+            .progressive(|p| p.min_speed_per_thread(speed))
             .build();
 
-        assert_eq!(config.progressive().worker_count(), 2);
+        assert_eq!(config.progressive().max_concurrent_downloads(), 2);
         assert_eq!(config.chunk.min_size, 1 * MB);
         assert_eq!(config.chunk.initial_size, 5 * MB);
         assert_eq!(config.chunk.max_size, 20 * MB);
-        assert_eq!(config.progressive().worker_launch_stages(), &[1, 2]);
+        assert_eq!(config.progressive().min_speed_per_thread(), speed);
     }
 }

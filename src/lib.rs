@@ -89,7 +89,7 @@
 //! async fn main() -> Result<(), hydra_dl::DownloadError> {
 //!     // 自定义配置：更多 worker，更大的分块范围
 //!     let config = DownloadConfig::builder()
-//!         .progressive(|p| p.worker_count(8))        // 8 个并发 worker
+//!         .progressive(|p| p.max_concurrent_downloads(8))        // 8 个并发 worker
 //!         .chunk(|c| c
 //!             .initial_size(10 * MB)                  // 初始 10 MB 分块
 //!             .min_size(5 * MB)                       // 最小 5 MB（慢速时）
@@ -150,7 +150,7 @@ pub mod utils {
 ///
 /// let config = DownloadConfig::builder()
 ///     .chunk(|c| c.initial_size(10 * MB))  // 10 MB
-///     .progressive(|p| p.min_speed_threshold(NonZeroU64::new(5 * MB)))  // 5 MB/s
+///     .progressive(|p| p.min_speed_per_thread(NonZeroU64::new(5 * MB).unwrap()))  // 5 MB/s
 ///     .build();
 /// ```
 pub mod constants {

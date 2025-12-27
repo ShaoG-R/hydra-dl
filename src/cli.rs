@@ -55,6 +55,10 @@ pub struct Cli {
     #[arg(short = 'n', long, default_value = "4")]
     pub workers: u64,
 
+    /// 初始 Worker 数量
+    #[arg(long, default_value = "1")]
+    pub initial_workers: u64,
+
     /// 初始分块大小（MB）
     #[arg(long, default_value = "5")]
     pub chunk_size: u64,
