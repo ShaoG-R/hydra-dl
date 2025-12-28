@@ -112,11 +112,13 @@ use std::path::PathBuf;
 async fn main() -> Result<(), hydra_dl::DownloadError> {
     // 创建配置
     let config = DownloadConfig::builder()
-        .worker_count(8)                         // 8 个并发 worker
-        .initial_chunk_size(10 * 1024 * 1024)    // 初始 10 MB
-        .min_chunk_size(5 * 1024 * 1024)         // 最小 5 MB
-        .max_chunk_size(100 * 1024 * 1024)       // 最大 100 MB
-        .build()?;
+        .progressive(|p| p.max_concurrent_downloads(8))  // 8 个并发 worker
+        .chunk(|c| c
+            .initial_size(10 * 1024 * 1024)   // 初始 10 MB
+            .min_size(5 * 1024 * 1024)        // 最小 5 MB
+            .max_size(100 * 1024 * 1024)      // 最大 100 MB
+        )
+        .build();
     
     // 创建定时器服务
     let timer = TimerWheel::with_defaults();
@@ -207,20 +209,23 @@ Hydra-DL 会根据实时下载速度自动调整每个 worker 的分块大小：
 
 ### 渐进式启动
 
-避免一次性启动所有 worker 对服务器造成压力：
+通过控制初始 Worker 数量和单线程速度阈值，实现平滑启动，避免触发服务器的反爬虫机制或造成过大压力：
 
 ```rust
+use std::num::NonZeroU64;
+
 let config = DownloadConfig::builder()
-    .worker_count(12)
-    .progressive_worker_ratios(vec![0.25, 0.5, 0.75, 1.0])  // 分4批启动
-    .min_speed_threshold(5 * 1024 * 1024)  // 速度阈值 5 MB/s
-    .build()?;
+    .progressive(|p| p
+        .max_concurrent_downloads(8)           // 最大并发数 8
+        .initial_worker_count(NonZeroU64::new(2).unwrap()) // 初始启动 2 个
+        .min_speed_per_thread(NonZeroU64::new(1024 * 1024).unwrap()) // 单线程速度需达 1MB/s 才会增加新 worker
+    )
+    .build();
 ```
 
-- **第 1 批**：启动 25% workers（3个）
-- **第 2 批**：速度达标后启动到 50%（6个）
-- **第 3 批**：继续达标后启动到 75%（9个）
-- **第 4 批**：最终启动全部 100%（12个）
+- **初始阶段**：仅启动 `initial_worker_count` 个 worker
+- **动态扩容**：当现有 worker 的平均速度超过 `min_speed_per_thread` 时，逐步增加 worker
+- **上限控制**：worker 总数不会超过 `max_concurrent_downloads`
 
 ### 智能重试机制
 
@@ -228,13 +233,15 @@ let config = DownloadConfig::builder()
 
 ```rust
 let config = DownloadConfig::builder()
-    .max_retry_count(5)
-    .retry_delays(vec![
-        Duration::from_secs(1),   // 第1次重试：1秒后
-        Duration::from_secs(2),   // 第2次重试：2秒后
-        Duration::from_secs(5),   // 第3次及以后：5秒后
-    ])
-    .build()?;
+    .retry(|r| r
+        .max_retry_count(5)
+        .retry_delays(vec![
+            Duration::from_secs(1),   // 第1次重试：1秒后
+            Duration::from_secs(2),   // 第2次重试：2秒后
+            Duration::from_secs(5),   // 第3次及以后：5秒后
+        ])
+    )
+    .build();
 ```
 
 ## 📊 性能优势
@@ -262,13 +269,13 @@ let config = DownloadConfig::builder()
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `worker_count` | 4 | Worker 并发数 |
+| `max_concurrent_downloads` | 4 | 最大 Worker 并发数 |
 | `initial_chunk_size` | 5 MB | 初始分块大小 |
 | `min_chunk_size` | 2 MB | 最小分块大小 |
 | `max_chunk_size` | 50 MB | 最大分块大小 |
 | `max_retry_count` | 3 | 最大重试次数 |
-| `progressive_worker_ratios` | `[1.0]` | 渐进式启动比例 |
-| `min_speed_threshold` | 0 | 速度阈值（字节/秒） |
+| `initial_worker_count` | 1 | 初始 Worker 数量 |
+| `min_speed_per_thread` | 1 MB/s | 预期单线程最低速度 |
 | `timeout` | 30 秒 | 请求超时 |
 | `connect_timeout` | 10 秒 | 连接超时 |
 
@@ -278,9 +285,9 @@ let config = DownloadConfig::builder()
 use hydra_dl::constants::*;
 
 let config = DownloadConfig::builder()
-    .initial_chunk_size(10 * MB)  // 10 MB
-    .min_speed_threshold(5 * MB)  // 5 MB/s
-    .build()?;
+    .chunk(|c| c.initial_size(10 * MB))  // 10 MB
+    .progressive(|p| p.min_speed_per_thread(NonZeroU64::new(5 * MB).unwrap()))  // 5 MB/s
+    .build();
 ```
 
 ## 🤝 贡献
